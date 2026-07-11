@@ -40,7 +40,35 @@ closed and refuses to create a conversation.
 
 ```powershell
 $env:SESSION_API_KEY = "<local-session-key>"
+ai-team doctor
 ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands
+```
+
+If OpenHands is not running, `doctor` reports `ready: false` with a network or
+timeout diagnostic. Do not treat a mock provider result as an OpenHands pass.
+
+## Receipts
+
+Every `ai-team run` writes a redacted runtime receipt to:
+
+```text
+reports/receipts/
+```
+
+Receipts include project path, branch, provider, workflow, stages, commit SHA,
+and validation result. Runtime receipts are ignored by Git.
+
+## Write Workflows
+
+Non-dry-run write workflows require a disposable linked worktree. Running
+`bug-fix-loop` against the primary CelebrateDeal worktree is denied.
+
+```powershell
+cd C:\Users\eden\Downloads\AI\CelebrateDeal
+git worktree add --detach ..\CelebrateDeal-openhands-disposable HEAD
+
+cd ..\ai-team-orchestrator
+ai-team run ..\CelebrateDeal-openhands-disposable --workflow bug-fix-loop
 ```
 
 ## Safety Rules
@@ -48,6 +76,7 @@ ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands
 - Project roots must remain inside the configured workspace allowlist.
 - Protected branches such as `master` and `main` reject write workflows unless
   the workflow is explicitly dry-run.
+- Non-dry-run write workflows require a linked disposable worktree by default.
 - Workflows must explicitly forbid production deploy, real payment, and
   destructive migration.
 - Provider logs and results redact token, secret, password, bearer, and `sk-*`

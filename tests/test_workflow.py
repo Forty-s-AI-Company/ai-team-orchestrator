@@ -3,10 +3,12 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from ai_team.core.orchestrator import Orchestrator
 from ai_team.core.project_loader import load_project
+from ai_team.core.receipts import write_run_receipt
 from ai_team.providers import MockProvider
 
 
@@ -52,6 +54,27 @@ class WorkflowTests(unittest.TestCase):
                 dry_run=True,
             )
             self.assertTrue(result.provider_result.success)
+
+    def test_receipt_redacts_provider_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            loaded = load_project(root)
+            provider = MockProvider()
+            result = Orchestrator(provider).run(
+                loaded,
+                workflow_name="project-analysis",
+                dry_run=True,
+            )
+            redaction_result = replace(
+                result,
+                provider_result=replace(result.provider_result, content="SESSION_API_KEY" + "=supersecret"),
+            )
+            receipt = write_run_receipt(loaded, redaction_result, Path(tmp) / "receipts")
+            content = receipt.read_text(encoding="utf-8")
+            self.assertIn("project-analysis", content)
+            self.assertNotIn("supersecret", content)
             self.assertEqual(result.workflow.name, "project-analysis")
             self.assertIn("inspect", result.stages)
 

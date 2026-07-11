@@ -48,12 +48,39 @@ class OpenHandsProvider(BaseProvider):
         }
 
     def ready(self) -> bool:
+        return self.diagnostics()["ready"] is True
+
+    def diagnostics(self) -> dict[str, Any]:
+        session_key_present = bool(self.session_key)
+        result: dict[str, Any] = {
+            "baseUrl": self.settings.base_url,
+            "readyPath": self.settings.ready_path,
+            "sessionKeyEnv": self.settings.session_key_env,
+            "sessionKeyPresent": session_key_present,
+            "failClosed": not session_key_present,
+            "ready": False,
+            "errorType": None,
+            "message": None,
+        }
         try:
             request = urllib.request.Request(self._url(self.settings.ready_path), method="GET")
             with urllib.request.urlopen(request, timeout=5) as response:
-                return 200 <= response.status < 300
-        except Exception:
-            return False
+                result["ready"] = 200 <= response.status < 300
+                result["status"] = response.status
+        except urllib.error.HTTPError as exc:
+            result["errorType"] = _http_error_type(exc.code)
+            result["status"] = exc.code
+            result["message"] = redact_secrets(exc.read().decode("utf-8", errors="replace"))
+        except (TimeoutError, socket.timeout) as exc:
+            result["errorType"] = ProviderErrorType.TIMEOUT
+            result["message"] = str(exc)
+        except urllib.error.URLError as exc:
+            result["errorType"] = ProviderErrorType.NETWORK
+            result["message"] = str(exc.reason)
+        except Exception as exc:
+            result["errorType"] = ProviderErrorType.UNKNOWN
+            result["message"] = str(exc)
+        return result
 
     def run(self, request: ProviderRequest) -> ProviderResult:
         try:

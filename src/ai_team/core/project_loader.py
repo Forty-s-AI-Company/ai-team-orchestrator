@@ -52,6 +52,7 @@ class SafetyPolicy(BaseModel):
     allow_database_migration: bool = False
     allow_database_seed: bool = False
     allow_destructive_commands: bool = False
+    require_disposable_worktree_for_writes: bool = True
 
 
 class ProjectProfile(BaseModel):
@@ -71,11 +72,16 @@ class LoadedProject(BaseModel):
     project_dir: Path
     root: Path
     current_branch: str | None
+    commit_sha: str | None
 
     def is_branch_protected(self) -> bool:
         if not self.current_branch:
             return False
         return self.current_branch in self.profile.repository.protected_branches
+
+    def is_disposable_worktree(self) -> bool:
+        git_marker = self.project_dir / ".git"
+        return git_marker.is_file()
 
     def assert_write_allowed(self, workflow_name: str) -> None:
         if self.is_branch_protected():
@@ -85,6 +91,11 @@ class LoadedProject(BaseModel):
             )
 
         safety = self.profile.safety
+        if safety.require_disposable_worktree_for_writes and not self.is_disposable_worktree():
+            raise ProjectConfigError(
+                f"workflow '{workflow_name}' requires a disposable git worktree for non-dry-run writes"
+            )
+
         if workflow_name == "bug-fix-loop" and safety.allow_destructive_commands:
             raise ProjectConfigError("destructive commands are not allowed for bug-fix-loop")
 
@@ -149,6 +160,23 @@ def current_git_branch(project_root: Path) -> str | None:
     return branch or None
 
 
+def current_git_commit(project_root: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=project_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    commit = result.stdout.strip()
+    return commit or None
+
+
 def load_project(project_path: str | Path, allowlist: list[str | Path] | None = None) -> LoadedProject:
     project_dir = Path(project_path).expanduser().resolve()
     if not project_dir.exists():
@@ -179,4 +207,5 @@ def load_project(project_path: str | Path, allowlist: list[str | Path] | None = 
         project_dir=project_dir,
         root=root,
         current_branch=current_git_branch(root),
+        commit_sha=current_git_commit(root),
     )

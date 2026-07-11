@@ -45,6 +45,16 @@ class ProviderTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn(result.error_type, {ProviderErrorType.TIMEOUT, ProviderErrorType.NETWORK})
 
+    def test_openhands_unavailable_diagnostics(self) -> None:
+        provider = OpenHandsProvider(
+            OpenHandsSettings(base_url="http://127.0.0.1:9"),
+            session_key="test-session",
+        )
+        diagnostics = provider.diagnostics()
+        self.assertFalse(diagnostics["ready"])
+        self.assertEqual(diagnostics["errorType"], ProviderErrorType.NETWORK)
+        self.assertTrue(diagnostics["sessionKeyPresent"])
+
     def test_retry_exhaustion(self) -> None:
         provider = RetryingProvider(MockProvider(fail_times=5), max_retries=2, backoff_seconds=0)
         result = provider.run(

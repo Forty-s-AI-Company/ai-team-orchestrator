@@ -63,14 +63,36 @@ the orchestrator against that path:
 
 ```powershell
 cd C:\Users\eden\Downloads\AI\CelebrateDeal
-git worktree add ..\CelebrateDeal-ai-task codex\openhands-ai-task
+git worktree add --detach ..\CelebrateDeal-openhands-disposable HEAD
 
 cd ..\ai-team-orchestrator
-ai-team init ..\CelebrateDeal-ai-task
-ai-team run ..\CelebrateDeal-ai-task --workflow bug-fix-loop --dry-run
+ai-team run ..\CelebrateDeal-openhands-disposable --workflow bug-fix-loop
 ```
 
 Do not run non-dry-run write workflows on `master` or `main`.
+Do not run non-dry-run write workflows on the primary worktree.
+
+## Provider-Native Smoke
+
+```powershell
+$env:SESSION_API_KEY = "<local-session-key>"
+ai-team doctor
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands
+```
+
+If OpenHands is unavailable, the provider-native run must fail with a network or
+timeout diagnostic. Do not treat a mock provider result as an OpenHands pass.
+
+## Receipts
+
+Runtime receipts are written to:
+
+```text
+C:\Users\eden\Downloads\AI\ai-team-orchestrator\reports\receipts
+```
+
+They are redacted and ignored by Git. A receipt records project path, branch,
+provider, workflow, stages, commit SHA, and validation result.
 
 ## Diagnostics
 

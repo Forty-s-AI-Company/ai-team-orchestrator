@@ -65,6 +65,30 @@ class ProjectLoaderTests(unittest.TestCase):
             with self.assertRaises(ProjectConfigError):
                 loaded.assert_write_allowed("bug-fix-loop")
 
+    def test_denies_write_on_primary_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            loaded = load_project(root)
+            loaded.current_branch = "feature/test"
+            with self.assertRaises(ProjectConfigError):
+                loaded.assert_write_allowed("bug-fix-loop")
+
+    def test_allows_write_on_disposable_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            git_marker = root / ".git"
+            git_marker_dir = root / ".git-dir"
+            if git_marker.is_dir():
+                git_marker.rename(git_marker_dir)
+            git_marker.write_text(f"gitdir: {git_marker_dir.as_posix()}\n", encoding="utf-8")
+            loaded = load_project(root)
+            loaded.current_branch = "feature/test"
+            loaded.assert_write_allowed("bug-fix-loop")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -10,6 +9,7 @@ import yaml
 
 from ai_team.core.orchestrator import Orchestrator, WorkflowError, load_workflow
 from ai_team.core.project_loader import ProjectConfigError, load_project
+from ai_team.core.receipts import write_run_receipt
 from ai_team.providers import MockProvider, OpenHandsProvider, OpenHandsSettings
 
 
@@ -118,7 +118,9 @@ def validate_profile(project_path: str) -> None:
                 "project": loaded.profile.project.name,
                 "root": str(loaded.root),
                 "branch": loaded.current_branch,
+                "commitSha": loaded.commit_sha,
                 "protectedBranch": loaded.is_branch_protected(),
+                "disposableWorktree": loaded.is_disposable_worktree(),
                 "allowGitPush": loaded.profile.safety.allow_git_push,
                 "allowDeploy": loaded.profile.safety.allow_deploy,
             },
@@ -134,6 +136,9 @@ def build_openhands_provider(settings: dict) -> OpenHandsProvider:
         session_key_env=str(openhands.get("session_key_env") or "SESSION_API_KEY"),
         ready_path=str(openhands.get("ready_path") or "/ready"),
         conversation_path=str(openhands.get("conversation_path") or "/api/v1/app-conversations"),
+        cancel_path_template=str(
+            openhands.get("cancel_path_template") or "/api/v1/app-conversations/{task_id}/stop"
+        ),
         timeout_seconds=float(openhands.get("timeout_seconds") or 30),
     )
     return OpenHandsProvider(provider_settings)
@@ -142,23 +147,26 @@ def build_openhands_provider(settings: dict) -> OpenHandsProvider:
 def doctor() -> None:
     settings = load_settings()
     provider = build_openhands_provider(settings)
-    session_key_present = bool(os.environ.get(provider.settings.session_key_env))
+    diagnostics = provider.diagnostics()
     print(
         json.dumps(
             {
                 "settings": str(DEFAULT_SETTINGS_PATH),
-                "openhandsBaseUrl": provider.settings.base_url,
-                "ready": provider.ready(),
-                "sessionKeyEnv": provider.settings.session_key_env,
-                "sessionKeyPresent": session_key_present,
-                "failClosed": not session_key_present,
+                "openhands": diagnostics,
             },
             indent=2,
+            default=str,
         )
     )
 
 
-def run_workflow(project_path: str, workflow_name: str, provider_name: str, dry_run: bool) -> None:
+def run_workflow(
+    project_path: str,
+    workflow_name: str,
+    provider_name: str,
+    dry_run: bool,
+    receipt_dir: str | None,
+) -> None:
     settings = load_settings()
     loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
     load_workflow(workflow_name)
@@ -170,6 +178,11 @@ def run_workflow(project_path: str, workflow_name: str, provider_name: str, dry_
         dry_run=dry_run,
         timeout_seconds=timeout_seconds,
     )
+    receipt_path = write_run_receipt(
+        loaded,
+        result,
+        Path(receipt_dir).resolve() if receipt_dir else REPO_ROOT / "reports" / "receipts",
+    )
     payload = {
         "workflow": result.workflow.name,
         "dryRun": result.dry_run,
@@ -180,6 +193,7 @@ def run_workflow(project_path: str, workflow_name: str, provider_name: str, dry_
         "errorType": result.provider_result.error_type,
         "content": result.provider_result.content,
         "data": result.provider_result.data,
+        "receiptPath": str(receipt_path),
     }
     print(json.dumps(payload, indent=2, default=str))
     if not result.provider_result.success:
@@ -209,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--workflow", required=True)
     run_parser.add_argument("--provider", choices=["mock", "openhands"], default="mock")
     run_parser.add_argument("--dry-run", action="store_true")
+    run_parser.add_argument("--receipt-dir")
 
     return parser
 
@@ -227,7 +242,7 @@ def main() -> None:
         elif args.command == "doctor":
             doctor()
         elif args.command == "run":
-            run_workflow(args.project, args.workflow, args.provider, args.dry_run)
+            run_workflow(args.project, args.workflow, args.provider, args.dry_run, args.receipt_dir)
     except (ProjectConfigError, WorkflowError) as exc:
         print(f"ai-team error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

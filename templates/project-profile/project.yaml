@@ -21,3 +21,4 @@ safety:
   allow_database_migration: false
   allow_database_seed: false
   allow_destructive_commands: false
+  require_disposable_worktree_for_writes: true
