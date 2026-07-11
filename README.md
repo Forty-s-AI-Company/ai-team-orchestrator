@@ -1,0 +1,62 @@
+# AI Team Orchestrator
+
+Reusable AI software-team orchestrator for local product repositories.
+
+This repository is separate from both:
+
+- `../CelebrateDeal`: the product repository.
+- `../OpenHands`: the official OpenHands source repository.
+
+The orchestrator talks to OpenHands through loopback HTTP only. It does not
+import or modify OpenHands Python modules.
+
+## Quick Start
+
+```powershell
+cd C:\Users\eden\Downloads\AI\ai-team-orchestrator
+.\.venv\Scripts\Activate.ps1
+pip install -e .
+
+ai-team inspect ..\CelebrateDeal
+ai-team validate ..\CelebrateDeal
+ai-team doctor
+ai-team run ..\CelebrateDeal --workflow project-analysis
+ai-team run ..\CelebrateDeal --workflow bug-fix-loop --dry-run
+```
+
+Default provider for `run` is `mock`, so local smoke tests do not require
+OpenHands or a model key.
+
+## OpenHands Provider
+
+Default endpoint:
+
+```text
+http://127.0.0.1:31024
+```
+
+The provider requires `SESSION_API_KEY`. If it is missing, the provider fails
+closed and refuses to create a conversation.
+
+```powershell
+$env:SESSION_API_KEY = "<local-session-key>"
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands
+```
+
+## Safety Rules
+
+- Project roots must remain inside the configured workspace allowlist.
+- Protected branches such as `master` and `main` reject write workflows unless
+  the workflow is explicitly dry-run.
+- Workflows must explicitly forbid production deploy, real payment, and
+  destructive migration.
+- Provider logs and results redact token, secret, password, bearer, and `sk-*`
+  patterns.
+- The provider does not inherit or forward the full process environment.
+
+## Tests
+
+```powershell
+python -m unittest discover -s tests
+python -m compileall src tests
+```

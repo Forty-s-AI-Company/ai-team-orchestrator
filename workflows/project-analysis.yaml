@@ -1,0 +1,12 @@
+name: project-analysis
+description: Read-only project inspection and planning workflow.
+write_required: false
+forbidden_actions:
+  - production_deploy
+  - real_payment
+  - destructive_migration
+stages:
+  - inspect
+  - plan
+  - review
+  - report

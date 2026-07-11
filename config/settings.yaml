@@ -1,0 +1,12 @@
+openhands:
+  base_url: "http://127.0.0.1:31024"
+  session_key_env: "SESSION_API_KEY"
+  ready_path: "/ready"
+  conversation_path: "/api/v1/app-conversations"
+  cancel_path_template: "/api/v1/app-conversations/{task_id}/stop"
+  timeout_seconds: 30
+  max_retries: 2
+
+workspace:
+  allowlist:
+    - "C:/Users/eden/Downloads/AI"
