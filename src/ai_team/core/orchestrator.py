@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,9 @@ class WorkflowRunResult:
     provider_result: ProviderResult
     dry_run: bool
     stages: list[str]
+    started_at: datetime
+    completed_at: datetime
+    duration_ms: int
 
 
 FORBIDDEN_ACTIONS = {"production_deploy", "real_payment", "destructive_migration"}
@@ -97,13 +101,18 @@ class Orchestrator:
             timeout_seconds=timeout_seconds,
             dry_run=dry_run,
         )
+        started_at = datetime.now(UTC)
         result = self.provider.run(request)
+        completed_at = datetime.now(UTC)
 
         return WorkflowRunResult(
             workflow=workflow,
             provider_result=result,
             dry_run=dry_run,
             stages=workflow.stages,
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=int((completed_at - started_at).total_seconds() * 1000),
         )
 
 

@@ -135,11 +135,15 @@ def build_openhands_provider(settings: dict) -> OpenHandsProvider:
         base_url=str(openhands.get("base_url") or "http://127.0.0.1:31024"),
         session_key_env=str(openhands.get("session_key_env") or "SESSION_API_KEY"),
         ready_path=str(openhands.get("ready_path") or "/ready"),
-        conversation_path=str(openhands.get("conversation_path") or "/api/v1/app-conversations"),
+        conversation_path=str(openhands.get("conversation_path") or "/api/conversations"),
         cancel_path_template=str(
-            openhands.get("cancel_path_template") or "/api/v1/app-conversations/{task_id}/stop"
+            openhands.get("cancel_path_template") or "/api/conversations/{task_id}/interrupt"
         ),
         timeout_seconds=float(openhands.get("timeout_seconds") or 30),
+        host_workspace_root=str(openhands.get("host_workspace_root") or "C:/Users/eden/Downloads/AI"),
+        container_workspace_root=str(openhands.get("container_workspace_root") or "/projects"),
+        llm_model=str(openhands.get("llm_model") or "openai/gpt-5.5"),
+        llm_api_key=str(openhands.get("llm_api_key") or "placeholder-not-a-real-secret"),
     )
     return OpenHandsProvider(provider_settings)
 
@@ -191,6 +195,8 @@ def run_workflow(
         "success": result.provider_result.success,
         "attempts": result.provider_result.attempts,
         "errorType": result.provider_result.error_type,
+        "conversationId": result.provider_result.conversation_id,
+        "taskId": result.provider_result.task_id,
         "content": result.provider_result.content,
         "data": result.provider_result.data,
         "receiptPath": str(receipt_path),

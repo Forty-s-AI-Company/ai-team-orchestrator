@@ -37,6 +37,16 @@ class ProviderResult:
     attempts: int = 1
     data: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def conversation_id(self) -> str | None:
+        value = self.data.get("conversationId") or self.data.get("conversation_id")
+        return str(value) if value else None
+
+    @property
+    def task_id(self) -> str | None:
+        value = self.data.get("taskId") or self.data.get("task_id")
+        return str(value) if value else None
+
 
 class ProviderError(RuntimeError):
     def __init__(self, message: str, error_type: ProviderErrorType = ProviderErrorType.UNKNOWN) -> None:

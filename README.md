@@ -46,6 +46,13 @@ ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands
 
 If OpenHands is not running, `doctor` reports `ready: false` with a network or
 timeout diagnostic. Do not treat a mock provider result as an OpenHands pass.
+OpenHands Agent Canvas persists its generated API key at
+`%USERPROFILE%\.openhands\agent-canvas\api-key.txt`; load it into the current
+PowerShell process before provider-native smoke:
+
+```powershell
+$env:SESSION_API_KEY = (Get-Content -Raw "$env:USERPROFILE\.openhands\agent-canvas\api-key.txt").Trim()
+```
 
 ## Receipts
 
@@ -56,7 +63,9 @@ reports/receipts/
 ```
 
 Receipts include project path, branch, provider, workflow, stages, commit SHA,
-and validation result. Runtime receipts are ignored by Git.
+provider-native ready result, OpenHands conversation id, task id when available,
+started/completed timestamps, duration, and validation result. Runtime receipts
+are ignored by Git.
 
 ## Write Workflows
 

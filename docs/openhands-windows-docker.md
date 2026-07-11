@@ -45,11 +45,23 @@ Example shape:
 
 ```powershell
 docker run --rm -it `
-  -p 127.0.0.1:31024:3000 `
-  -e SESSION_API_KEY `
+  -p 127.0.0.1:31024:8000 `
   -v C:\Users\eden\Downloads\AI:/projects `
   --name openhands-local `
-  openhands/openhands:latest
+  ghcr.io/openhands/agent-canvas:1.0.0-rc.11
+```
+
+Agent Canvas generates and persists its local API key at:
+
+```text
+%USERPROFILE%\.openhands\agent-canvas\api-key.txt
+```
+
+Load it into the current PowerShell process before running provider-native
+smoke. Do not print or commit the value.
+
+```powershell
+$env:SESSION_API_KEY = (Get-Content -Raw "$env:USERPROFILE\.openhands\agent-canvas\api-key.txt").Trim()
 ```
 
 If using a local source checkout, keep the working directory in
@@ -75,13 +87,15 @@ Do not run non-dry-run write workflows on the primary worktree.
 ## Provider-Native Smoke
 
 ```powershell
-$env:SESSION_API_KEY = "<local-session-key>"
+$env:SESSION_API_KEY = (Get-Content -Raw "$env:USERPROFILE\.openhands\agent-canvas\api-key.txt").Trim()
 ai-team doctor
 ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands
 ```
 
 If OpenHands is unavailable, the provider-native run must fail with a network or
 timeout diagnostic. Do not treat a mock provider result as an OpenHands pass.
+The smoke creates an idle OpenHands conversation with `run=false`; it does not
+start the agent loop or spend model tokens.
 
 ## Receipts
 
@@ -92,7 +106,9 @@ C:\Users\eden\Downloads\AI\ai-team-orchestrator\reports\receipts
 ```
 
 They are redacted and ignored by Git. A receipt records project path, branch,
-provider, workflow, stages, commit SHA, and validation result.
+provider, workflow, stages, commit SHA, provider-native ready result, OpenHands
+conversation id, task id when available, started/completed timestamps, duration,
+and validation result.
 
 ## Diagnostics
 

@@ -29,6 +29,15 @@ def write_run_receipt(
         "workflow": result.workflow.name,
         "stages": result.stages,
         "commitSha": loaded_project.commit_sha,
+        "startedAt": result.started_at.replace(microsecond=0).isoformat(),
+        "completedAt": result.completed_at.replace(microsecond=0).isoformat(),
+        "durationMs": result.duration_ms,
+        "providerNative": {
+            "ready": redact_secrets(result.provider_result.data.get("ready")),
+            "conversationId": result.provider_result.conversation_id,
+            "taskId": result.provider_result.task_id,
+            "executionStatus": result.provider_result.data.get("executionStatus"),
+        },
         "validationResult": {
             "success": result.provider_result.success,
             "dryRun": result.dry_run,

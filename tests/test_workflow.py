@@ -69,11 +69,23 @@ class WorkflowTests(unittest.TestCase):
             )
             redaction_result = replace(
                 result,
-                provider_result=replace(result.provider_result, content="SESSION_API_KEY" + "=supersecret"),
+                provider_result=replace(
+                    result.provider_result,
+                    content="SESSION_API_KEY" + "=supersecret",
+                    data={
+                        "conversationId": "11111111-1111-4111-8111-111111111111",
+                        "taskId": "task-123",
+                        "executionStatus": "idle",
+                        "ready": {"ready": True},
+                    },
+                ),
             )
             receipt = write_run_receipt(loaded, redaction_result, Path(tmp) / "receipts")
             content = receipt.read_text(encoding="utf-8")
             self.assertIn("project-analysis", content)
+            self.assertIn("11111111-1111-4111-8111-111111111111", content)
+            self.assertIn("task-123", content)
+            self.assertIn("durationMs", content)
             self.assertNotIn("supersecret", content)
             self.assertEqual(result.workflow.name, "project-analysis")
             self.assertIn("inspect", result.stages)

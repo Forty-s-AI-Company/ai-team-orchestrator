@@ -2,9 +2,13 @@ openhands:
   base_url: "http://127.0.0.1:31024"
   session_key_env: "SESSION_API_KEY"
   ready_path: "/ready"
-  conversation_path: "/api/v1/app-conversations"
-  cancel_path_template: "/api/v1/app-conversations/{task_id}/stop"
+  conversation_path: "/api/conversations"
+  cancel_path_template: "/api/conversations/{task_id}/interrupt"
   timeout_seconds: 30
+  host_workspace_root: "C:/Users/eden/Downloads/AI"
+  container_workspace_root: "/projects"
+  llm_model: "openai/gpt-5.5"
+  llm_api_key: "placeholder-not-a-real-secret"
   max_retries: 2
 
 workspace:
