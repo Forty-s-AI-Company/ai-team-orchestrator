@@ -7,11 +7,17 @@ from .base import (
     RetryingProvider,
     redact_secrets,
 )
+from .antigravity import AntigravityProvider, AntigravitySettings
+from .codex import CodexProvider, CodexSettings
 from .handsfreecode import HandsFreeCodeProvider, HandsFreeCodeSettings
 from .openhands import OpenHandsProvider, OpenHandsSettings
 
 __all__ = [
+    "AntigravityProvider",
+    "AntigravitySettings",
     "BaseProvider",
+    "CodexProvider",
+    "CodexSettings",
     "HandsFreeCodeProvider",
     "HandsFreeCodeSettings",
     "MockProvider",

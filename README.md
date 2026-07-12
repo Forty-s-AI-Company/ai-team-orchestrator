@@ -26,6 +26,7 @@ ai-team doctor
 ai-team run ..\CelebrateDeal --workflow project-analysis
 ai-team run ..\CelebrateDeal --workflow bug-fix-loop --dry-run
 ai-team supervise ..\CelebrateDeal --once
+ai-team git-policy ..\CelebrateDeal --action commit --file README.md
 ```
 
 Default provider for `run` is `mock`, so local smoke tests do not require
@@ -198,6 +199,51 @@ deployments, migrations, settlements, and payouts.
 Fallback output is never reported as a Codex or Antigravity provider-native
 pass. If HandsFreeCode uses Ollama internally, reports keep the outer provider
 as `handsfreecode` and set `runtimeProvider: ollama`.
+
+## Codex and Antigravity CLI Providers
+
+The Codex and Antigravity providers are CLI bridges. They intentionally inherit
+only a minimal process environment and redact command output before writing
+receipts.
+
+```powershell
+ai-team doctor
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider codex --mode create-only
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider antigravity --mode create-only
+```
+
+Default diagnostics:
+
+- Codex: `codex --version` and `codex doctor --json`
+- Antigravity: `antigravity auth status` and `antigravity quota`
+
+If a CLI reports quota exhaustion, the provider returns `rate_limit` and stores
+the parsed reset time when available. The supervisor may then allow Ollama only
+for documentation, triage, review, report, and project-analysis work. It must
+not relabel fallback output as a provider-native Codex or Antigravity pass.
+
+Antigravity execution is disabled by default until its real task command is
+configured in `config/settings.yaml`; diagnostics still run provider-native.
+
+## Git Automation Policy Gate
+
+`ai-team git-policy` evaluates whether an automated Git action is allowed. It
+does not perform the action.
+
+```powershell
+ai-team git-policy ..\CelebrateDeal --action commit --file README.md
+ai-team git-policy ..\CelebrateDeal --action push
+ai-team git-policy ..\CelebrateDeal --action pr
+```
+
+Default policy:
+
+- `add` / `commit` require a disposable linked worktree.
+- protected branches such as `master` and `main` block automated writes.
+- ignored files, runtime artifacts, logs, reports, receipts, caches, venvs, and
+  suspected secret files are blocked.
+- `push`, `pr`, and `merge` remain `externalRequired` until GitHub auth, branch
+  protection, reviewed receipts, and explicit project safety policy are wired.
 
 ## Safety Rules
 

@@ -8,10 +8,15 @@ from pathlib import Path
 import yaml
 
 from ai_team.core.orchestrator import Orchestrator, WorkflowError, load_workflow
+from ai_team.core.git_policy import evaluate_git_action
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
 from ai_team.core.supervisor import SupervisorOptions, run_supervisor
 from ai_team.providers import (
+    AntigravityProvider,
+    AntigravitySettings,
+    CodexProvider,
+    CodexSettings,
     HandsFreeCodeProvider,
     HandsFreeCodeSettings,
     MockProvider,
@@ -137,6 +142,15 @@ def validate_profile(project_path: str) -> None:
     )
 
 
+def evaluate_git_policy(project_path: str, action: str, files: list[str] | None) -> None:
+    settings = load_settings()
+    loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
+    decision = evaluate_git_action(loaded, action, candidate_files=files or [])
+    print(json.dumps(redact_secrets(decision.as_dict()), indent=2, default=str))
+    if not decision.allowed:
+        raise SystemExit(2)
+
+
 def build_openhands_provider(settings: dict) -> OpenHandsProvider:
     openhands = settings.get("openhands", {}) if isinstance(settings.get("openhands"), dict) else {}
     provider_settings = OpenHandsSettings(
@@ -170,11 +184,49 @@ def build_handsfreecode_provider(settings: dict) -> HandsFreeCodeProvider:
     return HandsFreeCodeProvider(provider_settings)
 
 
+def _string_list(value, fallback: list[str]) -> list[str]:
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    return fallback
+
+
+def build_codex_provider(settings: dict) -> CodexProvider:
+    codex = settings.get("codex", {}) if isinstance(settings.get("codex"), dict) else {}
+    provider_settings = CodexSettings(
+        executable=str(codex.get("executable") or "codex"),
+        status_args=_string_list(codex.get("status_args"), ["--version"]),
+        quota_args=_string_list(codex.get("quota_args"), ["doctor", "--json"]),
+        run_args=_string_list(codex.get("run_args"), ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]),
+        timeout_seconds=float(codex.get("timeout_seconds") or 45),
+        run_timeout_seconds=float(codex.get("run_timeout_seconds") or 180),
+        execution_enabled=bool(codex.get("execution_enabled", True)),
+    )
+    return CodexProvider(provider_settings)
+
+
+def build_antigravity_provider(settings: dict) -> AntigravityProvider:
+    antigravity = settings.get("antigravity", {}) if isinstance(settings.get("antigravity"), dict) else {}
+    provider_settings = AntigravitySettings(
+        executable=str(antigravity.get("executable") or "antigravity"),
+        status_args=_string_list(antigravity.get("status_args"), ["auth", "status"]),
+        quota_args=_string_list(antigravity.get("quota_args"), ["quota"]),
+        run_args=_string_list(antigravity.get("run_args"), []),
+        timeout_seconds=float(antigravity.get("timeout_seconds") or 45),
+        run_timeout_seconds=float(antigravity.get("run_timeout_seconds") or 180),
+        execution_enabled=bool(antigravity.get("execution_enabled", False)),
+    )
+    return AntigravityProvider(provider_settings)
+
+
 def build_provider(provider_name: str, settings: dict):
     if provider_name == "mock":
         return MockProvider()
     if provider_name == "handsfreecode":
         return build_handsfreecode_provider(settings)
+    if provider_name == "codex":
+        return build_codex_provider(settings)
+    if provider_name == "antigravity":
+        return build_antigravity_provider(settings)
     return build_openhands_provider(settings)
 
 
@@ -182,16 +234,22 @@ def doctor() -> None:
     settings = load_settings()
     openhands = build_openhands_provider(settings).diagnostics()
     handsfreecode = build_handsfreecode_provider(settings).diagnostics()
+    codex = build_codex_provider(settings).diagnostics()
+    antigravity = build_antigravity_provider(settings).diagnostics()
     print(
         json.dumps(
             {
                 "settings": str(DEFAULT_SETTINGS_PATH),
                 "openhands": openhands,
                 "handsfreecode": handsfreecode,
+                "codex": codex,
+                "antigravity": antigravity,
                 "providerNative": {
                     "openhands": {
-                        "ready": openhands.get("ready") is True,
-                        "externalRequired": not openhands.get("ready"),
+                        "ready": openhands.get("ready") is True and openhands.get("sessionKeyPresent") is True,
+                        "externalRequired": not (
+                            openhands.get("ready") is True and openhands.get("sessionKeyPresent") is True
+                        ),
                     },
                     "handsfreecode": {
                         "ready": handsfreecode.get("ready") is True
@@ -202,6 +260,18 @@ def doctor() -> None:
                             and handsfreecode.get("authConfigured") is True
                             and handsfreecode.get("sessionKeyPresent") is True
                         ),
+                    },
+                    "codex": {
+                        "ready": codex.get("ready") is True,
+                        "externalRequired": not codex.get("ready"),
+                        "quotaExhausted": codex.get("quotaExhausted") is True,
+                        "resetTime": codex.get("resetTime"),
+                    },
+                    "antigravity": {
+                        "ready": antigravity.get("ready") is True,
+                        "externalRequired": not antigravity.get("ready"),
+                        "quotaExhausted": antigravity.get("quotaExhausted") is True,
+                        "resetTime": antigravity.get("resetTime"),
                     },
                 },
             },
@@ -223,7 +293,7 @@ def run_workflow(
     loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
     load_workflow(workflow_name)
     provider = build_provider(provider_name, settings)
-    timeout_seconds = provider.settings.timeout_seconds if isinstance(provider, (OpenHandsProvider, HandsFreeCodeProvider)) else 30
+    timeout_seconds = provider.settings.timeout_seconds if hasattr(provider, "settings") else 30
     result = Orchestrator(provider=provider, max_retries=2).run(
         loaded,
         workflow_name=workflow_name,
@@ -315,10 +385,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("doctor", help="Check provider settings and provider-native loopback status")
 
+    git_policy_parser = subparsers.add_parser("git-policy", help="Evaluate guarded git automation policy")
+    git_policy_parser.add_argument("project", nargs="?", default=".")
+    git_policy_parser.add_argument(
+        "--action",
+        choices=["add", "commit", "push", "pr", "pull-request", "merge"],
+        required=True,
+    )
+    git_policy_parser.add_argument("--file", action="append", default=[])
+
     run_parser = subparsers.add_parser("run", help="Run a guarded workflow")
     run_parser.add_argument("project", nargs="?", default=".")
     run_parser.add_argument("--workflow", required=True)
-    run_parser.add_argument("--provider", choices=["mock", "openhands", "handsfreecode"], default="mock")
+    run_parser.add_argument(
+        "--provider",
+        choices=["mock", "openhands", "handsfreecode", "codex", "antigravity"],
+        default="mock",
+    )
     run_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--receipt-dir")
@@ -326,7 +409,11 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_parser = subparsers.add_parser("supervise", help="Run autonomous safe supervisor loop")
     supervisor_parser.add_argument("project", nargs="?", default=".")
     supervisor_parser.add_argument("--workflow", default="project-analysis")
-    supervisor_parser.add_argument("--provider", choices=["mock", "openhands", "handsfreecode"], default="mock")
+    supervisor_parser.add_argument(
+        "--provider",
+        choices=["mock", "openhands", "handsfreecode", "codex", "antigravity"],
+        default="mock",
+    )
     supervisor_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
     supervisor_parser.add_argument("--dry-run", action="store_true", default=True)
     supervisor_parser.add_argument("--execute", action="store_false", dest="dry_run")
@@ -362,6 +449,8 @@ def main() -> None:
             validate_profile(args.project)
         elif args.command == "doctor":
             doctor()
+        elif args.command == "git-policy":
+            evaluate_git_policy(args.project, args.action, args.file)
         elif args.command == "run":
             run_workflow(args.project, args.workflow, args.provider, args.dry_run, args.receipt_dir, args.mode)
         elif args.command == "supervise":

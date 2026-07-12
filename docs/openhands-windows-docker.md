@@ -223,6 +223,26 @@ When Codex or Antigravity reports quota exhaustion, the supervisor records the
 provider, parsed reset time when available, fallback policy, and next action in
 state. It does not pretend that fallback work is provider-native.
 
+Codex and Antigravity are checked through their native CLIs:
+
+```powershell
+ai-team doctor
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider codex --mode create-only
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider antigravity --mode create-only
+```
+
+The bridge does not inherit the full process environment. Keep credentials in
+the provider's own authenticated CLI storage or explicitly documented local
+variables. Do not place keys in `config/settings.yaml`.
+
+Default commands:
+
+- Codex: `codex --version`, `codex doctor --json`
+- Antigravity: `antigravity auth status`, `antigravity quota`
+
+If these commands timeout or report quota exhaustion, mark the provider as
+`External required`; do not substitute mock or Ollama output as a provider pass.
+
 Allowed Ollama fallback scope:
 
 - documentation
@@ -255,6 +275,28 @@ If HandsFreeCode uses Ollama internally, reports keep:
 - `session_key`: set the local session key in the current shell.
 - `llm_credentials`: set the provider's local LLM credential before agent mode.
 - quota exhaustion: wait until reset time or allow only low-risk Ollama fallback.
+- `codex_cli`: confirm Codex login, quota, and `codex doctor --json` latency.
+- `antigravity_cli`: confirm Antigravity login, quota, and native browser QA.
+
+## Git Automation Gate
+
+Before any autonomous Git operation, evaluate the policy:
+
+```powershell
+ai-team git-policy ..\CelebrateDeal --action commit --file README.md
+ai-team git-policy ..\CelebrateDeal --action push
+ai-team git-policy ..\CelebrateDeal --action pr
+```
+
+Current gate behavior:
+
+- `add` / `commit` are allowed only in a disposable linked worktree.
+- `master` and `main` are protected by default.
+- ignored files, runtime artifacts, logs, reports, receipts, cache folders,
+  virtualenvs, and suspected secret files are rejected.
+- `push`, PR creation, and merge are intentionally `External required` until
+  GitHub CLI auth, branch protection, reviewed receipts, staged secret scan,
+  and explicit project safety policy are connected.
 
 ## Receipts
 
