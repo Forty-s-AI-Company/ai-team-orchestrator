@@ -27,6 +27,8 @@ ai-team run ..\CelebrateDeal --workflow project-analysis
 ai-team run ..\CelebrateDeal --workflow bug-fix-loop --dry-run
 ai-team supervise ..\CelebrateDeal --once
 ai-team git-policy ..\CelebrateDeal --action commit --file README.md
+ai-team isolated-run ..\CelebrateDeal --workflow bug-fix-loop --provider mock --mode create-only
+ai-team github-gate ..\CelebrateDeal --action push
 ```
 
 Default provider for `run` is `mock`, so local smoke tests do not require
@@ -126,6 +128,22 @@ git worktree add --detach ..\CelebrateDeal-openhands-disposable HEAD
 cd ..\ai-team-orchestrator
 ai-team run ..\CelebrateDeal-openhands-disposable --workflow bug-fix-loop
 ```
+
+The preferred unattended write entry point is `isolated-run`. It creates a
+temporary disposable worktree from the source project, runs the write workflow
+there, writes both the workflow receipt and executor receipt, then evaluates
+the commit policy against the changed files.
+
+```powershell
+ai-team isolated-run ..\CelebrateDeal `
+  --workflow bug-fix-loop `
+  --provider mock `
+  --mode create-only `
+  --receipt-dir reports\isolated-smoke
+```
+
+Use `--remove-worktree` for short-lived smoke tests. Keep the worktree only
+when a reviewer or later automation stage needs to inspect the generated diff.
 
 `run-agent` starts the OpenHands agent loop via `/api/conversations/{id}/run`.
 It requires a local LLM credential in `OPENHANDS_LLM_API_KEY`; without it the
@@ -244,6 +262,20 @@ Default policy:
   suspected secret files are blocked.
 - `push`, `pr`, and `merge` remain `externalRequired` until GitHub auth, branch
   protection, reviewed receipts, and explicit project safety policy are wired.
+
+`ai-team github-gate` evaluates GitHub-level automation. It is dry-run by
+default and does not push, create PRs, or merge.
+
+```powershell
+ai-team github-gate ..\CelebrateDeal --action push
+ai-team github-gate ..\CelebrateDeal --action pr --validation-log-hash <sha256>
+ai-team github-gate ..\CelebrateDeal --action merge --validation-log-hash <sha256>
+```
+
+Push, PR, and merge execution require GitHub CLI authentication, branch
+protection, validation log hashes, reviewed executor receipts, and explicit
+project safety policy. Merge remains blocked until branch protection and review
+status are wired into the gate.
 
 ## Safety Rules
 

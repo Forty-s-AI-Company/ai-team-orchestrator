@@ -134,6 +134,21 @@ ai-team run ..\CelebrateDeal-openhands-disposable --workflow bug-fix-loop
 Do not run non-dry-run write workflows on `master` or `main`.
 Do not run non-dry-run write workflows on the primary worktree.
 
+For unattended runs, prefer the isolated executor:
+
+```powershell
+ai-team isolated-run ..\CelebrateDeal `
+  --workflow bug-fix-loop `
+  --provider mock `
+  --mode create-only `
+  --receipt-dir reports\isolated-smoke
+```
+
+The isolated executor creates a disposable linked worktree, runs the workflow,
+writes a run receipt and executor receipt, and evaluates the Git commit policy
+against changed files. Use `--remove-worktree` for smoke tests when the diff
+does not need to be inspected later.
+
 ## Provider-Native Smoke
 
 ```powershell
@@ -297,6 +312,19 @@ Current gate behavior:
 - `push`, PR creation, and merge are intentionally `External required` until
   GitHub CLI auth, branch protection, reviewed receipts, staged secret scan,
   and explicit project safety policy are connected.
+
+GitHub-level automation is guarded separately:
+
+```powershell
+ai-team github-gate ..\CelebrateDeal --action push
+ai-team github-gate ..\CelebrateDeal --action pr --validation-log-hash <sha256>
+ai-team github-gate ..\CelebrateDeal --action merge --validation-log-hash <sha256>
+```
+
+`github-gate` is dry-run by default. It must not perform real push, PR, or
+merge operations unless a later policy explicitly enables execution and the
+required receipts, validation hash, GitHub CLI authentication, and branch
+protection checks are present.
 
 ## Receipts
 

@@ -9,6 +9,8 @@ import yaml
 
 from ai_team.core.orchestrator import Orchestrator, WorkflowError, load_workflow
 from ai_team.core.git_policy import evaluate_git_action
+from ai_team.core.github_gate import evaluate_github_action
+from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
 from ai_team.core.supervisor import SupervisorOptions, run_supervisor
@@ -326,6 +328,65 @@ def run_workflow(
         raise SystemExit(2)
 
 
+def run_isolated_workflow(
+    project_path: str,
+    workflow_name: str,
+    provider_name: str,
+    dry_run: bool,
+    receipt_dir: str | None,
+    mode: str,
+    worktree_parent: str | None,
+    keep_worktree: bool,
+) -> None:
+    settings = load_settings()
+    provider = build_provider(provider_name, settings)
+    result = run_in_disposable_worktree(
+        source_project_path=project_path,
+        provider=provider,
+        workflow_name=workflow_name,
+        workspace_allowlist=workspace_allowlist(settings),
+        receipt_dir=Path(receipt_dir).resolve() if receipt_dir else REPO_ROOT / "reports" / "isolated",
+        worktree_parent=Path(worktree_parent).resolve() if worktree_parent else None,
+        dry_run=dry_run,
+        run_mode=mode,
+        keep_worktree=keep_worktree,
+    )
+    payload = {
+        "workflow": result.workflow_result.workflow.name,
+        "provider": result.workflow_result.provider_result.provider,
+        "runMode": mode,
+        "dryRun": dry_run,
+        "success": result.workflow_result.provider_result.success,
+        "errorType": result.workflow_result.provider_result.error_type,
+        "worktreePath": str(result.worktree_path),
+        "runReceipt": str(result.run_receipt),
+        "executorReceipt": str(result.executor_receipt),
+        "gitPolicy": result.git_policy,
+    }
+    print(json.dumps(redact_secrets(payload), indent=2, default=str))
+    if not result.workflow_result.provider_result.success:
+        raise SystemExit(2)
+
+
+def evaluate_github_gate(
+    project_path: str,
+    action: str,
+    dry_run: bool,
+    validation_log_hash: str | None,
+) -> None:
+    settings = load_settings()
+    loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
+    decision = evaluate_github_action(
+        loaded,
+        action,
+        dry_run=dry_run,
+        validation_log_hash=validation_log_hash,
+    )
+    print(json.dumps(redact_secrets(decision.as_dict()), indent=2, default=str))
+    if not decision.allowed:
+        raise SystemExit(2)
+
+
 def supervise(
     project_path: str,
     workflow_name: str,
@@ -406,6 +467,28 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--receipt-dir")
 
+    isolated_parser = subparsers.add_parser("isolated-run", help="Run a write workflow in a disposable worktree")
+    isolated_parser.add_argument("project", nargs="?", default=".")
+    isolated_parser.add_argument("--workflow", required=True)
+    isolated_parser.add_argument(
+        "--provider",
+        choices=["mock", "openhands", "handsfreecode", "codex", "antigravity"],
+        default="mock",
+    )
+    isolated_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
+    isolated_parser.add_argument("--dry-run", action="store_true")
+    isolated_parser.add_argument("--receipt-dir")
+    isolated_parser.add_argument("--worktree-parent")
+    isolated_parser.add_argument("--remove-worktree", action="store_false", dest="keep_worktree")
+    isolated_parser.set_defaults(keep_worktree=True)
+
+    github_parser = subparsers.add_parser("github-gate", help="Evaluate guarded GitHub automation policy")
+    github_parser.add_argument("project", nargs="?", default=".")
+    github_parser.add_argument("--action", choices=["push", "pr", "pull-request", "merge"], required=True)
+    github_parser.add_argument("--execute", action="store_false", dest="dry_run")
+    github_parser.set_defaults(dry_run=True)
+    github_parser.add_argument("--validation-log-hash")
+
     supervisor_parser = subparsers.add_parser("supervise", help="Run autonomous safe supervisor loop")
     supervisor_parser.add_argument("project", nargs="?", default=".")
     supervisor_parser.add_argument("--workflow", default="project-analysis")
@@ -453,6 +536,19 @@ def main() -> None:
             evaluate_git_policy(args.project, args.action, args.file)
         elif args.command == "run":
             run_workflow(args.project, args.workflow, args.provider, args.dry_run, args.receipt_dir, args.mode)
+        elif args.command == "isolated-run":
+            run_isolated_workflow(
+                args.project,
+                args.workflow,
+                args.provider,
+                args.dry_run,
+                args.receipt_dir,
+                args.mode,
+                args.worktree_parent,
+                args.keep_worktree,
+            )
+        elif args.command == "github-gate":
+            evaluate_github_gate(args.project, args.action, args.dry_run, args.validation_log_hash)
         elif args.command == "supervise":
             supervise(
                 args.project,
