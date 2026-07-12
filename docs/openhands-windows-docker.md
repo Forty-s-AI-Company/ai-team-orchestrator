@@ -230,6 +230,20 @@ ai-team supervise ..\CelebrateDeal `
   --state-path reports\supervisor\handsfreecode-state.json
 ```
 
+To allow the supervisor to run a write workflow, use `--execute` with
+`--auto-commit`. This delegates to the isolated executor; it does not write to
+the primary CelebrateDeal worktree.
+
+```powershell
+ai-team supervise ..\CelebrateDeal `
+  --workflow bug-fix-loop `
+  --provider handsfreecode `
+  --mode create-only `
+  --execute `
+  --auto-commit `
+  --once
+```
+
 Pause by closing the shell or stopping the process with `Ctrl+C`.
 Resume by running the same command with the same `--state-path`; the next report
 will include the previous state revision. Stop by ending the supervisor process

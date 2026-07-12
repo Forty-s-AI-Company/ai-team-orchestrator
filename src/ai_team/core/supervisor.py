@@ -11,7 +11,9 @@ from typing import Any
 from uuid import uuid4
 
 from ai_team.core.fallback_policy import decide_fallback, state_timestamp
+from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.orchestrator import Orchestrator
+from ai_team.core.orchestrator import load_workflow
 from ai_team.core.project_loader import LoadedProject, ProjectConfigError, load_project
 from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderResult, redact_secrets
 
@@ -29,6 +31,7 @@ class SupervisorOptions:
     report_dir: Path = Path("reports/supervisor")
     workspace_allowlist: list[str] | None = None
     state_path: Path | None = None
+    isolated_auto_commit: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,14 +100,38 @@ def run_supervisor_cycle(options: SupervisorOptions, cycle_number: int) -> Path:
 
     provider_result: ProviderResult | None = None
     provider_error_message: str | None = None
+    isolated_details: dict[str, Any] | None = None
     if loaded is not None:
         try:
-            provider_result = Orchestrator(options.provider, max_retries=1).run(
-                loaded,
-                workflow_name=options.workflow,
-                dry_run=options.dry_run,
-                run_mode=options.run_mode,
-            ).provider_result
+            workflow = load_workflow(options.workflow)
+            if workflow.write_required and not options.dry_run:
+                isolated = run_in_disposable_worktree(
+                    source_project_path=options.project_path,
+                    provider=options.provider,
+                    workflow_name=options.workflow,
+                    workspace_allowlist=options.workspace_allowlist,
+                    receipt_dir=options.report_dir / "isolated",
+                    worktree_parent=options.project_path.resolve().parent,
+                    dry_run=False,
+                    run_mode=options.run_mode,
+                    keep_worktree=True,
+                    auto_commit=options.isolated_auto_commit,
+                )
+                provider_result = isolated.workflow_result.provider_result
+                isolated_details = {
+                    "worktreePath": str(isolated.worktree_path),
+                    "runReceipt": str(isolated.run_receipt),
+                    "executorReceipt": str(isolated.executor_receipt),
+                    "gitPolicy": isolated.git_policy,
+                    "commitResult": isolated.commit_result,
+                }
+            else:
+                provider_result = Orchestrator(options.provider, max_retries=1).run(
+                    loaded,
+                    workflow_name=options.workflow,
+                    dry_run=options.dry_run,
+                    run_mode=options.run_mode,
+                ).provider_result
             auto_cycle_success = provider_result.success or provider_result.error_type == ProviderErrorType.EXTERNAL_REQUIRED
             stages.append(
                 _stage(
@@ -115,6 +142,7 @@ def run_supervisor_cycle(options: SupervisorOptions, cycle_number: int) -> Path:
                         "success": provider_result.success,
                         "errorType": provider_result.error_type,
                         "externalRequired": provider_result.data.get("externalRequired"),
+                        "isolatedExecutor": isolated_details,
                     },
                 )
             )

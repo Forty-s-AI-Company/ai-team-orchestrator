@@ -210,6 +210,23 @@ ai-team supervise ..\CelebrateDeal `
   --state-path reports\supervisor\handsfreecode-state.json
 ```
 
+Run a write-capable workflow through the supervisor only when the isolated
+executor is intended:
+
+```powershell
+ai-team supervise ..\CelebrateDeal `
+  --workflow bug-fix-loop `
+  --provider handsfreecode `
+  --mode create-only `
+  --execute `
+  --auto-commit `
+  --once
+```
+
+In this mode the supervisor creates a disposable worktree and delegates the
+write workflow to `isolated-run`. The primary project worktree remains read
+only from the supervisor's point of view.
+
 The current supervisor is intentionally conservative. It writes structured
 reports to `reports/supervisor/` and does not push, merge, deploy, run real
 payments, or modify production data. Git push, PR, and merge automation must be

@@ -253,6 +253,36 @@ class SupervisorTests(unittest.TestCase):
             self.assertNotIn("plain-secret-value", state)
             self.assertIn("<redacted>", state)
 
+    def test_execute_write_workflow_uses_isolated_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            subprocess.run(["git", "config", "user.email", "test@example.local"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "AI Team Test"], cwd=root, check=True)
+            subprocess.run(["git", "add", ".ai-team/project.yaml"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
+
+            summary = run_supervisor(
+                SupervisorOptions(
+                    project_path=root,
+                    provider=_WritingProvider("notes/change.md", "safe change\n"),
+                    workflow="bug-fix-loop",
+                    dry_run=False,
+                    once=True,
+                    report_dir=Path(tmp) / "reports",
+                    workspace_allowlist=[tmp],
+                    isolated_auto_commit=True,
+                )
+            )
+
+            report = json.loads(summary.report_paths[0].read_text(encoding="utf-8"))
+            auto_cycle = next(stage for stage in report["stages"] if stage["name"] == "auto-cycle")
+            isolated = auto_cycle["details"]["isolatedExecutor"]
+            self.assertTrue(auto_cycle["ok"])
+            self.assertIn("worktreePath", isolated)
+            self.assertTrue(isolated["commitResult"]["committed"], isolated["commitResult"])
+
 
 class _StaticProvider(BaseProvider):
     name = "static"
@@ -266,6 +296,28 @@ class _StaticProvider(BaseProvider):
 
     def run(self, request: ProviderRequest) -> ProviderResult:
         return self.result
+
+
+class _WritingProvider(BaseProvider):
+    name = "writing-test"
+
+    def __init__(self, relative_path: str, content: str) -> None:
+        self.relative_path = relative_path
+        self.content = content
+
+    def ready(self) -> bool:
+        return True
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        target = request.project_root / self.relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.content, encoding="utf-8")
+        return ProviderResult(
+            provider=self.name,
+            success=True,
+            content="wrote file",
+            data={"runMode": request.run_mode},
+        )
 
 
 if __name__ == "__main__":
