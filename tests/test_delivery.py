@@ -8,10 +8,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ai_team.core.delivery import DeliveryOptions, TrustedTask, run_delivery_cycle
+from ai_team.cli import build_parser
 from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
 
 
 class DeliveryTests(unittest.TestCase):
+    def test_supervisor_delivery_flag_is_parsed(self) -> None:
+        args = build_parser().parse_args(["supervise", "project", "--delivery"])
+        self.assertTrue(args.delivery)
+
     def test_trusted_task_runs_in_disposable_worktree_and_persists_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

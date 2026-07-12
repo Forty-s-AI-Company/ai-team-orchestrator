@@ -746,7 +746,6 @@ def main() -> None:
                 args.github_branch,
                 args.validation_log_hash,
                 args.test_evidence_hash,
-                args.delivery,
             )
         elif args.command == "github-gate":
             evaluate_github_gate(
@@ -775,6 +774,7 @@ def main() -> None:
                 args.github_execute,
                 args.validation_log_hash,
                 args.test_evidence_hash,
+                args.delivery,
             )
     except (ProjectConfigError, WorkflowError) as exc:
         print(f"ai-team error: {exc}", file=sys.stderr)
