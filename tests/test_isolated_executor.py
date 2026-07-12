@@ -10,6 +10,7 @@ from ai_team.core.github_gate import evaluate_github_action
 from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import load_project
 from ai_team.providers import MockProvider
+from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
 
 
 def init_committed_project(root: Path, allow_git_push: bool = False) -> None:
@@ -89,6 +90,54 @@ class IsolatedExecutorTests(unittest.TestCase):
                     worktree_parent=Path(tmp),
                 )
 
+    def test_auto_commit_commits_safe_changes_in_disposable_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+
+            result = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=_WritingProvider("notes/change.md", "safe change\n"),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                auto_commit=True,
+                commit_message="chore(ai-team): test safe change",
+            )
+
+            self.assertTrue(result.commit_result["committed"], result.commit_result)
+            log = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s"],
+                cwd=result.worktree_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(log.stdout.strip(), "chore(ai-team): test safe change")
+
+    def test_auto_commit_blocks_secret_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+
+            result = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=_WritingProvider("config.txt", "api_key = plain-secret-value\n"),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                auto_commit=True,
+            )
+
+            self.assertFalse(result.commit_result["committed"])
+            self.assertIn("policy denied", result.commit_result["reason"])
+
     def test_github_gate_push_without_policy_is_external_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -129,6 +178,28 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertFalse(decision.allowed)
             self.assertTrue(decision.external_required)
             self.assertIn("branch protection", " ".join(decision.reasons))
+
+
+class _WritingProvider(BaseProvider):
+    name = "writing-test"
+
+    def __init__(self, relative_path: str, content: str) -> None:
+        self.relative_path = relative_path
+        self.content = content
+
+    def ready(self) -> bool:
+        return True
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        target = request.project_root / self.relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.content, encoding="utf-8")
+        return ProviderResult(
+            provider=self.name,
+            success=True,
+            content="wrote file",
+            data={"runMode": request.run_mode},
+        )
 
 
 if __name__ == "__main__":

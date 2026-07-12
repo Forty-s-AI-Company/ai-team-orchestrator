@@ -22,6 +22,7 @@ class IsolatedRunResult:
     run_receipt: Path
     executor_receipt: Path
     git_policy: dict[str, Any]
+    commit_result: dict[str, Any]
 
 
 def run_in_disposable_worktree(
@@ -34,6 +35,8 @@ def run_in_disposable_worktree(
     dry_run: bool = False,
     run_mode: str = "create-only",
     keep_worktree: bool = True,
+    auto_commit: bool = False,
+    commit_message: str | None = None,
 ) -> IsolatedRunResult:
     source = load_project(source_project_path, allowlist=workspace_allowlist)
     workflow = load_workflow(workflow_name)
@@ -60,6 +63,13 @@ def run_in_disposable_worktree(
         git_policy = evaluate_git_action(loaded, "commit", candidate_files=changed_files).as_dict()
         git_policy["changedFiles"] = changed_files
         git_policy["fileCheck"] = file_check
+        commit_result = maybe_commit_changed_files(
+            loaded,
+            changed_files=changed_files,
+            git_policy=git_policy,
+            enabled=auto_commit,
+            commit_message=commit_message or default_commit_message(workflow_name),
+        )
         run_receipt = write_run_receipt(loaded, result, receipt_dir)
         executor_receipt = write_executor_receipt(
             source_project=source,
@@ -68,6 +78,7 @@ def run_in_disposable_worktree(
             run_receipt=run_receipt,
             receipt_dir=receipt_dir,
             git_policy=git_policy,
+            commit_result=commit_result,
             keep_worktree=keep_worktree,
         )
         return IsolatedRunResult(
@@ -76,6 +87,7 @@ def run_in_disposable_worktree(
             run_receipt=run_receipt,
             executor_receipt=executor_receipt,
             git_policy=git_policy,
+            commit_result=commit_result,
         )
     finally:
         if not keep_worktree and worktree_path.exists():
@@ -108,6 +120,59 @@ def list_changed_files(project_root: Path) -> list[str]:
     return files
 
 
+def maybe_commit_changed_files(
+    loaded_project: LoadedProject,
+    changed_files: list[str],
+    git_policy: dict[str, Any],
+    enabled: bool,
+    commit_message: str,
+) -> dict[str, Any]:
+    if not enabled:
+        return {"attempted": False, "committed": False, "reason": "auto commit disabled"}
+    if not changed_files:
+        return {"attempted": True, "committed": False, "reason": "no changed files"}
+    if not git_policy.get("allowed"):
+        return {
+            "attempted": True,
+            "committed": False,
+            "reason": "git policy denied commit",
+            "policyReasons": git_policy.get("reasons", []),
+        }
+
+    _run_git(loaded_project.root, ["add", "--", *changed_files])
+    staged_files = list_staged_files(loaded_project.root)
+    staged_policy = evaluate_git_action(loaded_project, "commit", candidate_files=staged_files).as_dict()
+    if not staged_policy.get("allowed"):
+        _run_git(loaded_project.root, ["reset", "--", *staged_files])
+        return {
+            "attempted": True,
+            "committed": False,
+            "reason": "staged policy denied commit",
+            "policyReasons": staged_policy.get("reasons", []),
+            "stagedFiles": staged_files,
+        }
+
+    _run_git(loaded_project.root, ["commit", "-m", commit_message])
+    commit_sha = _run_git(loaded_project.root, ["rev-parse", "HEAD"]).stdout.strip()
+    return {
+        "attempted": True,
+        "committed": True,
+        "commitSha": commit_sha,
+        "message": commit_message,
+        "stagedFiles": staged_files,
+    }
+
+
+def list_staged_files(project_root: Path) -> list[str]:
+    result = _run_git(project_root, ["diff", "--cached", "--name-only"])
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def default_commit_message(workflow_name: str) -> str:
+    safe_workflow = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in workflow_name)
+    return f"chore(ai-team): apply {safe_workflow}"
+
+
 def write_executor_receipt(
     source_project: LoadedProject,
     worktree_project: LoadedProject,
@@ -115,6 +180,7 @@ def write_executor_receipt(
     run_receipt: Path,
     receipt_dir: Path,
     git_policy: dict[str, Any],
+    commit_result: dict[str, Any],
     keep_worktree: bool,
 ) -> Path:
     receipt_dir.mkdir(parents=True, exist_ok=True)
@@ -135,6 +201,7 @@ def write_executor_receipt(
         "stages": result.stages,
         "runReceipt": str(run_receipt),
         "gitPolicy": git_policy,
+        "commitResult": commit_result,
         "keepWorktree": keep_worktree,
         "validationResult": {
             "success": result.provider_result.success,

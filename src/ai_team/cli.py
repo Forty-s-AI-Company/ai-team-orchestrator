@@ -337,6 +337,8 @@ def run_isolated_workflow(
     mode: str,
     worktree_parent: str | None,
     keep_worktree: bool,
+    auto_commit: bool,
+    commit_message: str | None,
 ) -> None:
     settings = load_settings()
     provider = build_provider(provider_name, settings)
@@ -350,6 +352,8 @@ def run_isolated_workflow(
         dry_run=dry_run,
         run_mode=mode,
         keep_worktree=keep_worktree,
+        auto_commit=auto_commit,
+        commit_message=commit_message,
     )
     payload = {
         "workflow": result.workflow_result.workflow.name,
@@ -362,6 +366,7 @@ def run_isolated_workflow(
         "runReceipt": str(result.run_receipt),
         "executorReceipt": str(result.executor_receipt),
         "gitPolicy": result.git_policy,
+        "commitResult": result.commit_result,
     }
     print(json.dumps(redact_secrets(payload), indent=2, default=str))
     if not result.workflow_result.provider_result.success:
@@ -481,6 +486,8 @@ def build_parser() -> argparse.ArgumentParser:
     isolated_parser.add_argument("--worktree-parent")
     isolated_parser.add_argument("--remove-worktree", action="store_false", dest="keep_worktree")
     isolated_parser.set_defaults(keep_worktree=True)
+    isolated_parser.add_argument("--auto-commit", action="store_true")
+    isolated_parser.add_argument("--commit-message")
 
     github_parser = subparsers.add_parser("github-gate", help="Evaluate guarded GitHub automation policy")
     github_parser.add_argument("project", nargs="?", default=".")
@@ -546,6 +553,8 @@ def main() -> None:
                 args.mode,
                 args.worktree_parent,
                 args.keep_worktree,
+                args.auto_commit,
+                args.commit_message,
             )
         elif args.command == "github-gate":
             evaluate_github_gate(args.project, args.action, args.dry_run, args.validation_log_hash)

@@ -145,6 +145,23 @@ ai-team isolated-run ..\CelebrateDeal `
 Use `--remove-worktree` for short-lived smoke tests. Keep the worktree only
 when a reviewer or later automation stage needs to inspect the generated diff.
 
+When a provider actually writes files, `--auto-commit` can commit the generated
+diff inside the disposable worktree only. It never commits on the primary
+CelebrateDeal worktree.
+
+```powershell
+ai-team isolated-run ..\CelebrateDeal `
+  --workflow bug-fix-loop `
+  --provider handsfreecode `
+  --mode create-only `
+  --auto-commit `
+  --commit-message "chore(ai-team): apply guarded fix"
+```
+
+Auto-commit first evaluates `git-policy`, rejects ignored/runtime/secret-like
+files, stages only the changed files, evaluates staged files again, and writes
+the commit SHA into the executor receipt.
+
 `run-agent` starts the OpenHands agent loop via `/api/conversations/{id}/run`.
 It requires a local LLM credential in `OPENHANDS_LLM_API_KEY`; without it the
 provider returns `external_required` and does not create a conversation.

@@ -149,6 +149,23 @@ writes a run receipt and executor receipt, and evaluates the Git commit policy
 against changed files. Use `--remove-worktree` for smoke tests when the diff
 does not need to be inspected later.
 
+If the provider writes a safe diff, enable local auto-commit inside the
+disposable worktree:
+
+```powershell
+ai-team isolated-run ..\CelebrateDeal `
+  --workflow bug-fix-loop `
+  --provider handsfreecode `
+  --mode create-only `
+  --auto-commit `
+  --commit-message "chore(ai-team): apply guarded fix"
+```
+
+Auto-commit never runs on the primary worktree. It evaluates changed files with
+`git-policy`, stages them, evaluates staged files again, then writes the new
+commit SHA into the executor receipt. Push / PR / merge still require
+`github-gate`.
+
 ## Provider-Native Smoke
 
 ```powershell
