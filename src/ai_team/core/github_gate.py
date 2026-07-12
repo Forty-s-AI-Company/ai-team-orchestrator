@@ -35,6 +35,9 @@ def evaluate_github_action(
     action: str,
     dry_run: bool = True,
     validation_log_hash: str | None = None,
+    receipt_hash: str | None = None,
+    secret_scan_hash: str | None = None,
+    test_evidence_hash: str | None = None,
 ) -> GitHubGateDecision:
     normalized = action.lower().strip()
     if normalized == "pull-request":
@@ -49,9 +52,15 @@ def evaluate_github_action(
             evidence=_base_evidence(loaded_project, validation_log_hash),
         )
 
-    git_policy_action = "push" if normalized == "push" else normalized
+    git_policy_action = "push" if normalized == "push" else "pr"
     git_policy = evaluate_git_action(loaded_project, git_policy_action)
-    evidence = _base_evidence(loaded_project, validation_log_hash)
+    evidence = _base_evidence(
+        loaded_project,
+        validation_log_hash,
+        receipt_hash=receipt_hash,
+        secret_scan_hash=secret_scan_hash,
+        test_evidence_hash=test_evidence_hash,
+    )
     evidence["gitPolicy"] = git_policy.as_dict()
     evidence["githubCliAvailable"] = shutil.which("gh") is not None
 
@@ -76,20 +85,30 @@ def evaluate_github_action(
         reasons.append("validation log hash is required before PR or merge automation")
 
     if normalized == "merge":
-        reasons.append("merge requires branch protection, review status, and explicit human-approved policy")
-        external_required = True
+        if not receipt_hash:
+            reasons.append("merge requires receipt hash")
+        if not secret_scan_hash:
+            reasons.append("merge requires staged secret scan hash")
+        if not test_evidence_hash:
+            reasons.append("merge requires test evidence hash")
 
     return GitHubGateDecision(
         action=normalized,
-        allowed=dry_run and not reasons,
+        allowed=not reasons,
         dry_run=dry_run,
-        external_required=external_required or not dry_run,
+        external_required=external_required,
         reasons=reasons,
         evidence=evidence,
     )
 
 
-def _base_evidence(loaded_project: LoadedProject, validation_log_hash: str | None) -> dict[str, Any]:
+def _base_evidence(
+    loaded_project: LoadedProject,
+    validation_log_hash: str | None,
+    receipt_hash: str | None = None,
+    secret_scan_hash: str | None = None,
+    test_evidence_hash: str | None = None,
+) -> dict[str, Any]:
     return {
         "projectPath": str(loaded_project.root),
         "branch": loaded_project.current_branch,
@@ -98,6 +117,9 @@ def _base_evidence(loaded_project: LoadedProject, validation_log_hash: str | Non
         "disposableWorktree": loaded_project.is_disposable_worktree(),
         "allowGitPush": loaded_project.profile.safety.allow_git_push,
         "validationLogHash": validation_log_hash,
+        "receiptHash": receipt_hash,
+        "secretScanHash": secret_scan_hash,
+        "testEvidenceHash": test_evidence_hash,
     }
 
 
@@ -109,6 +131,8 @@ def _gh_auth_status(cwd: Path) -> dict[str, Any]:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -116,6 +140,6 @@ def _gh_auth_status(cwd: Path) -> dict[str, Any]:
     return {
         "authenticated": result.returncode == 0,
         "returnCode": result.returncode,
-        "stdout": result.stdout[:2000],
-        "stderr": result.stderr[:2000],
+        "stdout": (result.stdout or "")[:2000],
+        "stderr": (result.stderr or "")[:2000],
     }

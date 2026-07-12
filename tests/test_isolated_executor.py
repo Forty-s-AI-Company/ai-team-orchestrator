@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action, sanitize_branch_name
 from ai_team.core.github_gate import evaluate_github_action
 from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import load_project
@@ -173,19 +174,20 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertFalse(decision.allowed)
             self.assertIn("validation log hash", " ".join(decision.reasons))
 
-    def test_github_gate_merge_always_external_required(self) -> None:
+    def test_github_gate_merge_requires_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
             root.mkdir()
             init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
             loaded = load_project(root, allowlist=[tmp])
             loaded.current_branch = "feature/test"
 
             decision = evaluate_github_action(loaded, "merge", dry_run=True, validation_log_hash="abc123")
 
             self.assertFalse(decision.allowed)
-            self.assertTrue(decision.external_required)
-            self.assertIn("branch protection", " ".join(decision.reasons))
+            self.assertFalse(decision.external_required)
+            self.assertIn("receipt hash", " ".join(decision.reasons))
 
     def test_github_gate_pr_dry_run_allowed_when_policy_inputs_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -200,6 +202,170 @@ class IsolatedExecutorTests(unittest.TestCase):
 
             self.assertTrue(decision.allowed, decision.reasons)
             self.assertFalse(decision.external_required)
+
+    def test_github_gate_merge_allowed_when_policy_inputs_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_github_action(
+                loaded,
+                "merge",
+                dry_run=True,
+                validation_log_hash="validation-hash",
+                receipt_hash="receipt-hash",
+                secret_scan_hash="secret-scan-hash",
+                test_evidence_hash="test-hash",
+            )
+
+            self.assertTrue(decision.allowed, decision.reasons)
+
+    def test_github_executor_push_dry_run_requires_receipt_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            result = execute_github_action(loaded, GitHubExecutionOptions(action="push", dry_run=True))
+
+            self.assertFalse(result.success)
+            self.assertIn("receipt hash", " ".join(result.reasons))
+
+    def test_github_executor_pr_dry_run_records_evidence_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            receipt = root / "receipt.json"
+            receipt.write_text('{"ok": true}\n', encoding="utf-8")
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            result = execute_github_action(
+                loaded,
+                GitHubExecutionOptions(
+                    action="pr",
+                    dry_run=True,
+                    validation_log_hash="validation-hash",
+                    receipt_path=receipt,
+                    test_evidence_hash="test-hash",
+                ),
+            )
+
+            self.assertTrue(result.success, result.reasons)
+            self.assertFalse(result.attempted)
+            self.assertIsNotNone(result.receipt_hash)
+            self.assertIsNotNone(result.secret_scan_hash)
+
+    def test_github_executor_push_execute_runs_git_push(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            receipt = root / "receipt.json"
+            receipt.write_text('{"ok": true}\n', encoding="utf-8")
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+            commands: list[list[str]] = []
+
+            def fake_runner(args: list[str], cwd: Path, timeout: int):
+                commands.append(args)
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+            result = execute_github_action(
+                loaded,
+                GitHubExecutionOptions(action="push", dry_run=False, receipt_path=receipt, branch_name="ai-team/test"),
+                runner=fake_runner,
+            )
+
+            self.assertTrue(result.success, result.reasons)
+            self.assertIn(["git", "push", "-u", "origin", "HEAD:ai-team/test"], commands)
+
+    def test_sanitize_branch_name_blocks_protected_names(self) -> None:
+        self.assertEqual(sanitize_branch_name("master"), "ai-team/master")
+
+    def test_github_executor_merge_execute_checks_pr_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            receipt = root / "receipt.json"
+            receipt.write_text('{"ok": true}\n', encoding="utf-8")
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+            commands: list[list[str]] = []
+
+            def fake_runner(args: list[str], cwd: Path, timeout: int):
+                commands.append(args)
+                if args[:3] == ["gh", "pr", "view"]:
+                    return subprocess.CompletedProcess(
+                        args=args,
+                        returncode=0,
+                        stdout='{"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","isDraft":false}',
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+            result = execute_github_action(
+                loaded,
+                GitHubExecutionOptions(
+                    action="merge",
+                    dry_run=False,
+                    validation_log_hash="validation-hash",
+                    receipt_path=receipt,
+                    test_evidence_hash="test-hash",
+                    pr_identifier="123",
+                ),
+                runner=fake_runner,
+            )
+
+            self.assertTrue(result.success, result.reasons)
+            self.assertIn(["gh", "pr", "merge", "123", "--squash"], commands)
+
+    def test_github_executor_merge_blocks_unapproved_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            receipt = root / "receipt.json"
+            receipt.write_text('{"ok": true}\n', encoding="utf-8")
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            def fake_runner(args: list[str], cwd: Path, timeout: int):
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=0,
+                    stdout='{"mergeStateStatus":"CLEAN","reviewDecision":"REVIEW_REQUIRED","isDraft":false}',
+                    stderr="",
+                )
+
+            result = execute_github_action(
+                loaded,
+                GitHubExecutionOptions(
+                    action="merge",
+                    dry_run=False,
+                    validation_log_hash="validation-hash",
+                    receipt_path=receipt,
+                    test_evidence_hash="test-hash",
+                    pr_identifier="123",
+                ),
+                runner=fake_runner,
+            )
+
+            self.assertFalse(result.success)
+            self.assertIn("approved review", " ".join(result.reasons))
 
 
 class _WritingProvider(BaseProvider):

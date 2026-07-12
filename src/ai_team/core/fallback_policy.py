@@ -13,13 +13,16 @@ QUOTA_PATTERNS = [
     re.compile(r"(?i)quota exceeded"),
     re.compile(r"(?i)resource_exhausted"),
     re.compile(r"(?i)too many requests"),
+    re.compile(r"(?i)individual quota reached"),
     re.compile(r"(?i)try again at\s+(.+?)(?:\.|$)"),
     re.compile(r"(?i)reset time:\s*([0-9:\- ]+)(?:\s*\(local time\))?"),
+    re.compile(r"(?i)resets in\s+([0-9hms ]+)"),
 ]
 
 RESET_PATTERNS = [
     re.compile(r"(?i)try again at\s+(.+?)(?:\.|$)"),
     re.compile(r"(?i)reset time:\s*([0-9:\- ]+)(?:\s*\(local time\))?"),
+    re.compile(r"(?i)resets in\s+([0-9hms ]+)"),
 ]
 
 OLLAMA_ALLOWED_WORKFLOW_TERMS = {
@@ -122,4 +125,3 @@ def _ollama_workflow_allowed(workflow_name: str) -> tuple[bool, str]:
 
 def state_timestamp() -> str:
     return datetime.now(UTC).isoformat()
-

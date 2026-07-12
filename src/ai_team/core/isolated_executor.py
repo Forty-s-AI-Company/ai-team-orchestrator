@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from ai_team.core.git_policy import evaluate_git_action, inspect_candidate_files
+from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action
 from ai_team.core.orchestrator import Orchestrator, WorkflowRunResult, load_workflow
 from ai_team.core.project_loader import LoadedProject, load_project
 from ai_team.core.receipts import write_run_receipt
@@ -23,6 +24,7 @@ class IsolatedRunResult:
     executor_receipt: Path
     git_policy: dict[str, Any]
     commit_result: dict[str, Any]
+    github_result: dict[str, Any] | None = None
 
 
 def run_in_disposable_worktree(
@@ -37,6 +39,10 @@ def run_in_disposable_worktree(
     keep_worktree: bool = True,
     auto_commit: bool = False,
     commit_message: str | None = None,
+    github_action: str | None = None,
+    github_execute: bool = False,
+    validation_log_hash: str | None = None,
+    test_evidence_hash: str | None = None,
 ) -> IsolatedRunResult:
     source = load_project(source_project_path, allowlist=workspace_allowlist)
     workflow = load_workflow(workflow_name)
@@ -71,6 +77,15 @@ def run_in_disposable_worktree(
             commit_message=commit_message or default_commit_message(workflow_name),
         )
         run_receipt = write_run_receipt(loaded, result, receipt_dir)
+        github_result = maybe_execute_github_action(
+            loaded,
+            action=github_action,
+            enabled=bool(github_action and commit_result.get("committed")),
+            execute=github_execute,
+            run_receipt=run_receipt,
+            validation_log_hash=validation_log_hash,
+            test_evidence_hash=test_evidence_hash,
+        )
         executor_receipt = write_executor_receipt(
             source_project=source,
             worktree_project=loaded,
@@ -79,6 +94,7 @@ def run_in_disposable_worktree(
             receipt_dir=receipt_dir,
             git_policy=git_policy,
             commit_result=commit_result,
+            github_result=github_result,
             keep_worktree=keep_worktree,
         )
         return IsolatedRunResult(
@@ -88,6 +104,7 @@ def run_in_disposable_worktree(
             executor_receipt=executor_receipt,
             git_policy=git_policy,
             commit_result=commit_result,
+            github_result=github_result,
         )
     finally:
         if not keep_worktree and worktree_path.exists():
@@ -173,6 +190,37 @@ def default_commit_message(workflow_name: str) -> str:
     return f"chore(ai-team): apply {safe_workflow}"
 
 
+def maybe_execute_github_action(
+    loaded_project: LoadedProject,
+    action: str | None,
+    enabled: bool,
+    execute: bool,
+    run_receipt: Path,
+    validation_log_hash: str | None,
+    test_evidence_hash: str | None,
+) -> dict[str, Any] | None:
+    if not action:
+        return None
+    if not enabled:
+        return {
+            "attempted": False,
+            "success": False,
+            "reason": "GitHub action requires a committed isolated change",
+            "action": action,
+        }
+    result = execute_github_action(
+        loaded_project,
+        GitHubExecutionOptions(
+            action=action,
+            dry_run=not execute,
+            validation_log_hash=validation_log_hash,
+            receipt_path=run_receipt,
+            test_evidence_hash=test_evidence_hash,
+        ),
+    )
+    return result.as_dict()
+
+
 def write_executor_receipt(
     source_project: LoadedProject,
     worktree_project: LoadedProject,
@@ -181,6 +229,7 @@ def write_executor_receipt(
     receipt_dir: Path,
     git_policy: dict[str, Any],
     commit_result: dict[str, Any],
+    github_result: dict[str, Any] | None,
     keep_worktree: bool,
 ) -> Path:
     receipt_dir.mkdir(parents=True, exist_ok=True)
@@ -202,6 +251,7 @@ def write_executor_receipt(
         "runReceipt": str(run_receipt),
         "gitPolicy": git_policy,
         "commitResult": commit_result,
+        "githubResult": github_result,
         "keepWorktree": keep_worktree,
         "validationResult": {
             "success": result.provider_result.success,

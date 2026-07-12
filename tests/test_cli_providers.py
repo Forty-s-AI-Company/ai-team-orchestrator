@@ -55,6 +55,26 @@ class CliProviderTests(unittest.TestCase):
         self.assertTrue(result.data["quotaExhausted"])
         self.assertEqual(result.data["resetTime"], "2026-07-12 08:00:00")
 
+    def test_antigravity_individual_quota_resets_in_is_rate_limit(self) -> None:
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=[
+                    "-c",
+                    "import sys; sys.stderr.write('Error: Individual quota reached. Resets in 1h51m33s.'); sys.exit(1)",
+                ],
+                execution_enabled=True,
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.RATE_LIMIT)
+        self.assertEqual(result.data["resetTime"], "1h51m33s")
+
     def test_antigravity_execution_disabled_is_external_required(self) -> None:
         provider = AntigravityProvider(
             AntigravitySettings(

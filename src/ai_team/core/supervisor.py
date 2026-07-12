@@ -32,6 +32,10 @@ class SupervisorOptions:
     workspace_allowlist: list[str] | None = None
     state_path: Path | None = None
     isolated_auto_commit: bool = False
+    github_action: str | None = None
+    github_execute: bool = False
+    validation_log_hash: str | None = None
+    test_evidence_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,10 @@ def run_supervisor_cycle(options: SupervisorOptions, cycle_number: int) -> Path:
                     run_mode=options.run_mode,
                     keep_worktree=True,
                     auto_commit=options.isolated_auto_commit,
+                    github_action=options.github_action,
+                    github_execute=options.github_execute,
+                    validation_log_hash=options.validation_log_hash,
+                    test_evidence_hash=options.test_evidence_hash,
                 )
                 provider_result = isolated.workflow_result.provider_result
                 isolated_details = {
@@ -124,6 +132,7 @@ def run_supervisor_cycle(options: SupervisorOptions, cycle_number: int) -> Path:
                     "executorReceipt": str(isolated.executor_receipt),
                     "gitPolicy": isolated.git_policy,
                     "commitResult": isolated.commit_result,
+                    "githubResult": isolated.github_result,
                 }
             else:
                 provider_result = Orchestrator(options.provider, max_retries=1).run(

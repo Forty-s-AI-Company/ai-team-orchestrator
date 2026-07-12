@@ -310,13 +310,20 @@ variables. Do not place keys in `config/settings.yaml`.
 Default commands:
 
 - Codex: `codex --version`, `codex doctor --json`
-- Antigravity: `antigravity auth status`, `antigravity quota`
+- Antigravity: `agy --version`
 
 Windows CLI resolution prefers `.cmd`, `.exe`, `.bat`, and `.ps1` before
 extensionless shims so npm-installed CLIs do not fail with `WinError 5`.
 
 If these commands timeout or report quota exhaustion, mark the provider as
 `External required`; do not substitute mock or Ollama output as a provider pass.
+
+Current local Antigravity evidence: `agy --version`, `agy models`, and trivial
+`agy --print` prompts work, but workflow-sized prompts currently return
+`Error: timeout waiting for response`; GPT-OSS 120B reports individual quota
+reset evidence. The auto router records this as provider-native timeout or
+rate-limit evidence and continues to the next provider. It must not mark Codex
+or HandsFreeCode fallback as an Antigravity pass.
 
 Allowed Ollama fallback scope:
 
@@ -378,15 +385,32 @@ Current gate behavior:
 GitHub-level automation is guarded separately:
 
 ```powershell
-ai-team github-gate ..\CelebrateDeal --action push
-ai-team github-gate ..\CelebrateDeal --action pr --validation-log-hash <sha256>
-ai-team github-gate ..\CelebrateDeal --action merge --validation-log-hash <sha256>
+ai-team github-gate <disposable-worktree> --action push --receipt-path <run-receipt-json>
+ai-team github-gate <disposable-worktree> --action pr --validation-log-hash <sha256> --receipt-path <run-receipt-json>
+ai-team github-gate <disposable-worktree> --action merge --validation-log-hash <sha256> --receipt-path <run-receipt-json> --test-evidence-hash <sha256>
 ```
 
-`github-gate` is dry-run by default. PR dry-run may pass when the project is a
-disposable worktree, push policy is enabled, and a validation hash is present.
-Execution still requires GitHub CLI authentication. Merge remains blocked until
-branch protection and review status are connected.
+`github-gate` is dry-run by default. Execution requires a disposable worktree,
+push policy, GitHub CLI authentication, validation evidence, run receipt hash,
+secret scan hash, and command receipts. Merge additionally requires test
+evidence. Primary worktrees and protected branches are denied.
+
+Supervisor isolated writes can request GitHub automation:
+
+```powershell
+ai-team supervise ..\CelebrateDeal `
+  --workflow bug-fix-loop `
+  --provider auto `
+  --execute `
+  --auto-commit `
+  --github-action pr `
+  --validation-log-hash <sha256> `
+  --test-evidence-hash <sha256> `
+  --once
+```
+
+Add `--github-execute` only when you intend to run the GitHub command instead of
+recording a dry-run decision.
 
 ## Receipts
 
