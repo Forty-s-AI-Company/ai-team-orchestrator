@@ -141,7 +141,12 @@ def run_supervisor_cycle(options: SupervisorOptions, cycle_number: int) -> Path:
                     dry_run=options.dry_run,
                     run_mode=options.run_mode,
                 ).provider_result
-            auto_cycle_success = provider_result.success or provider_result.error_type == ProviderErrorType.EXTERNAL_REQUIRED
+            github_success = not isolated_details or not isolated_details.get("githubResult") or bool(
+                isolated_details["githubResult"].get("success")
+            )
+            auto_cycle_success = (
+                provider_result.success or provider_result.error_type == ProviderErrorType.EXTERNAL_REQUIRED
+            ) and github_success
             stages.append(
                 _stage(
                     "auto-cycle",

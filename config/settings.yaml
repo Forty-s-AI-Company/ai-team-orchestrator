@@ -35,10 +35,11 @@ antigravity:
   executable: "agy"
   status_args: ["--version"]
   quota_args: []
-  run_args: ["--model", "Gemini 3.5 Flash (Low)", "--print-timeout", "20s", "--mode", "plan", "--print"]
+  run_args: ["--model", "Gemini 3.5 Flash (Low)", "--print-timeout", "30s", "--mode", "plan", "--sandbox", "--print"]
   timeout_seconds: 20
-  run_timeout_seconds: 30
+  run_timeout_seconds: 40
   execution_enabled: true
+  prompt_max_chars: 500
 
 workspace:
   allowlist:

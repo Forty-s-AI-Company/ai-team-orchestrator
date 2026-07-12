@@ -41,6 +41,7 @@ def run_in_disposable_worktree(
     commit_message: str | None = None,
     github_action: str | None = None,
     github_execute: bool = False,
+    github_branch: str | None = None,
     validation_log_hash: str | None = None,
     test_evidence_hash: str | None = None,
 ) -> IsolatedRunResult:
@@ -73,15 +74,27 @@ def run_in_disposable_worktree(
             loaded,
             changed_files=changed_files,
             git_policy=git_policy,
-            enabled=auto_commit,
+            enabled=auto_commit and result.provider_result.success,
             commit_message=commit_message or default_commit_message(workflow_name),
         )
-        run_receipt = write_run_receipt(loaded, result, receipt_dir)
+        if auto_commit and not result.provider_result.success:
+            commit_result = {
+                "attempted": False,
+                "committed": False,
+                "reason": "provider validation failed; commit denied",
+            }
+        run_receipt = write_run_receipt(
+            loaded,
+            result,
+            receipt_dir,
+            source_commit_sha=source.commit_sha,
+        )
         github_result = maybe_execute_github_action(
             loaded,
             action=github_action,
             enabled=bool(github_action and commit_result.get("committed")),
             execute=github_execute,
+            branch_name=github_branch,
             run_receipt=run_receipt,
             validation_log_hash=validation_log_hash,
             test_evidence_hash=test_evidence_hash,
@@ -171,6 +184,7 @@ def maybe_commit_changed_files(
 
     _run_git(loaded_project.root, ["commit", "-m", commit_message])
     commit_sha = _run_git(loaded_project.root, ["rev-parse", "HEAD"]).stdout.strip()
+    loaded_project.commit_sha = commit_sha
     return {
         "attempted": True,
         "committed": True,
@@ -195,6 +209,7 @@ def maybe_execute_github_action(
     action: str | None,
     enabled: bool,
     execute: bool,
+    branch_name: str | None,
     run_receipt: Path,
     validation_log_hash: str | None,
     test_evidence_hash: str | None,
@@ -213,6 +228,7 @@ def maybe_execute_github_action(
         GitHubExecutionOptions(
             action=action,
             dry_run=not execute,
+            branch_name=branch_name,
             validation_log_hash=validation_log_hash,
             receipt_path=run_receipt,
             test_evidence_hash=test_evidence_hash,

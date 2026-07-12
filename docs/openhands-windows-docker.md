@@ -360,6 +360,17 @@ If HandsFreeCode uses Ollama internally, reports keep:
 - `codex_cli`: confirm Codex login, quota, and `codex doctor --json` latency.
 - `antigravity_cli`: confirm Antigravity login, quota, and native browser QA.
 
+Antigravity workflow smoke uses a compact prompt plus `--add-dir` and
+`--sandbox`. Record trivial native success separately from repository workflow
+success. If the repository workflow reaches `--print-timeout`, keep the receipt
+as `timeout`; do not relabel a Codex or Ollama fallback as Antigravity-native.
+
+For GitHub execution, first run `write-smoke` without `--github-execute`. After
+the receipt, committed-blob secret scan, validation hash, and test hash pass,
+adding `--github-execute` may push and create a PR. Do not merge during smoke.
+Use `github-gate --action merge --pr-identifier <number>` to perform a read-only
+check of approval and branch-protection status.
+
 ## Git Automation Gate
 
 Before any autonomous Git operation, evaluate the policy:

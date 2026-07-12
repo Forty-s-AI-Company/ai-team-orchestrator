@@ -16,6 +16,7 @@ from ai_team.providers.base import redact_secrets
 
 
 SAFE_BRANCH_RE = re.compile(r"[^A-Za-z0-9._/-]+")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 SECRET_SCAN_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_\-]{10,}"),
     re.compile(r"(?i)Bearer\s+[A-Za-z0-9_\-.]+"),
@@ -92,11 +93,23 @@ def execute_github_action(
 ) -> GitHubExecutionResult:
     action = _normalize_action(options.action)
     receipt_hash = _hash_file(options.receipt_path) if options.receipt_path else None
-    changed_files = _changed_files_for_head(loaded_project.root)
-    secret_scan = scan_commit_for_secrets(loaded_project.root, changed_files)
+    try:
+        changed_files = _changed_files_for_head(loaded_project.root)
+        secret_scan = scan_commit_for_secrets(loaded_project.root, changed_files)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        scan_payload = {
+            "changedFiles": [],
+            "blocked": True,
+            "reasons": [f"committed secret scan failed: {exc}"],
+        }
+        secret_scan = {
+            **scan_payload,
+            "hash": hashlib.sha256(json.dumps(scan_payload, sort_keys=True).encode("utf-8")).hexdigest(),
+        }
     validation_hash = options.validation_log_hash
     test_hash = options.test_evidence_hash
     preflight_reasons = _preflight_reasons(action, validation_hash, receipt_hash, secret_scan["hash"], test_hash)
+    preflight_reasons.extend(_receipt_reasons(loaded_project, options.receipt_path))
     decision = evaluate_github_action(
         loaded_project,
         action,
@@ -145,6 +158,51 @@ def execute_github_action(
             branch = default_branch_name(loaded_project)
     else:
         branch = loaded_project.current_branch
+    runner = runner or _run_command
+    if options.dry_run and action == "merge":
+        merge_target = options.pr_identifier or branch
+        if not merge_target:
+            return GitHubExecutionResult(
+                action=action,
+                dry_run=True,
+                attempted=False,
+                success=False,
+                decision=decision.as_dict(),
+                branch=branch,
+                validation_log_hash=validation_hash,
+                receipt_hash=receipt_hash,
+                secret_scan_hash=secret_scan["hash"],
+                test_evidence_hash=test_hash,
+                reasons=["merge dry-run requires a PR identifier or current branch"],
+            )
+        view_result = runner(
+            [
+                "gh",
+                "pr",
+                "view",
+                merge_target,
+                "--json",
+                "mergeStateStatus,reviewDecision,isDraft,baseRefName,headRefName",
+            ],
+            loaded_project.root,
+            60,
+        )
+        commands = [_command_dict(view_result)]
+        reasons = _merge_gate_reasons(view_result)
+        return GitHubExecutionResult(
+            action=action,
+            dry_run=True,
+            attempted=False,
+            success=not reasons,
+            decision=decision.as_dict(),
+            branch=branch,
+            validation_log_hash=validation_hash,
+            receipt_hash=receipt_hash,
+            secret_scan_hash=secret_scan["hash"],
+            test_evidence_hash=test_hash,
+            commands=commands,
+            reasons=reasons,
+        )
     if options.dry_run:
         return GitHubExecutionResult(
             action=action,
@@ -159,7 +217,6 @@ def execute_github_action(
             test_evidence_hash=test_hash,
         )
 
-    runner = runner or _run_command
     commands: list[dict[str, Any]] = []
     if action == "push":
         commands.append(_command_dict(runner(["git", "push", "-u", "origin", f"HEAD:{branch}"], loaded_project.root, 60)))
@@ -278,15 +335,11 @@ def scan_commit_for_secrets(project_root: Path, changed_files: list[str]) -> dic
     file_check = inspect_candidate_files(project_root, changed_files)
     reasons = list(file_check["reasons"])
     for relative in changed_files:
-        target = (project_root / relative).resolve()
-        if not target.is_file():
-            continue
-        try:
-            text = target.read_text(encoding="utf-8", errors="replace")[:1_000_000]
-        except OSError:
+        blob = _read_head_blob(project_root, relative)
+        if blob is None:
             continue
         for pattern in SECRET_SCAN_PATTERNS:
-            if pattern.search(text):
+            if pattern.search(blob.decode("utf-8", errors="replace")[:1_000_000]):
                 reasons.append(f"secret-like content in changed file: {relative}")
                 break
     payload = {"changedFiles": changed_files, "blocked": bool(reasons), "reasons": reasons}
@@ -297,11 +350,29 @@ def scan_commit_for_secrets(project_root: Path, changed_files: list[str]) -> dic
 
 
 def _changed_files_for_head(project_root: Path) -> list[str]:
-    try:
-        result = _run_command(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"], project_root, 30)
-    except subprocess.SubprocessError:
-        return []
+    result = _run_command(
+        ["git", "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        project_root,
+        30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("unable to enumerate files in HEAD for secret scan")
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _read_head_blob(project_root: Path, relative: str) -> bytes | None:
+    result = subprocess.run(
+        ["git", "show", f"HEAD:{relative}"],
+        cwd=project_root,
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode == 0:
+        return result.stdout
+    if not (project_root / relative).exists():
+        return None
+    raise RuntimeError(f"unable to read committed blob for secret scan: {relative}")
 
 
 def _normalize_action(value: str) -> str:
@@ -317,14 +388,45 @@ def _preflight_reasons(
     test_evidence_hash: str | None,
 ) -> list[str]:
     reasons: list[str] = []
-    if action in {"pr", "merge"} and not validation_log_hash:
-        reasons.append("validation log hash is required")
+    if action in {"pr", "merge"} and not _is_sha256(validation_log_hash):
+        reasons.append("valid SHA-256 validation log hash is required")
     if action in {"push", "pr", "merge"} and not receipt_hash:
         reasons.append("receipt hash is required")
     if action in {"push", "pr", "merge"} and not secret_scan_hash:
         reasons.append("secret scan hash is required")
-    if action == "merge" and not test_evidence_hash:
-        reasons.append("merge requires test evidence hash")
+    if action in {"pr", "merge"} and not _is_sha256(test_evidence_hash):
+        reasons.append(f"{action} requires valid SHA-256 test evidence hash")
+    return reasons
+
+
+def _is_sha256(value: str | None) -> bool:
+    return bool(value and SHA256_RE.fullmatch(value))
+
+
+def _receipt_reasons(loaded_project: LoadedProject, receipt_path: Path | None) -> list[str]:
+    if receipt_path is None or not receipt_path.is_file():
+        return ["run receipt is missing"]
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ["run receipt is unreadable or invalid JSON"]
+    if not isinstance(payload, dict):
+        return ["run receipt must be a JSON object"]
+
+    reasons: list[str] = []
+    validation = payload.get("validationResult")
+    if not isinstance(validation, dict) or validation.get("success") is not True:
+        reasons.append("run receipt does not contain a successful validation result")
+    if payload.get("projectPath") != str(loaded_project.root):
+        reasons.append("run receipt project path does not match the disposable worktree")
+    if payload.get("commitSha") != loaded_project.commit_sha:
+        reasons.append("run receipt commit SHA does not match HEAD")
+
+    source_sha = payload.get("sourceCommitSha")
+    if source_sha and loaded_project.commit_sha:
+        parent = _run_command(["git", "rev-parse", "HEAD^"], loaded_project.root, 30)
+        if parent.returncode != 0 or parent.stdout.strip() != source_sha:
+            reasons.append("run receipt source commit is not the direct parent of HEAD")
     return reasons
 
 

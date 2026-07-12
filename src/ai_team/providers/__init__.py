@@ -12,6 +12,7 @@ from .codex import CodexProvider, CodexSettings
 from .handsfreecode import HandsFreeCodeProvider, HandsFreeCodeSettings
 from .openhands import OpenHandsProvider, OpenHandsSettings
 from .router import RouterProvider
+from .write_smoke import WriteSmokeProvider
 
 __all__ = [
     "AntigravityProvider",
@@ -29,5 +30,6 @@ __all__ = [
     "ProviderResult",
     "RetryingProvider",
     "RouterProvider",
+    "WriteSmokeProvider",
     "redact_secrets",
 ]

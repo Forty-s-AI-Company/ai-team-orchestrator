@@ -9,7 +9,6 @@ import yaml
 
 from ai_team.core.orchestrator import Orchestrator, WorkflowError, load_workflow
 from ai_team.core.git_policy import evaluate_git_action
-from ai_team.core.github_gate import evaluate_github_action
 from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action
 from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import ProjectConfigError, load_project
@@ -26,6 +25,7 @@ from ai_team.providers import (
     OpenHandsProvider,
     OpenHandsSettings,
     RouterProvider,
+    WriteSmokeProvider,
 )
 from ai_team.providers.base import redact_secrets
 
@@ -220,6 +220,7 @@ def build_antigravity_provider(settings: dict) -> AntigravityProvider:
         timeout_seconds=float(antigravity.get("timeout_seconds") or 45),
         run_timeout_seconds=float(antigravity.get("run_timeout_seconds") or 180),
         execution_enabled=bool(antigravity.get("execution_enabled", False)),
+        prompt_max_chars=int(antigravity.get("prompt_max_chars") or 1200),
     )
     return AntigravityProvider(provider_settings)
 
@@ -237,6 +238,8 @@ def build_provider(provider_name: str, settings: dict):
         )
     if provider_name == "mock":
         return MockProvider()
+    if provider_name == "write-smoke":
+        return WriteSmokeProvider()
     if provider_name == "handsfreecode":
         return build_handsfreecode_provider(settings)
     if provider_name == "codex":
@@ -356,6 +359,7 @@ def run_isolated_workflow(
     commit_message: str | None,
     github_action: str | None,
     github_execute: bool,
+    github_branch: str | None,
     validation_log_hash: str | None,
     test_evidence_hash: str | None,
 ) -> None:
@@ -375,6 +379,7 @@ def run_isolated_workflow(
         commit_message=commit_message,
         github_action=github_action,
         github_execute=github_execute,
+        github_branch=github_branch,
         validation_log_hash=validation_log_hash,
         test_evidence_hash=test_evidence_hash,
     )
@@ -393,7 +398,9 @@ def run_isolated_workflow(
         "githubResult": result.github_result,
     }
     print(json.dumps(redact_secrets(payload), indent=2, default=str))
-    if not result.workflow_result.provider_result.success:
+    if not result.workflow_result.provider_result.success or (
+        result.github_result is not None and not result.github_result.get("success", False)
+    ):
         raise SystemExit(2)
 
 
@@ -404,32 +411,19 @@ def evaluate_github_gate(
     validation_log_hash: str | None,
     receipt_path: str | None,
     test_evidence_hash: str | None,
+    pr_identifier: str | None,
 ) -> None:
     settings = load_settings()
     loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
-    if dry_run:
-        decision = evaluate_github_action(
-            loaded,
-            action,
-            dry_run=True,
-            validation_log_hash=validation_log_hash,
-            receipt_hash=None,
-            secret_scan_hash=None,
-            test_evidence_hash=test_evidence_hash,
-        )
-        print(json.dumps(redact_secrets(decision.as_dict()), indent=2, default=str))
-        if not decision.allowed:
-            raise SystemExit(2)
-        return
-
     result = execute_github_action(
         loaded,
         GitHubExecutionOptions(
             action=action,
-            dry_run=False,
+            dry_run=dry_run,
             validation_log_hash=validation_log_hash,
             receipt_path=Path(receipt_path).resolve() if receipt_path else None,
             test_evidence_hash=test_evidence_hash,
+            pr_identifier=pr_identifier,
         ),
     )
     print(json.dumps(redact_secrets(result.as_dict()), indent=2, default=str))
@@ -532,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
     isolated_parser.add_argument("--workflow", required=True)
     isolated_parser.add_argument(
         "--provider",
-        choices=["auto", "mock", "openhands", "handsfreecode", "codex", "antigravity"],
+        choices=["auto", "mock", "write-smoke", "openhands", "handsfreecode", "codex", "antigravity"],
         default="mock",
     )
     isolated_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
@@ -545,6 +539,7 @@ def build_parser() -> argparse.ArgumentParser:
     isolated_parser.add_argument("--commit-message")
     isolated_parser.add_argument("--github-action", choices=["push", "pr", "pull-request", "merge"])
     isolated_parser.add_argument("--github-execute", action="store_true")
+    isolated_parser.add_argument("--github-branch")
     isolated_parser.add_argument("--validation-log-hash")
     isolated_parser.add_argument("--test-evidence-hash")
 
@@ -556,6 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
     github_parser.add_argument("--validation-log-hash")
     github_parser.add_argument("--receipt-path")
     github_parser.add_argument("--test-evidence-hash")
+    github_parser.add_argument("--pr-identifier")
 
     supervisor_parser = subparsers.add_parser("supervise", help="Run autonomous safe supervisor loop")
     supervisor_parser.add_argument("project", nargs="?", default=".")
@@ -623,6 +619,7 @@ def main() -> None:
                 args.commit_message,
                 args.github_action,
                 args.github_execute,
+                args.github_branch,
                 args.validation_log_hash,
                 args.test_evidence_hash,
             )
@@ -634,6 +631,7 @@ def main() -> None:
                 args.validation_log_hash,
                 args.receipt_path,
                 args.test_evidence_hash,
+                args.pr_identifier,
             )
         elif args.command == "supervise":
             supervise(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from ai_team.providers import (
     CodexSettings,
     ProviderErrorType,
     ProviderRequest,
+    WriteSmokeProvider,
 )
 from ai_team.providers.cli_common import CliProviderSettings, run_cli_command
 
@@ -165,6 +168,104 @@ class CliProviderTests(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertEqual(result.error_type, ProviderErrorType.TIMEOUT)
+
+    def test_cli_success_output_containing_timeout_is_not_failure(self) -> None:
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "print('No timeout occurred')"],
+                execution_enabled=True,
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertTrue(result.success)
+        self.assertIsNone(result.error_type)
+
+    def test_antigravity_compact_prompt_enforces_length_limit(self) -> None:
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "import sys; print(len(sys.argv[-1])); print(sys.argv[-1])"],
+                execution_enabled=True,
+                prompt_max_chars=240,
+            )
+        )
+
+        result = provider.run(_request(prompt="instruction\n" * 100))
+
+        self.assertTrue(result.success)
+        self.assertIn("[Prompt truncated by Antigravity compact mode]", result.content)
+        self.assertLessEqual(int(result.content.splitlines()[0]), 240)
+        self.assertIn("--add-dir", str(result.data["command"]["args"]))
+
+    def test_write_smoke_rejects_primary_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+
+            result = WriteSmokeProvider().run(
+                ProviderRequest(
+                    workflow="bug-fix-loop",
+                    prompt="smoke",
+                    project_root=root,
+                    dry_run=False,
+                )
+            )
+
+            self.assertFalse(result.success)
+            self.assertFalse(result.data["writePerformed"])
+            self.assertIn("disposable", result.content)
+
+    def test_write_smoke_rejects_forged_git_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_git_dir = root / "fake-git-dir"
+            fake_git_dir.mkdir()
+            (root / ".git").write_text(f"gitdir: {fake_git_dir.as_posix()}\n", encoding="utf-8")
+
+            result = WriteSmokeProvider().run(
+                ProviderRequest(
+                    workflow="bug-fix-loop",
+                    prompt="smoke",
+                    project_root=root,
+                    dry_run=False,
+                )
+            )
+
+            self.assertFalse(result.success)
+            self.assertFalse((root / "docs/ai-team-smoke/isolated-write-smoke.md").exists())
+
+    def test_write_smoke_rejects_dry_run_and_run_agent(self) -> None:
+        provider = WriteSmokeProvider()
+        root = Path.cwd()
+
+        dry_run = provider.run(
+            ProviderRequest(
+                workflow="bug-fix-loop",
+                prompt="smoke",
+                project_root=root,
+                dry_run=True,
+            )
+        )
+        run_agent = provider.run(
+            ProviderRequest(
+                workflow="bug-fix-loop",
+                prompt="smoke",
+                project_root=root,
+                dry_run=False,
+                run_mode="run-agent",
+            )
+        )
+
+        self.assertFalse(dry_run.success)
+        self.assertFalse(run_agent.success)
+        self.assertIn("create-only", run_agent.content)
 
 
 def _request(prompt: str = "hello") -> ProviderRequest:

@@ -172,6 +172,37 @@ temporary disposable worktree from the source project, runs the write workflow
 there, writes both the workflow receipt and executor receipt, then evaluates
 the commit policy against the changed files.
 
+For a deterministic control-plane smoke that cannot edit product code, use
+`write-smoke`. It is accepted only by `isolated-run`, verifies the linked
+worktree through Git, and exclusively creates
+`docs/ai-team-smoke/isolated-write-smoke.md`:
+
+```powershell
+ai-team isolated-run ..\CelebrateDeal `
+  --workflow bug-fix-loop `
+  --provider write-smoke `
+  --mode create-only `
+  --auto-commit `
+  --github-action pr `
+  --github-branch ai-team/isolated-write-smoke `
+  --validation-log-hash <sha256> `
+  --test-evidence-hash <sha256>
+```
+
+Without `--github-execute`, the GitHub action remains a dry-run. Adding it may
+push the disposable commit and create a real pull request; it never merges it.
+
+The PR gate validates the generated run receipt against the exact output
+commit, verifies that the source commit is its direct parent, scans committed
+Git blobs for secret-like content, and requires SHA-256 validation and test
+evidence. A merge dry-run also calls `gh pr view`; missing approval or a
+non-clean branch-protection state remains blocked and no merge command runs.
+
+The Antigravity adapter uses a provider-specific compact prompt and passes the
+project through `--add-dir` in sandboxed plan mode. A trivial native request can
+prove login/model availability, while a workflow timeout remains a timeout and
+must never be reported as an Antigravity pass or replaced by a Codex label.
+
 ```powershell
 ai-team isolated-run ..\CelebrateDeal `
   --workflow bug-fix-loop `

@@ -62,13 +62,14 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)Bearer\s+[A-Za-z0-9_\-.]+"),
 ]
 SECRET_KEY_PATTERN = re.compile(r"(?i)(api[_-]?key|token|secret|password|hash[_-]?key|hash[_-]?iv)")
+EVIDENCE_HASH_KEYS = {"receiptHash", "secretScanHash", "testEvidenceHash", "validationLogHash"}
 
 
 def redact_secrets(value: Any) -> Any:
     if isinstance(value, dict):
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
-            if isinstance(key, str) and SECRET_KEY_PATTERN.search(key):
+            if isinstance(key, str) and key not in EVIDENCE_HASH_KEYS and SECRET_KEY_PATTERN.search(key):
                 redacted[key] = "<redacted>" if item else item
             else:
                 redacted[key] = redact_secrets(item)

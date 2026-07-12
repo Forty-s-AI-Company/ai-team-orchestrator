@@ -15,6 +15,7 @@ def write_run_receipt(
     loaded_project: LoadedProject,
     result: WorkflowRunResult,
     receipt_dir: Path,
+    source_commit_sha: str | None = None,
 ) -> Path:
     receipt_dir.mkdir(parents=True, exist_ok=True)
     generated_at = datetime.now(UTC).isoformat()
@@ -31,6 +32,7 @@ def write_run_receipt(
         "workflow": result.workflow.name,
         "stages": result.stages,
         "commitSha": loaded_project.commit_sha,
+        "sourceCommitSha": source_commit_sha or loaded_project.commit_sha,
         "runMode": result.provider_result.data.get("runMode"),
         "startedAt": result.started_at.replace(microsecond=0).isoformat(),
         "completedAt": result.completed_at.replace(microsecond=0).isoformat(),

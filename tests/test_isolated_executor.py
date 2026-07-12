@@ -12,6 +12,11 @@ from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import load_project
 from ai_team.providers import MockProvider
 from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
+from ai_team.providers.write_smoke import WriteSmokeProvider
+
+
+VALIDATION_HASH = "a" * 64
+TEST_HASH = "b" * 64
 
 
 def init_committed_project(root: Path, allow_git_push: bool = False) -> None:
@@ -55,6 +60,22 @@ def make_disposable_worktree_marker(root: Path) -> None:
     if git_marker.is_dir():
         git_marker.rename(git_marker_dir)
     git_marker.write_text(f"gitdir: {git_marker_dir.as_posix()}\n", encoding="utf-8")
+
+
+def write_valid_receipt(root: Path, loaded) -> Path:
+    receipt = root / "receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "projectPath": str(loaded.root),
+                "commitSha": loaded.commit_sha,
+                "validationResult": {"success": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return receipt
 
 
 class IsolatedExecutorTests(unittest.TestCase):
@@ -127,6 +148,39 @@ class IsolatedExecutorTests(unittest.TestCase):
             )
             self.assertEqual(log.stdout.strip(), "chore(ai-team): test safe change")
 
+    def test_write_smoke_auto_commit_and_pr_dry_run_records_all_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+
+            result = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=WriteSmokeProvider(),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                auto_commit=True,
+                github_action="pr",
+                github_branch="ai-team/write-smoke-test",
+                validation_log_hash=VALIDATION_HASH,
+                test_evidence_hash=TEST_HASH,
+            )
+
+            self.assertTrue(result.commit_result["committed"], result.commit_result)
+            self.assertIsNotNone(result.github_result)
+            self.assertTrue(result.github_result["success"], result.github_result)
+            self.assertEqual(result.github_result["branch"], "ai-team/write-smoke-test")
+            self.assertIsNotNone(result.github_result["receiptHash"])
+            self.assertRegex(result.github_result["secretScanHash"], r"^[0-9a-f]{64}$")
+            self.assertEqual(result.github_result["validationLogHash"], VALIDATION_HASH)
+            self.assertEqual(result.github_result["testEvidenceHash"], TEST_HASH)
+            run_receipt = json.loads(result.run_receipt.read_text(encoding="utf-8"))
+            self.assertEqual(run_receipt["commitSha"], result.commit_result["commitSha"])
+            self.assertNotEqual(run_receipt["sourceCommitSha"], run_receipt["commitSha"])
+
     def test_auto_commit_blocks_secret_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -146,6 +200,32 @@ class IsolatedExecutorTests(unittest.TestCase):
 
             self.assertFalse(result.commit_result["committed"])
             self.assertIn("policy denied", result.commit_result["reason"])
+
+    def test_provider_failure_cannot_commit_or_trigger_github_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+
+            result = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=_WritingFailureProvider("notes/partial.md", "partial output\n"),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                auto_commit=True,
+                github_action="pr",
+                validation_log_hash=VALIDATION_HASH,
+                test_evidence_hash=TEST_HASH,
+            )
+
+            self.assertFalse(result.workflow_result.provider_result.success)
+            self.assertFalse(result.commit_result["committed"])
+            self.assertIn("provider validation failed", result.commit_result["reason"])
+            self.assertFalse(result.github_result["success"])
+            self.assertFalse(result.github_result["attempted"])
 
     def test_github_gate_push_without_policy_is_external_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -244,19 +324,18 @@ class IsolatedExecutorTests(unittest.TestCase):
             root.mkdir()
             init_committed_project(root, allow_git_push=True)
             make_disposable_worktree_marker(root)
-            receipt = root / "receipt.json"
-            receipt.write_text('{"ok": true}\n', encoding="utf-8")
             loaded = load_project(root, allowlist=[tmp])
             loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
 
             result = execute_github_action(
                 loaded,
                 GitHubExecutionOptions(
                     action="pr",
                     dry_run=True,
-                    validation_log_hash="validation-hash",
+                    validation_log_hash=VALIDATION_HASH,
                     receipt_path=receipt,
-                    test_evidence_hash="test-hash",
+                    test_evidence_hash=TEST_HASH,
                 ),
             )
 
@@ -265,16 +344,44 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertIsNotNone(result.receipt_hash)
             self.assertIsNotNone(result.secret_scan_hash)
 
+    def test_github_executor_scans_committed_blob_not_working_tree_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            secret_file = root / "committed.txt"
+            secret_file.write_text("api_key = should-never-pass-scan\n", encoding="utf-8")
+            subprocess.run(["git", "add", "committed.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "unsafe fixture"], cwd=root, check=True, capture_output=True)
+            secret_file.write_text("safe working tree copy\n", encoding="utf-8")
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
+
+            result = execute_github_action(
+                loaded,
+                GitHubExecutionOptions(
+                    action="pr",
+                    dry_run=True,
+                    validation_log_hash=VALIDATION_HASH,
+                    receipt_path=receipt,
+                    test_evidence_hash=TEST_HASH,
+                ),
+            )
+
+            self.assertFalse(result.success)
+            self.assertIn("secret-like content", " ".join(result.reasons))
+
     def test_github_executor_push_execute_runs_git_push(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
             root.mkdir()
             init_committed_project(root, allow_git_push=True)
             make_disposable_worktree_marker(root)
-            receipt = root / "receipt.json"
-            receipt.write_text('{"ok": true}\n', encoding="utf-8")
             loaded = load_project(root, allowlist=[tmp])
             loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
             commands: list[list[str]] = []
 
             def fake_runner(args: list[str], cwd: Path, timeout: int):
@@ -299,10 +406,9 @@ class IsolatedExecutorTests(unittest.TestCase):
             root.mkdir()
             init_committed_project(root, allow_git_push=True)
             make_disposable_worktree_marker(root)
-            receipt = root / "receipt.json"
-            receipt.write_text('{"ok": true}\n', encoding="utf-8")
             loaded = load_project(root, allowlist=[tmp])
             loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
             commands: list[list[str]] = []
 
             def fake_runner(args: list[str], cwd: Path, timeout: int):
@@ -321,9 +427,9 @@ class IsolatedExecutorTests(unittest.TestCase):
                 GitHubExecutionOptions(
                     action="merge",
                     dry_run=False,
-                    validation_log_hash="validation-hash",
+                    validation_log_hash=VALIDATION_HASH,
                     receipt_path=receipt,
-                    test_evidence_hash="test-hash",
+                    test_evidence_hash=TEST_HASH,
                     pr_identifier="123",
                 ),
                 runner=fake_runner,
@@ -338,10 +444,9 @@ class IsolatedExecutorTests(unittest.TestCase):
             root.mkdir()
             init_committed_project(root, allow_git_push=True)
             make_disposable_worktree_marker(root)
-            receipt = root / "receipt.json"
-            receipt.write_text('{"ok": true}\n', encoding="utf-8")
             loaded = load_project(root, allowlist=[tmp])
             loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
 
             def fake_runner(args: list[str], cwd: Path, timeout: int):
                 return subprocess.CompletedProcess(
@@ -356,9 +461,9 @@ class IsolatedExecutorTests(unittest.TestCase):
                 GitHubExecutionOptions(
                     action="merge",
                     dry_run=False,
-                    validation_log_hash="validation-hash",
+                    validation_log_hash=VALIDATION_HASH,
                     receipt_path=receipt,
-                    test_evidence_hash="test-hash",
+                    test_evidence_hash=TEST_HASH,
                     pr_identifier="123",
                 ),
                 runner=fake_runner,
@@ -386,6 +491,19 @@ class _WritingProvider(BaseProvider):
             provider=self.name,
             success=True,
             content="wrote file",
+            data={"runMode": request.run_mode},
+        )
+
+
+class _WritingFailureProvider(_WritingProvider):
+    name = "writing-failure-test"
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        super().run(request)
+        return ProviderResult(
+            provider=self.name,
+            success=False,
+            content="provider validation failed after partial write",
             data={"runMode": request.run_mode},
         )
 
