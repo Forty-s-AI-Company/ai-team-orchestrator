@@ -99,6 +99,17 @@ class LoadedProject(BaseModel):
         if workflow_name == "bug-fix-loop" and safety.allow_destructive_commands:
             raise ProjectConfigError("destructive commands are not allowed for bug-fix-loop")
 
+    def assert_agent_run_allowed(self, workflow_name: str) -> None:
+        if self.is_branch_protected():
+            raise ProjectConfigError(
+                f"workflow '{workflow_name}' run-agent mode is denied on protected branch "
+                f"'{self.current_branch}'"
+            )
+        if not self.is_disposable_worktree():
+            raise ProjectConfigError(
+                f"workflow '{workflow_name}' run-agent mode requires a disposable git worktree"
+            )
+
 
 def _load_yaml(path: Path) -> dict[str, Any]:
     try:

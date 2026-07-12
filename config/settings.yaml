@@ -8,6 +8,7 @@ openhands:
   host_workspace_root: "C:/Users/eden/Downloads/AI"
   container_workspace_root: "/projects"
   llm_model: "openai/gpt-5.5"
+  llm_api_key_env: "OPENHANDS_LLM_API_KEY"
   llm_api_key: "placeholder-not-a-real-secret"
   max_retries: 2
 

@@ -65,6 +65,16 @@ class ProjectLoaderTests(unittest.TestCase):
             with self.assertRaises(ProjectConfigError):
                 loaded.assert_write_allowed("bug-fix-loop")
 
+    def test_denies_run_agent_on_protected_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            loaded = load_project(root)
+            loaded.current_branch = "master"
+            with self.assertRaises(ProjectConfigError):
+                loaded.assert_agent_run_allowed("project-analysis")
+
     def test_denies_write_on_primary_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -74,6 +84,8 @@ class ProjectLoaderTests(unittest.TestCase):
             loaded.current_branch = "feature/test"
             with self.assertRaises(ProjectConfigError):
                 loaded.assert_write_allowed("bug-fix-loop")
+            with self.assertRaises(ProjectConfigError):
+                loaded.assert_agent_run_allowed("project-analysis")
 
     def test_allows_write_on_disposable_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,6 +100,7 @@ class ProjectLoaderTests(unittest.TestCase):
             loaded = load_project(root)
             loaded.current_branch = "feature/test"
             loaded.assert_write_allowed("bug-fix-loop")
+            loaded.assert_agent_run_allowed("project-analysis")
 
 
 if __name__ == "__main__":

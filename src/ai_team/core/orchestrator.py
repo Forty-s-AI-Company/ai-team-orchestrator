@@ -79,8 +79,15 @@ class Orchestrator:
         workflow_name: str,
         dry_run: bool = False,
         timeout_seconds: float = 30,
+        run_mode: str = "create-only",
     ) -> WorkflowRunResult:
         workflow = load_workflow(workflow_name)
+
+        if run_mode not in {"create-only", "run-agent"}:
+            raise WorkflowError(f"unsupported run mode: {run_mode}")
+
+        if run_mode == "run-agent":
+            loaded_project.assert_agent_run_allowed(workflow.name)
 
         if workflow.write_required and not dry_run:
             loaded_project.assert_write_allowed(workflow.name)
@@ -97,9 +104,11 @@ class Orchestrator:
                 "branch": loaded_project.current_branch,
                 "stages": workflow.stages,
                 "dryRun": dry_run,
+                "runMode": run_mode,
             },
             timeout_seconds=timeout_seconds,
             dry_run=dry_run,
+            run_mode=run_mode,
         )
         started_at = datetime.now(UTC)
         result = self.provider.run(request)

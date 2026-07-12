@@ -14,6 +14,7 @@ class ProviderErrorType(StrEnum):
     TIMEOUT = "timeout"
     NETWORK = "network"
     RATE_LIMIT = "rate_limit"
+    EXTERNAL_REQUIRED = "external_required"
     INVALID_RESPONSE = "invalid_response"
     UNKNOWN = "unknown"
 
@@ -26,6 +27,7 @@ class ProviderRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
     timeout_seconds: float = 30
     dry_run: bool = False
+    run_mode: str = "create-only"
 
 
 @dataclass(frozen=True)
@@ -116,7 +118,11 @@ class RetryingProvider(BaseProvider):
                     attempts=attempts,
                     data=last_result.data,
                 )
-            if last_result.error_type in {ProviderErrorType.AUTH, ProviderErrorType.INVALID_RESPONSE}:
+            if last_result.error_type in {
+                ProviderErrorType.AUTH,
+                ProviderErrorType.EXTERNAL_REQUIRED,
+                ProviderErrorType.INVALID_RESPONSE,
+            }:
                 break
             time.sleep(self.backoff_seconds * attempts)
 
@@ -156,5 +162,5 @@ class MockProvider(BaseProvider):
             provider=self.name,
             success=True,
             content=f"mock completed {request.workflow}",
-            data={"workflow": request.workflow, "dryRun": request.dry_run},
+            data={"workflow": request.workflow, "dryRun": request.dry_run, "runMode": request.run_mode},
         )

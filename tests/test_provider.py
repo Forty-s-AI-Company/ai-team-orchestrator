@@ -47,7 +47,66 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(result.conversation_id, "11111111-1111-4111-8111-111111111111")
             self.assertEqual(result.data["executionStatus"], "idle")
             self.assertEqual(server.last_post_path, "/api/conversations")
+            self.assertIsNone(server.last_run_path)
         finally:
+            server.close()
+
+    def test_openhands_run_agent_calls_run_endpoint(self) -> None:
+        server = _FakeOpenHandsServer()
+        old_value = os.environ.get("OPENHANDS_TEST_LLM_KEY")
+        os.environ["OPENHANDS_TEST_LLM_KEY"] = "test-llm-key"
+        try:
+            provider = OpenHandsProvider(
+                OpenHandsSettings(
+                    base_url=server.base_url,
+                    llm_api_key_env="OPENHANDS_TEST_LLM_KEY",
+                    host_workspace_root=str(Path.cwd().anchor or Path.cwd()),
+                    container_workspace_root="/projects",
+                ),
+                session_key="test-session",
+            )
+            result = provider.run(
+                ProviderRequest(
+                    workflow="project-analysis",
+                    prompt="hello",
+                    project_root=Path.cwd(),
+                    run_mode="run-agent",
+                )
+            )
+            self.assertTrue(result.success)
+            self.assertEqual(result.conversation_id, "11111111-1111-4111-8111-111111111111")
+            self.assertEqual(server.last_run_path, "/api/conversations/11111111-1111-4111-8111-111111111111/run")
+            self.assertEqual(result.data["runEndpointResult"]["success"], True)
+        finally:
+            if old_value is None:
+                os.environ.pop("OPENHANDS_TEST_LLM_KEY", None)
+            else:
+                os.environ["OPENHANDS_TEST_LLM_KEY"] = old_value
+            server.close()
+
+    def test_openhands_run_agent_missing_llm_credentials_external_required(self) -> None:
+        server = _FakeOpenHandsServer()
+        old_value = os.environ.pop("OPENHANDS_TEST_LLM_KEY", None)
+        try:
+            provider = OpenHandsProvider(
+                OpenHandsSettings(base_url=server.base_url, llm_api_key_env="OPENHANDS_TEST_LLM_KEY"),
+                session_key="test-session",
+            )
+            result = provider.run(
+                ProviderRequest(
+                    workflow="project-analysis",
+                    prompt="hello",
+                    project_root=Path.cwd(),
+                    run_mode="run-agent",
+                )
+            )
+            self.assertFalse(result.success)
+            self.assertEqual(result.error_type, ProviderErrorType.EXTERNAL_REQUIRED)
+            self.assertEqual(result.data["externalRequired"]["type"], "llm_credentials")
+            self.assertIsNone(server.last_post_path)
+        finally:
+            if old_value is not None:
+                os.environ["OPENHANDS_TEST_LLM_KEY"] = old_value
             server.close()
 
     def test_openhands_fails_closed_without_session_key(self) -> None:
@@ -133,6 +192,10 @@ class _FakeOpenHandsHandler(BaseHTTPRequestHandler):
         raw_body = self.rfile.read(length).decode("utf-8")
         self.server.last_post_path = self.path  # type: ignore[attr-defined]
         self.server.last_post_body = json.loads(raw_body)  # type: ignore[attr-defined]
+        if self.path == "/api/conversations/11111111-1111-4111-8111-111111111111/run":
+            self.server.last_run_path = self.path  # type: ignore[attr-defined]
+            self._send_json({"success": True})
+            return
         if self.path != "/api/conversations":
             self.send_response(404)
             self.end_headers()
@@ -159,6 +222,7 @@ class _FakeOpenHandsServer:
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOpenHandsHandler)
         self.httpd.last_post_path = None  # type: ignore[attr-defined]
         self.httpd.last_post_body = None  # type: ignore[attr-defined]
+        self.httpd.last_run_path = None  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
 
@@ -170,6 +234,10 @@ class _FakeOpenHandsServer:
     @property
     def last_post_path(self) -> str | None:
         return self.httpd.last_post_path  # type: ignore[attr-defined]
+
+    @property
+    def last_run_path(self) -> str | None:
+        return self.httpd.last_run_path  # type: ignore[attr-defined]
 
     def close(self) -> None:
         self.httpd.shutdown()

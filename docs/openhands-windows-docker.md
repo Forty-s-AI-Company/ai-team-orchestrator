@@ -89,13 +89,33 @@ Do not run non-dry-run write workflows on the primary worktree.
 ```powershell
 $env:SESSION_API_KEY = (Get-Content -Raw "$env:USERPROFILE\.openhands\agent-canvas\api-key.txt").Trim()
 ai-team doctor
-ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands --mode create-only
 ```
 
 If OpenHands is unavailable, the provider-native run must fail with a network or
 timeout diagnostic. Do not treat a mock provider result as an OpenHands pass.
 The smoke creates an idle OpenHands conversation with `run=false`; it does not
 start the agent loop or spend model tokens.
+
+## Agent Loop Mode
+
+`run-agent` mode explicitly calls:
+
+```text
+/api/conversations/{conversation_id}/run
+```
+
+It is only allowed on a disposable linked worktree and requires a local LLM
+credential:
+
+```powershell
+$env:SESSION_API_KEY = (Get-Content -Raw "$env:USERPROFILE\.openhands\agent-canvas\api-key.txt").Trim()
+$env:OPENHANDS_LLM_API_KEY = "<local-llm-key>"
+ai-team run ..\CelebrateDeal-openhands-disposable --workflow project-analysis --provider openhands --mode run-agent
+```
+
+Without `OPENHANDS_LLM_API_KEY`, `run-agent` returns `external_required` and
+does not create a conversation.
 
 ## Receipts
 

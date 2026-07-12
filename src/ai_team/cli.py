@@ -143,6 +143,7 @@ def build_openhands_provider(settings: dict) -> OpenHandsProvider:
         host_workspace_root=str(openhands.get("host_workspace_root") or "C:/Users/eden/Downloads/AI"),
         container_workspace_root=str(openhands.get("container_workspace_root") or "/projects"),
         llm_model=str(openhands.get("llm_model") or "openai/gpt-5.5"),
+        llm_api_key_env=str(openhands.get("llm_api_key_env") or "OPENHANDS_LLM_API_KEY"),
         llm_api_key=str(openhands.get("llm_api_key") or "placeholder-not-a-real-secret"),
     )
     return OpenHandsProvider(provider_settings)
@@ -170,6 +171,7 @@ def run_workflow(
     provider_name: str,
     dry_run: bool,
     receipt_dir: str | None,
+    mode: str,
 ) -> None:
     settings = load_settings()
     loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
@@ -181,6 +183,7 @@ def run_workflow(
         workflow_name=workflow_name,
         dry_run=dry_run,
         timeout_seconds=timeout_seconds,
+        run_mode=mode,
     )
     receipt_path = write_run_receipt(
         loaded,
@@ -192,6 +195,7 @@ def run_workflow(
         "dryRun": result.dry_run,
         "stages": result.stages,
         "provider": result.provider_result.provider,
+        "runMode": mode,
         "success": result.provider_result.success,
         "attempts": result.provider_result.attempts,
         "errorType": result.provider_result.error_type,
@@ -228,6 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("project", nargs="?", default=".")
     run_parser.add_argument("--workflow", required=True)
     run_parser.add_argument("--provider", choices=["mock", "openhands"], default="mock")
+    run_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--receipt-dir")
 
@@ -248,7 +253,7 @@ def main() -> None:
         elif args.command == "doctor":
             doctor()
         elif args.command == "run":
-            run_workflow(args.project, args.workflow, args.provider, args.dry_run, args.receipt_dir)
+            run_workflow(args.project, args.workflow, args.provider, args.dry_run, args.receipt_dir, args.mode)
     except (ProjectConfigError, WorkflowError) as exc:
         print(f"ai-team error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

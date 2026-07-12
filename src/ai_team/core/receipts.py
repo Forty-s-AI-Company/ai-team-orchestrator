@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ai_team.core.orchestrator import WorkflowRunResult
 from ai_team.core.project_loader import LoadedProject
@@ -16,9 +17,10 @@ def write_run_receipt(
     receipt_dir: Path,
 ) -> Path:
     receipt_dir.mkdir(parents=True, exist_ok=True)
-    generated_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+    generated_at = datetime.now(UTC).isoformat()
     safe_workflow = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in result.workflow.name)
-    file_name = f"{generated_at.replace(':', '').replace('+', 'Z')}-{safe_workflow}.json"
+    timestamp = generated_at.replace(":", "").replace("+", "Z").replace(".", "")
+    file_name = f"{timestamp}-{safe_workflow}-{uuid4().hex[:8]}.json"
     path = receipt_dir / file_name
     payload: dict[str, Any] = {
         "schemaVersion": 1,
@@ -29,6 +31,7 @@ def write_run_receipt(
         "workflow": result.workflow.name,
         "stages": result.stages,
         "commitSha": loaded_project.commit_sha,
+        "runMode": result.provider_result.data.get("runMode"),
         "startedAt": result.started_at.replace(microsecond=0).isoformat(),
         "completedAt": result.completed_at.replace(microsecond=0).isoformat(),
         "durationMs": result.duration_ms,
@@ -37,6 +40,8 @@ def write_run_receipt(
             "conversationId": result.provider_result.conversation_id,
             "taskId": result.provider_result.task_id,
             "executionStatus": result.provider_result.data.get("executionStatus"),
+            "runEndpointResult": redact_secrets(result.provider_result.data.get("runEndpointResult")),
+            "externalRequired": redact_secrets(result.provider_result.data.get("externalRequired")),
         },
         "validationResult": {
             "success": result.provider_result.success,

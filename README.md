@@ -41,7 +41,7 @@ closed and refuses to create a conversation.
 ```powershell
 $env:SESSION_API_KEY = "<local-session-key>"
 ai-team doctor
-ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands --mode create-only
 ```
 
 If OpenHands is not running, `doctor` reports `ready: false` with a network or
@@ -71,6 +71,8 @@ are ignored by Git.
 
 Non-dry-run write workflows require a disposable linked worktree. Running
 `bug-fix-loop` against the primary CelebrateDeal worktree is denied.
+OpenHands `run-agent` mode is also denied on the primary worktree, even for
+read-only workflows.
 
 ```powershell
 cd C:\Users\eden\Downloads\AI\CelebrateDeal
@@ -78,6 +80,15 @@ git worktree add --detach ..\CelebrateDeal-openhands-disposable HEAD
 
 cd ..\ai-team-orchestrator
 ai-team run ..\CelebrateDeal-openhands-disposable --workflow bug-fix-loop
+```
+
+`run-agent` starts the OpenHands agent loop via `/api/conversations/{id}/run`.
+It requires a local LLM credential in `OPENHANDS_LLM_API_KEY`; without it the
+provider returns `external_required` and does not create a conversation.
+
+```powershell
+$env:OPENHANDS_LLM_API_KEY = "<local-llm-key>"
+ai-team run ..\CelebrateDeal-openhands-disposable --workflow project-analysis --provider openhands --mode run-agent
 ```
 
 ## Safety Rules

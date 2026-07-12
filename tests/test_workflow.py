@@ -7,6 +7,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from ai_team.core.orchestrator import Orchestrator
+from ai_team.core.orchestrator import WorkflowError
+from ai_team.core.project_loader import ProjectConfigError
 from ai_team.core.project_loader import load_project
 from ai_team.core.receipts import write_run_receipt
 from ai_team.providers import MockProvider
@@ -54,6 +56,7 @@ class WorkflowTests(unittest.TestCase):
                 dry_run=True,
             )
             self.assertTrue(result.provider_result.success)
+            self.assertEqual(result.provider_result.data["runMode"], "create-only")
 
     def test_receipt_redacts_provider_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -73,6 +76,7 @@ class WorkflowTests(unittest.TestCase):
                     result.provider_result,
                     content="SESSION_API_KEY" + "=supersecret",
                     data={
+                        "runMode": "run-agent",
                         "conversationId": "11111111-1111-4111-8111-111111111111",
                         "taskId": "task-123",
                         "executionStatus": "idle",
@@ -85,10 +89,29 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("project-analysis", content)
             self.assertIn("11111111-1111-4111-8111-111111111111", content)
             self.assertIn("task-123", content)
+            self.assertIn("\"runMode\": \"run-agent\"", content)
             self.assertIn("durationMs", content)
             self.assertNotIn("supersecret", content)
             self.assertEqual(result.workflow.name, "project-analysis")
             self.assertIn("inspect", result.stages)
+
+    def test_receipt_names_are_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            loaded = load_project(root)
+            result = Orchestrator(MockProvider()).run(
+                loaded,
+                workflow_name="project-analysis",
+                dry_run=True,
+            )
+            receipt_dir = Path(tmp) / "receipts"
+            first = write_run_receipt(loaded, result, receipt_dir)
+            second = write_run_receipt(loaded, result, receipt_dir)
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.exists())
+            self.assertTrue(second.exists())
 
     def test_write_workflow_dry_run_allowed_on_protected_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,6 +126,33 @@ class WorkflowTests(unittest.TestCase):
                 dry_run=True,
             )
             self.assertTrue(result.provider_result.success)
+
+    def test_run_agent_rejected_on_primary_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            loaded = load_project(root)
+            loaded.current_branch = "feature/test"
+            with self.assertRaises(ProjectConfigError):
+                Orchestrator(MockProvider()).run(
+                    loaded,
+                    workflow_name="project-analysis",
+                    run_mode="run-agent",
+                )
+
+    def test_unsupported_run_mode_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            loaded = load_project(root)
+            with self.assertRaises(WorkflowError):
+                Orchestrator(MockProvider()).run(
+                    loaded,
+                    workflow_name="project-analysis",
+                    run_mode="bad-mode",
+                )
 
 
 if __name__ == "__main__":
