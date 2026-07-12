@@ -222,6 +222,7 @@ class HandsFreeCodeProviderTests(unittest.TestCase):
                 HandsFreeCodeSettings(
                     base_url="http://127.0.0.1:31025",
                     session_key_env="HANDSFREECODE_TEST_SESSION_KEY",
+                    session_key_file=None,
                 )
             )
             result = provider.run(
@@ -247,6 +248,54 @@ class HandsFreeCodeProviderTests(unittest.TestCase):
         self.assertFalse(diagnostics["ready"])
         self.assertEqual(diagnostics["errorType"], ProviderErrorType.NETWORK)
         self.assertTrue(diagnostics["sessionKeyPresent"])
+
+    def test_handsfreecode_ready_requires_local_session_key(self) -> None:
+        server = _FakeHandsFreeCodeServer()
+        old_value = os.environ.pop("HANDSFREECODE_TEST_SESSION_KEY", None)
+        try:
+            provider = HandsFreeCodeProvider(
+                HandsFreeCodeSettings(
+                    base_url=server.base_url,
+                    session_key_env="HANDSFREECODE_TEST_SESSION_KEY",
+                    session_key_file=None,
+                )
+            )
+            diagnostics = provider.diagnostics()
+            self.assertTrue(diagnostics["ready"])
+            self.assertTrue(diagnostics["authConfigured"])
+            self.assertFalse(diagnostics["sessionKeyPresent"])
+            self.assertFalse(provider.ready())
+        finally:
+            if old_value is not None:
+                os.environ["HANDSFREECODE_TEST_SESSION_KEY"] = old_value
+            server.close()
+
+    def test_handsfreecode_ready_accepts_configured_session_key(self) -> None:
+        server = _FakeHandsFreeCodeServer()
+        try:
+            provider = HandsFreeCodeProvider(
+                HandsFreeCodeSettings(base_url=server.base_url),
+                session_key="test-session",
+            )
+            self.assertTrue(provider.ready())
+        finally:
+            server.close()
+
+    def test_handsfreecode_reads_session_key_file(self) -> None:
+        server = _FakeHandsFreeCodeServer()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                key_file = Path(tmp) / "hfc-key.txt"
+                key_file.write_text("test-session\n", encoding="utf-8")
+                provider = HandsFreeCodeProvider(
+                    HandsFreeCodeSettings(base_url=server.base_url, session_key_file=str(key_file))
+                )
+                diagnostics = provider.diagnostics()
+                self.assertTrue(diagnostics["sessionKeyFileConfigured"])
+                self.assertTrue(diagnostics["sessionKeyPresent"])
+                self.assertTrue(provider.ready())
+        finally:
+            server.close()
 
     def test_handsfreecode_protected_api_401_is_auth(self) -> None:
         server = _FakeHandsFreeCodeServer(task_status=401)

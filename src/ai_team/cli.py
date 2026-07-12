@@ -24,6 +24,7 @@ from ai_team.providers import (
     MockProvider,
     OpenHandsProvider,
     OpenHandsSettings,
+    RouterProvider,
 )
 from ai_team.providers.base import redact_secrets
 
@@ -179,6 +180,7 @@ def build_handsfreecode_provider(settings: dict) -> HandsFreeCodeProvider:
     provider_settings = HandsFreeCodeSettings(
         base_url=str(handsfreecode.get("base_url") or "http://127.0.0.1:31025"),
         session_key_env=str(handsfreecode.get("session_key_env") or "HANDSFREECODE_SESSION_API_KEY"),
+        session_key_file=str(handsfreecode.get("session_key_file") or "~/.handsfreecode/session-api-key.txt"),
         ready_path=str(handsfreecode.get("ready_path") or "/ready"),
         task_run_path=str(handsfreecode.get("task_run_path") or "/api/tasks/run"),
         timeout_seconds=float(handsfreecode.get("timeout_seconds") or 30),
@@ -222,6 +224,16 @@ def build_antigravity_provider(settings: dict) -> AntigravityProvider:
 
 
 def build_provider(provider_name: str, settings: dict):
+    if provider_name == "auto":
+        return RouterProvider(
+            [
+                build_codex_provider(settings),
+                build_antigravity_provider(settings),
+                build_handsfreecode_provider(settings),
+                build_openhands_provider(settings),
+                MockProvider(),
+            ]
+        )
     if provider_name == "mock":
         return MockProvider()
     if provider_name == "handsfreecode":
@@ -239,6 +251,7 @@ def doctor() -> None:
     handsfreecode = build_handsfreecode_provider(settings).diagnostics()
     codex = build_codex_provider(settings).diagnostics()
     antigravity = build_antigravity_provider(settings).diagnostics()
+    auto = build_provider("auto", settings).diagnostics()
     print(
         json.dumps(
             {
@@ -247,6 +260,7 @@ def doctor() -> None:
                 "handsfreecode": handsfreecode,
                 "codex": codex,
                 "antigravity": antigravity,
+                "auto": auto,
                 "providerNative": {
                     "openhands": {
                         "ready": openhands.get("ready") is True and openhands.get("sessionKeyPresent") is True,
@@ -296,12 +310,11 @@ def run_workflow(
     loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
     load_workflow(workflow_name)
     provider = build_provider(provider_name, settings)
-    timeout_seconds = provider.settings.timeout_seconds if hasattr(provider, "settings") else 30
     result = Orchestrator(provider=provider, max_retries=2).run(
         loaded,
         workflow_name=workflow_name,
         dry_run=dry_run,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=None,
         run_mode=mode,
     )
     receipt_path = write_run_receipt(
@@ -468,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--workflow", required=True)
     run_parser.add_argument(
         "--provider",
-        choices=["mock", "openhands", "handsfreecode", "codex", "antigravity"],
+        choices=["auto", "mock", "openhands", "handsfreecode", "codex", "antigravity"],
         default="mock",
     )
     run_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
@@ -480,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
     isolated_parser.add_argument("--workflow", required=True)
     isolated_parser.add_argument(
         "--provider",
-        choices=["mock", "openhands", "handsfreecode", "codex", "antigravity"],
+        choices=["auto", "mock", "openhands", "handsfreecode", "codex", "antigravity"],
         default="mock",
     )
     isolated_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
@@ -504,7 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_parser.add_argument("--workflow", default="project-analysis")
     supervisor_parser.add_argument(
         "--provider",
-        choices=["mock", "openhands", "handsfreecode", "codex", "antigravity"],
+        choices=["auto", "mock", "openhands", "handsfreecode", "codex", "antigravity"],
         default="mock",
     )
     supervisor_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")

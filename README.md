@@ -74,6 +74,34 @@ HandsFreeCode may use Ollama internally for low-risk fallback work. The
 orchestrator still records the outer provider as `handsfreecode` and the inner
 runtime provider as `ollama`, never `codex` or `antigravity`.
 
+For unattended Windows runs, both HandsFreeCode and this orchestrator can read a
+local key file outside the repository:
+
+```powershell
+$keyDir = Join-Path $env:USERPROFILE ".handsfreecode"
+New-Item -ItemType Directory -Force -Path $keyDir | Out-Null
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+[Convert]::ToHexString($bytes).ToLowerInvariant() |
+  Set-Content -LiteralPath (Join-Path $keyDir "session-api-key.txt") -Encoding UTF8 -NoNewline
+```
+
+The file is intentionally not tracked by Git.
+
+## Auto Provider Routing
+
+`--provider auto` routes through Codex CLI, Antigravity CLI, HandsFreeCode,
+OpenHands, then mock fallback. Quota, timeout, and network failures are recorded
+in `routeAttempts`. If HandsFreeCode uses Ollama internally, the receipt stays
+`provider=handsfreecode`, `runtimeProvider=ollama`; it is never relabeled as a
+Codex or Antigravity pass.
+
+Current local evidence: `agy --version`, `agy models`, and a trivial
+Antigravity `--print` smoke pass on this machine, but workflow-sized prompts can
+still timeout. Treat that as provider-native timeout evidence and let auto
+routing continue to HandsFreeCode/Ollama until the Antigravity model path is
+stable.
+
 ## OpenHands Provider
 
 Default endpoint:

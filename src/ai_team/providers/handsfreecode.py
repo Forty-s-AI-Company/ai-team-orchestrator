@@ -16,6 +16,7 @@ from .base import BaseProvider, ProviderErrorType, ProviderRequest, ProviderResu
 class HandsFreeCodeSettings:
     base_url: str = "http://127.0.0.1:31025"
     session_key_env: str = "HANDSFREECODE_SESSION_API_KEY"
+    session_key_file: str | None = "~/.handsfreecode/session-api-key.txt"
     ready_path: str = "/ready"
     task_run_path: str = "/api/tasks/run"
     timeout_seconds: float = 30
@@ -31,11 +32,24 @@ class HandsFreeCodeProvider(BaseProvider):
 
     @property
     def session_key(self) -> str | None:
-        return self._session_key or os.environ.get(self.settings.session_key_env)
+        return self._session_key or os.environ.get(self.settings.session_key_env) or self._session_key_from_file()
+
+    def _session_key_from_file(self) -> str | None:
+        if not self.settings.session_key_file:
+            return None
+        key_file = Path(os.path.expandvars(self.settings.session_key_file)).expanduser()
+        if not key_file.exists() or not key_file.is_file():
+            return None
+        value = key_file.read_text(encoding="utf-8").strip()
+        return value or None
 
     def ready(self) -> bool:
         diagnostics = self.diagnostics()
-        return diagnostics["ready"] is True and diagnostics.get("authConfigured") is True
+        return (
+            diagnostics["ready"] is True
+            and diagnostics.get("authConfigured") is True
+            and diagnostics.get("sessionKeyPresent") is True
+        )
 
     def diagnostics(self) -> dict[str, Any]:
         session_key_present = bool(self.session_key)
@@ -43,6 +57,7 @@ class HandsFreeCodeProvider(BaseProvider):
             "baseUrl": self.settings.base_url,
             "readyPath": self.settings.ready_path,
             "sessionKeyEnv": self.settings.session_key_env,
+            "sessionKeyFileConfigured": bool(self.settings.session_key_file),
             "sessionKeyPresent": session_key_present,
             "failClosed": not session_key_present,
             "ready": False,

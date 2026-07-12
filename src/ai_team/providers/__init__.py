@@ -11,6 +11,7 @@ from .antigravity import AntigravityProvider, AntigravitySettings
 from .codex import CodexProvider, CodexSettings
 from .handsfreecode import HandsFreeCodeProvider, HandsFreeCodeSettings
 from .openhands import OpenHandsProvider, OpenHandsSettings
+from .router import RouterProvider
 
 __all__ = [
     "AntigravityProvider",
@@ -27,5 +28,6 @@ __all__ = [
     "ProviderRequest",
     "ProviderResult",
     "RetryingProvider",
+    "RouterProvider",
     "redact_secrets",
 ]

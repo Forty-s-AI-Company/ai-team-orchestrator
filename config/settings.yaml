@@ -16,28 +16,29 @@ openhands:
 handsfreecode:
   base_url: "http://127.0.0.1:31025"
   session_key_env: "HANDSFREECODE_SESSION_API_KEY"
+  session_key_file: "~/.handsfreecode/session-api-key.txt"
   ready_path: "/ready"
   task_run_path: "/api/tasks/run"
   timeout_seconds: 30
-  default_runtime_provider: "mock"
+  default_runtime_provider: "ollama"
 
 codex:
   executable: "codex"
   status_args: ["--version"]
-  quota_args: ["doctor", "--json"]
+  quota_args: []
   run_args: ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]
   timeout_seconds: 45
   run_timeout_seconds: 180
   execution_enabled: true
 
 antigravity:
-  executable: "antigravity"
-  status_args: ["auth", "status"]
-  quota_args: ["quota"]
-  run_args: []
-  timeout_seconds: 45
-  run_timeout_seconds: 180
-  execution_enabled: false
+  executable: "agy"
+  status_args: ["--version"]
+  quota_args: []
+  run_args: ["--model", "Gemini 3.5 Flash (Low)", "--print-timeout", "60s", "--mode", "plan", "--print"]
+  timeout_seconds: 20
+  run_timeout_seconds: 75
+  execution_enabled: true
 
 workspace:
   allowlist:

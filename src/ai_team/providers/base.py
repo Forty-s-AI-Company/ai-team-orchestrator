@@ -25,7 +25,7 @@ class ProviderRequest:
     prompt: str
     project_root: Path
     metadata: dict[str, Any] = field(default_factory=dict)
-    timeout_seconds: float = 30
+    timeout_seconds: float | None = None
     dry_run: bool = False
     run_mode: str = "create-only"
 
@@ -127,6 +127,7 @@ class RetryingProvider(BaseProvider):
                 )
             if last_result.error_type in {
                 ProviderErrorType.AUTH,
+                ProviderErrorType.TIMEOUT,
                 ProviderErrorType.EXTERNAL_REQUIRED,
                 ProviderErrorType.INVALID_RESPONSE,
             }:

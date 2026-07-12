@@ -63,6 +63,11 @@ HandsFreeCode may call Ollama internally. That result is recorded as
 `runtimeProvider: ollama` under the outer provider `handsfreecode`; it is never
 treated as a Codex or Antigravity provider-native pass.
 
+For unattended runs, store the local session key at
+`%USERPROFILE%\.handsfreecode\session-api-key.txt`. HandsFreeCode and the
+orchestrator both read this file when `HANDSFREECODE_SESSION_API_KEY` is absent.
+The file must stay outside Git.
+
 ## Port
 
 OpenHands loopback is reserved for:
@@ -214,6 +219,23 @@ cd C:\Users\eden\Downloads\AI\ai-team-orchestrator
 ai-team supervise ..\CelebrateDeal --once
 ai-team supervise ..\CelebrateDeal --interval-minutes 60 --max-runtime-minutes 480
 ```
+
+Run hourly patrol with dual CLI plus local fallback:
+
+```powershell
+ai-team supervise ..\CelebrateDeal `
+  --provider auto `
+  --mode create-only `
+  --interval-minutes 60 `
+  --max-runtime-minutes 480 `
+  --report-dir reports\auto-autopatrol `
+  --state-path reports\auto-autopatrol\state.json
+```
+
+`auto` records every route attempt. Codex quota exhaustion, Antigravity timeout,
+or provider-native loopback failures are evidence, not success. Local Ollama
+fallback only runs through HandsFreeCode and remains labeled as
+`provider=handsfreecode`, `runtimeProvider=ollama`.
 
 Use HandsFreeCode as the provider:
 

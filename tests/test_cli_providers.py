@@ -12,6 +12,7 @@ from ai_team.providers import (
     ProviderErrorType,
     ProviderRequest,
 )
+from ai_team.providers.cli_common import CliProviderSettings, run_cli_command
 
 
 class CliProviderTests(unittest.TestCase):
@@ -101,6 +102,49 @@ class CliProviderTests(unittest.TestCase):
 
         self.assertFalse(diagnostics["ready"])
         self.assertEqual(diagnostics["errorType"], ProviderErrorType.EXTERNAL_REQUIRED)
+
+    def test_cli_command_decodes_utf8_output_on_windows(self) -> None:
+        result = run_cli_command(
+            CliProviderSettings(executable=sys.executable),
+            ["-c", "print('測試輸出')"],
+        )
+
+        self.assertEqual(result.return_code, 0)
+        self.assertIn("測試輸出", result.stdout)
+
+    def test_cli_run_uses_provider_run_timeout_when_request_timeout_is_unspecified(self) -> None:
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "import time; time.sleep(0.2); print('late')"],
+                timeout_seconds=5,
+                run_timeout_seconds=0.01,
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.TIMEOUT)
+        self.assertIn("timeout", str(result.data["command"]["error"]))
+
+    def test_cli_timeout_stderr_is_classified_as_timeout(self) -> None:
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "import sys; sys.stderr.write('Error: timeout waiting for response'); sys.exit(1)"],
+                execution_enabled=True,
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.TIMEOUT)
 
 
 def _request(prompt: str = "hello") -> ProviderRequest:

@@ -78,7 +78,7 @@ class Orchestrator:
         loaded_project: LoadedProject,
         workflow_name: str,
         dry_run: bool = False,
-        timeout_seconds: float = 30,
+        timeout_seconds: float | None = None,
         run_mode: str = "create-only",
     ) -> WorkflowRunResult:
         workflow = load_workflow(workflow_name)

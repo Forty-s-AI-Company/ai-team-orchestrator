@@ -75,6 +75,8 @@ def run_cli_command(
             input=input_text,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_seconds or settings.timeout_seconds,
             check=False,
             shell=False,
@@ -230,7 +232,10 @@ def cli_run_result(
 
 
 def _safe_env() -> dict[str, str]:
-    return {key: value for key, value in os.environ.items() if key.upper() in SAFE_ENV_KEYS}
+    safe = {key: value for key, value in os.environ.items() if key.upper() in SAFE_ENV_KEYS}
+    safe["PYTHONIOENCODING"] = "utf-8"
+    safe["PYTHONUTF8"] = "1"
+    return safe
 
 
 def _resolve_executable(executable: str) -> str | None:
@@ -258,7 +263,7 @@ def _command_result_dict(args: list[str], result: CliCommandResult) -> dict[str,
 def _error_type_from_command(result: CliCommandResult) -> ProviderErrorType | None:
     if _looks_like_quota(result.combined):
         return ProviderErrorType.RATE_LIMIT
-    if result.error and "timeout" in result.error.lower():
+    if "timeout" in result.combined.lower():
         return ProviderErrorType.TIMEOUT
     if result.return_code == 0:
         return None
