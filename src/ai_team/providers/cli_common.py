@@ -54,7 +54,7 @@ class CliCommandResult:
 
 
 def executable_available(executable: str) -> bool:
-    return shutil.which(executable) is not None
+    return _resolve_executable(executable) is not None
 
 
 def run_cli_command(
@@ -64,12 +64,13 @@ def run_cli_command(
     input_text: str | None = None,
     timeout_seconds: float | None = None,
 ) -> CliCommandResult:
-    if not executable_available(settings.executable):
+    resolved_executable = _resolve_executable(settings.executable)
+    if not resolved_executable:
         return CliCommandResult(False, None, "", "", f"executable not found: {settings.executable}")
 
     try:
         completed = subprocess.run(
-            [settings.executable, *args],
+            [resolved_executable, *args],
             cwd=cwd,
             input=input_text,
             capture_output=True,
@@ -101,6 +102,7 @@ def build_diagnostics(provider_name: str, settings: CliProviderSettings) -> dict
     diagnostics: dict[str, Any] = {
         "provider": provider_name,
         "executable": settings.executable,
+        "resolvedExecutable": _resolve_executable(settings.executable),
         "available": executable_available(settings.executable),
         "ready": False,
         "quotaExhausted": False,
@@ -229,6 +231,15 @@ def cli_run_result(
 
 def _safe_env() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key.upper() in SAFE_ENV_KEYS}
+
+
+def _resolve_executable(executable: str) -> str | None:
+    if os.name == "nt" and not Path(executable).suffix:
+        for suffix in (".cmd", ".exe", ".bat", ".ps1"):
+            candidate = shutil.which(f"{executable}{suffix}")
+            if candidate:
+                return candidate
+    return shutil.which(executable)
 
 
 def _command_result_dict(args: list[str], result: CliCommandResult) -> dict[str, Any]:

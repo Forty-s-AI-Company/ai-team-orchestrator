@@ -114,6 +114,10 @@ smoke. Do not print or commit the value.
 $env:SESSION_API_KEY = (Get-Content -Raw "$env:USERPROFILE\.openhands\agent-canvas\api-key.txt").Trim()
 ```
 
+The orchestrator can also read this file automatically through
+`openhands.session_key_file` in `config/settings.yaml`. Do not copy the key into
+the config file; only the file path is stored.
+
 If using a local source checkout, keep the working directory in
 `C:\Users\eden\Downloads\AI\OpenHands` and configure its server to listen on
 `127.0.0.1:31024`.
@@ -285,6 +289,9 @@ Default commands:
 
 - Codex: `codex --version`, `codex doctor --json`
 - Antigravity: `antigravity auth status`, `antigravity quota`
+
+Windows CLI resolution prefers `.cmd`, `.exe`, `.bat`, and `.ps1` before
+extensionless shims so npm-installed CLIs do not fail with `WinError 5`.
 
 If these commands timeout or report quota exhaustion, mark the provider as
 `External required`; do not substitute mock or Ollama output as a provider pass.

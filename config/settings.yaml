@@ -1,6 +1,7 @@
 openhands:
   base_url: "http://127.0.0.1:31024"
   session_key_env: "SESSION_API_KEY"
+  session_key_file: "%USERPROFILE%/.openhands/agent-canvas/api-key.txt"
   ready_path: "/ready"
   conversation_path: "/api/conversations"
   cancel_path_template: "/api/conversations/{task_id}/interrupt"

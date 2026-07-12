@@ -17,6 +17,7 @@ from .base import BaseProvider, ProviderErrorType, ProviderRequest, ProviderResu
 class OpenHandsSettings:
     base_url: str = "http://127.0.0.1:31024"
     session_key_env: str = "SESSION_API_KEY"
+    session_key_file: str | None = None
     ready_path: str = "/ready"
     conversation_path: str = "/api/conversations"
     cancel_path_template: str = "/api/conversations/{task_id}/interrupt"
@@ -37,7 +38,14 @@ class OpenHandsProvider(BaseProvider):
 
     @property
     def session_key(self) -> str | None:
-        return self._session_key or os.environ.get(self.settings.session_key_env)
+        if self._session_key:
+            return self._session_key
+        env_value = os.environ.get(self.settings.session_key_env)
+        if env_value:
+            return env_value
+        if self.settings.session_key_file:
+            return _read_secret_file(self.settings.session_key_file)
+        return None
 
     def _url(self, path: str) -> str:
         base = self.settings.base_url.rstrip("/")
@@ -62,6 +70,7 @@ class OpenHandsProvider(BaseProvider):
             "baseUrl": self.settings.base_url,
             "readyPath": self.settings.ready_path,
             "sessionKeyEnv": self.settings.session_key_env,
+            "sessionKeyFileConfigured": bool(self.settings.session_key_file),
             "sessionKeyPresent": session_key_present,
             "failClosed": not session_key_present,
             "ready": False,
@@ -372,3 +381,13 @@ def _token_usage(data: Any, run_mode: str) -> int:
                 return value
 
     return 0
+
+
+def _read_secret_file(path_value: str) -> str | None:
+    expanded = os.path.expandvars(os.path.expanduser(path_value))
+    path = Path(expanded)
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None

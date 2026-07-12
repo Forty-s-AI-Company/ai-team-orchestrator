@@ -158,6 +158,7 @@ def build_openhands_provider(settings: dict) -> OpenHandsProvider:
     provider_settings = OpenHandsSettings(
         base_url=str(openhands.get("base_url") or "http://127.0.0.1:31024"),
         session_key_env=str(openhands.get("session_key_env") or "SESSION_API_KEY"),
+        session_key_file=str(openhands.get("session_key_file") or "") or None,
         ready_path=str(openhands.get("ready_path") or "/ready"),
         conversation_path=str(openhands.get("conversation_path") or "/api/conversations"),
         cancel_path_template=str(

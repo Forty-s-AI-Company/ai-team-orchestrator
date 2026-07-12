@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -133,6 +134,25 @@ class ProviderTests(unittest.TestCase):
         finally:
             if old_value is not None:
                 os.environ["SESSION_API_KEY"] = old_value
+
+    def test_openhands_reads_session_key_file(self) -> None:
+        server = _FakeOpenHandsServer()
+        old_value = os.environ.pop("SESSION_API_KEY", None)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                key_file = Path(tmp) / "openhands-key.txt"
+                key_file.write_text("test-session\n", encoding="utf-8")
+                provider = OpenHandsProvider(
+                    OpenHandsSettings(base_url=server.base_url, session_key_file=str(key_file))
+                )
+                diagnostics = provider.diagnostics()
+                self.assertTrue(diagnostics["ready"])
+                self.assertTrue(diagnostics["sessionKeyPresent"])
+                self.assertTrue(diagnostics["sessionKeyFileConfigured"])
+        finally:
+            if old_value is not None:
+                os.environ["SESSION_API_KEY"] = old_value
+            server.close()
 
     def test_provider_timeout_is_classified(self) -> None:
         provider = OpenHandsProvider(

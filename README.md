@@ -91,6 +91,16 @@ ai-team doctor
 ai-team run ..\CelebrateDeal --workflow project-analysis --provider openhands --mode create-only
 ```
 
+On Windows, the orchestrator also reads the Agent Canvas key file configured in
+`config/settings.yaml`:
+
+```text
+%USERPROFILE%\.openhands\agent-canvas\api-key.txt
+```
+
+The key value is never printed or committed. If both env var and file exist,
+the env var wins.
+
 If OpenHands is not running, `doctor` reports `ready: false` with a network or
 timeout diagnostic. Do not treat a mock provider result as an OpenHands pass.
 OpenHands Agent Canvas persists its generated API key at
@@ -268,6 +278,10 @@ Default diagnostics:
 
 - Codex: `codex --version` and `codex doctor --json`
 - Antigravity: `antigravity auth status` and `antigravity quota`
+
+On Windows, CLI resolution prefers `.cmd`, `.exe`, `.bat`, and `.ps1` shims
+before extensionless files. This avoids the `WinError 5` access issue caused by
+executing the extensionless npm shim directly.
 
 If a CLI reports quota exhaustion, the provider returns `rate_limit` and stores
 the parsed reset time when available. The supervisor may then allow Ollama only
