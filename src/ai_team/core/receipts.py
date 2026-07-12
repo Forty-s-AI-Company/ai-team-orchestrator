@@ -38,12 +38,18 @@ def write_run_receipt(
         "completedAt": result.completed_at.replace(microsecond=0).isoformat(),
         "durationMs": result.duration_ms,
         "providerNative": {
-            "ready": redact_secrets(result.provider_result.data.get("ready")),
+            "ready": redact_secrets(
+                result.provider_result.data.get("ready")
+                or (result.provider_result.data.get("diagnostics") or {}).get("ready")
+            ),
             "conversationId": result.provider_result.conversation_id,
             "taskId": result.provider_result.task_id,
             "executionStatus": result.provider_result.data.get("executionStatus"),
             "runEndpointResult": redact_secrets(result.provider_result.data.get("runEndpointResult")),
             "externalRequired": redact_secrets(result.provider_result.data.get("externalRequired")),
+            "responseValidated": result.provider_result.data.get("responseValidated"),
+            "repositorySmokePassed": result.provider_result.data.get("repositorySmokePassed"),
+            "antigravityNativePass": result.provider_result.data.get("antigravityNativePass"),
         },
         "validationResult": {
             "success": result.provider_result.success,

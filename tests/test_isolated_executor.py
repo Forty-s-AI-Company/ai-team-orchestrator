@@ -373,6 +373,35 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertFalse(result.success)
             self.assertIn("secret-like content", " ".join(result.reasons))
 
+    def test_github_executor_does_not_flag_unchanged_fixture_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            (root / "fixture.yml").write_text("JOB_SECRET: ci-test-fixture\n", encoding="utf-8")
+            subprocess.run(["git", "add", "fixture.yml"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=root, check=True, capture_output=True)
+            source_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (root / "safe.md").write_text("safe change\n", encoding="utf-8")
+            subprocess.run(["git", "add", "safe.md"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "safe"], cwd=root, check=True, capture_output=True)
+            make_disposable_worktree_marker(root)
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
+            receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+            receipt_payload["sourceCommitSha"] = source_sha
+            receipt.write_text(json.dumps(receipt_payload), encoding="utf-8")
+
+            result = execute_github_action(
+                loaded,
+                GitHubExecutionOptions(action="push", dry_run=True, receipt_path=receipt),
+            )
+
+            self.assertTrue(result.success, result.reasons)
+
     def test_github_executor_push_execute_runs_git_push(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -417,7 +446,21 @@ class IsolatedExecutorTests(unittest.TestCase):
                     return subprocess.CompletedProcess(
                         args=args,
                         returncode=0,
-                        stdout='{"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","isDraft":false}',
+                        stdout=json.dumps(
+                            {
+                                "mergeStateStatus": "CLEAN",
+                                "reviewDecision": "APPROVED",
+                                "isDraft": False,
+                                "headRefOid": loaded.commit_sha,
+                                "statusCheckRollup": [
+                                    {
+                                        "__typename": "CheckRun",
+                                        "status": "COMPLETED",
+                                        "conclusion": "SUCCESS",
+                                    }
+                                ],
+                            }
+                        ),
                         stderr="",
                     )
                 return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
@@ -452,7 +495,21 @@ class IsolatedExecutorTests(unittest.TestCase):
                 return subprocess.CompletedProcess(
                     args=args,
                     returncode=0,
-                    stdout='{"mergeStateStatus":"CLEAN","reviewDecision":"REVIEW_REQUIRED","isDraft":false}',
+                    stdout=json.dumps(
+                        {
+                            "mergeStateStatus": "CLEAN",
+                            "reviewDecision": "REVIEW_REQUIRED",
+                            "isDraft": False,
+                            "headRefOid": loaded.commit_sha,
+                            "statusCheckRollup": [
+                                {
+                                    "__typename": "CheckRun",
+                                    "status": "COMPLETED",
+                                    "conclusion": "SUCCESS",
+                                }
+                            ],
+                        }
+                    ),
                     stderr="",
                 )
 
@@ -471,6 +528,55 @@ class IsolatedExecutorTests(unittest.TestCase):
 
             self.assertFalse(result.success)
             self.assertIn("approved review", " ".join(result.reasons))
+
+    def test_github_executor_merge_blocks_pending_checks_and_stale_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
+
+            def fake_runner(args: list[str], cwd: Path, timeout: int):
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "mergeStateStatus": "CLEAN",
+                            "reviewDecision": "APPROVED",
+                            "isDraft": False,
+                            "headRefOid": "f" * 40,
+                            "statusCheckRollup": [
+                                {
+                                    "__typename": "CheckRun",
+                                    "status": "IN_PROGRESS",
+                                    "conclusion": "",
+                                }
+                            ],
+                        }
+                    ),
+                    stderr="",
+                )
+
+            result = execute_github_action(
+                loaded,
+                GitHubExecutionOptions(
+                    action="merge",
+                    dry_run=True,
+                    validation_log_hash=VALIDATION_HASH,
+                    receipt_path=receipt,
+                    test_evidence_hash=TEST_HASH,
+                    pr_identifier="123",
+                ),
+                runner=fake_runner,
+            )
+
+            self.assertFalse(result.success)
+            self.assertIn("head SHA", " ".join(result.reasons))
+            self.assertIn("pending", " ".join(result.reasons))
 
 
 class _WritingProvider(BaseProvider):

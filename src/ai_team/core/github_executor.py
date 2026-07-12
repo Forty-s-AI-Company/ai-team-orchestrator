@@ -93,9 +93,10 @@ def execute_github_action(
 ) -> GitHubExecutionResult:
     action = _normalize_action(options.action)
     receipt_hash = _hash_file(options.receipt_path) if options.receipt_path else None
+    receipt_source_sha = _receipt_source_sha(options.receipt_path)
     try:
-        changed_files = _changed_files_for_head(loaded_project.root)
-        secret_scan = scan_commit_for_secrets(loaded_project.root, changed_files)
+        changed_files = _changed_files_for_head(loaded_project.root, receipt_source_sha)
+        secret_scan = scan_commit_for_secrets(loaded_project.root, changed_files, receipt_source_sha)
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         scan_payload = {
             "changedFiles": [],
@@ -182,13 +183,13 @@ def execute_github_action(
                 "view",
                 merge_target,
                 "--json",
-                "mergeStateStatus,reviewDecision,isDraft,baseRefName,headRefName",
+                "mergeStateStatus,reviewDecision,isDraft,baseRefName,headRefName,headRefOid,statusCheckRollup",
             ],
             loaded_project.root,
             60,
         )
         commands = [_command_dict(view_result)]
-        reasons = _merge_gate_reasons(view_result)
+        reasons = _merge_gate_reasons(view_result, loaded_project.commit_sha)
         return GitHubExecutionResult(
             action=action,
             dry_run=True,
@@ -273,13 +274,13 @@ def execute_github_action(
             "view",
             merge_target,
             "--json",
-            "mergeStateStatus,reviewDecision,isDraft,baseRefName,headRefName",
+            "mergeStateStatus,reviewDecision,isDraft,baseRefName,headRefName,headRefOid,statusCheckRollup",
         ],
         loaded_project.root,
         60,
     )
     commands.append(_command_dict(view_result))
-    merge_gate_reasons = _merge_gate_reasons(view_result)
+    merge_gate_reasons = _merge_gate_reasons(view_result, loaded_project.commit_sha)
     if merge_gate_reasons:
         return GitHubExecutionResult(
             action=action,
@@ -331,15 +332,21 @@ def sanitize_branch_name(value: str) -> str:
     return cleaned[:180]
 
 
-def scan_commit_for_secrets(project_root: Path, changed_files: list[str]) -> dict[str, Any]:
+def scan_commit_for_secrets(
+    project_root: Path,
+    changed_files: list[str],
+    source_sha: str | None = None,
+) -> dict[str, Any]:
     file_check = inspect_candidate_files(project_root, changed_files)
-    reasons = list(file_check["reasons"])
+    reasons = [
+        reason
+        for reason in file_check["reasons"]
+        if not reason.startswith("candidate appears to contain a secret:")
+    ]
     for relative in changed_files:
-        blob = _read_head_blob(project_root, relative)
-        if blob is None:
-            continue
+        added_text = _added_lines(project_root, relative, source_sha)
         for pattern in SECRET_SCAN_PATTERNS:
-            if pattern.search(blob.decode("utf-8", errors="replace")[:1_000_000]):
+            if pattern.search(added_text[:1_000_000]):
                 reasons.append(f"secret-like content in changed file: {relative}")
                 break
     payload = {"changedFiles": changed_files, "blocked": bool(reasons), "reasons": reasons}
@@ -349,30 +356,32 @@ def scan_commit_for_secrets(project_root: Path, changed_files: list[str]) -> dic
     }
 
 
-def _changed_files_for_head(project_root: Path) -> list[str]:
-    result = _run_command(
-        ["git", "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"],
-        project_root,
-        30,
+def _changed_files_for_head(project_root: Path, source_sha: str | None = None) -> list[str]:
+    args = (
+        ["git", "diff", "--name-only", f"{source_sha}..HEAD"]
+        if source_sha
+        else ["git", "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"]
     )
+    result = _run_command(args, project_root, 30)
     if result.returncode != 0:
-        raise RuntimeError("unable to enumerate files in HEAD for secret scan")
+        raise RuntimeError("unable to enumerate attested commit range for secret scan")
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def _read_head_blob(project_root: Path, relative: str) -> bytes | None:
-    result = subprocess.run(
-        ["git", "show", f"HEAD:{relative}"],
-        cwd=project_root,
-        check=False,
-        capture_output=True,
-        timeout=30,
+def _added_lines(project_root: Path, relative: str, source_sha: str | None) -> str:
+    args = (
+        ["git", "diff", "--unified=0", f"{source_sha}..HEAD", "--", relative]
+        if source_sha
+        else ["git", "show", "--format=", "--unified=0", "HEAD", "--", relative]
     )
-    if result.returncode == 0:
-        return result.stdout
-    if not (project_root / relative).exists():
-        return None
-    raise RuntimeError(f"unable to read committed blob for secret scan: {relative}")
+    result = _run_command(args, project_root, 30)
+    if result.returncode != 0:
+        raise RuntimeError(f"unable to read attested diff for secret scan: {relative}")
+    return "\n".join(
+        line[1:]
+        for line in result.stdout.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
 
 
 def _normalize_action(value: str) -> str:
@@ -424,10 +433,21 @@ def _receipt_reasons(loaded_project: LoadedProject, receipt_path: Path | None) -
 
     source_sha = payload.get("sourceCommitSha")
     if source_sha and loaded_project.commit_sha:
-        parent = _run_command(["git", "rev-parse", "HEAD^"], loaded_project.root, 30)
-        if parent.returncode != 0 or parent.stdout.strip() != source_sha:
-            reasons.append("run receipt source commit is not the direct parent of HEAD")
+        ancestor = _run_command(["git", "merge-base", "--is-ancestor", str(source_sha), "HEAD"], loaded_project.root, 30)
+        if ancestor.returncode != 0 or source_sha == loaded_project.commit_sha:
+            reasons.append("run receipt source commit is not a strict ancestor of HEAD")
     return reasons
+
+
+def _receipt_source_sha(receipt_path: Path | None) -> str | None:
+    if receipt_path is None or not receipt_path.is_file():
+        return None
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = payload.get("sourceCommitSha") if isinstance(payload, dict) else None
+    return str(value) if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) else None
 
 
 def _hash_file(path: Path | None) -> str | None:
@@ -521,7 +541,7 @@ def _extract_pr_url(stdout: str) -> str | None:
     return None
 
 
-def _merge_gate_reasons(result: subprocess.CompletedProcess[str]) -> list[str]:
+def _merge_gate_reasons(result: subprocess.CompletedProcess[str], expected_commit_sha: str | None) -> list[str]:
     if result.returncode != 0:
         return ["gh pr view failed before merge"]
     try:
@@ -535,4 +555,24 @@ def _merge_gate_reasons(result: subprocess.CompletedProcess[str]) -> list[str]:
         reasons.append("merge requires approved review decision")
     if payload.get("mergeStateStatus") != "CLEAN":
         reasons.append("merge requires clean branch protection status")
+    if not expected_commit_sha or payload.get("headRefOid") != expected_commit_sha:
+        reasons.append("merge requires PR head SHA to match the attested receipt commit")
+    checks = payload.get("statusCheckRollup")
+    if not isinstance(checks, list) or not checks:
+        reasons.append("merge requires explicit CI check evidence")
+    else:
+        for check in checks:
+            if not isinstance(check, dict):
+                reasons.append("merge received invalid CI check evidence")
+                continue
+            raw_status = str(check.get("status") or check.get("state") or "").upper()
+            conclusion = str(check.get("conclusion") or "").upper()
+            if raw_status in {"EXPECTED", "IN_PROGRESS", "PENDING", "QUEUED", "REQUESTED", "WAITING"}:
+                reasons.append("merge blocked while CI checks are pending")
+            elif check.get("__typename") == "CheckRun" and not (
+                raw_status == "COMPLETED" and conclusion == "SUCCESS"
+            ):
+                reasons.append("merge requires all CI checks to pass")
+            elif check.get("__typename") != "CheckRun" and raw_status != "SUCCESS":
+                reasons.append("merge requires all status contexts to pass")
     return reasons

@@ -193,8 +193,8 @@ Without `--github-execute`, the GitHub action remains a dry-run. Adding it may
 push the disposable commit and create a real pull request; it never merges it.
 
 The PR gate validates the generated run receipt against the exact output
-commit, verifies that the source commit is its direct parent, scans committed
-Git blobs for secret-like content, and requires SHA-256 validation and test
+commit, verifies that the source commit is a strict ancestor, scans every
+changed Git blob in the attested range for secret-like content, and requires SHA-256 validation and test
 evidence. A merge dry-run also calls `gh pr view`; missing approval or a
 non-clean branch-protection state remains blocked and no merge command runs.
 
@@ -202,6 +202,34 @@ The Antigravity adapter uses a provider-specific compact prompt and passes the
 project through `--add-dir` in sandboxed plan mode. A trivial native request can
 prove login/model availability, while a workflow timeout remains a timeout and
 must never be reported as an Antigravity pass or replaced by a Codex label.
+
+Antigravity native success now requires a challenge-bound JSON response. The
+`provider-smoke` workflow asks Antigravity to read a small tracked manifest and
+return its SHA-256 without receiving the expected hash in the prompt:
+
+```powershell
+ai-team run ..\CelebrateDeal --workflow provider-smoke --provider antigravity --dry-run
+```
+
+Plain text, Markdown fences, stale challenges, incorrect paths or hashes, and
+CLI help output are `INVALID_RESPONSE`, even when the CLI exits with code zero.
+Successful diagnostics are cached briefly and share one monotonic deadline with
+the model command.
+
+Use `pr-monitor` to poll pull-request checks and save redacted evidence:
+
+```powershell
+ai-team pr-monitor <disposable-worktree> `
+  --repo owner/repository `
+  --pr 123 `
+  --wait-seconds 600 `
+  --report-dir reports/pr-123-ci
+```
+
+Dependency lock failures produce a policy-built restricted repair task. The
+task is not automatically executable, permits only `package-lock.json`, allows
+at most one attempt, and forbids push and merge. CI log text remains untrusted
+evidence and never controls commands, paths, provider selection, or prompts.
 
 ```powershell
 ai-team isolated-run ..\CelebrateDeal `

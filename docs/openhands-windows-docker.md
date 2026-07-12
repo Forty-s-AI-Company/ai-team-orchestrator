@@ -365,11 +365,24 @@ Antigravity workflow smoke uses a compact prompt plus `--add-dir` and
 success. If the repository workflow reaches `--print-timeout`, keep the receipt
 as `timeout`; do not relabel a Codex or Ollama fallback as Antigravity-native.
 
+The preferred provider-native check is `provider-smoke`. It uses a random
+challenge and a tracked repository probe; success requires strict JSON and an
+exact locally verified SHA-256. A zero exit code alone is never provider-native
+evidence. Successful diagnostics use a short in-memory cache and consume the
+same monotonic deadline as the model command.
+
 For GitHub execution, first run `write-smoke` without `--github-execute`. After
 the receipt, committed-blob secret scan, validation hash, and test hash pass,
 adding `--github-execute` may push and create a PR. Do not merge during smoke.
 Use `github-gate --action merge --pr-identifier <number>` to perform a read-only
 check of approval and branch-protection status.
+
+Before that merge gate, run `pr-monitor`. It waits for terminal check states,
+writes redacted evidence and classifies failures as control-plane, product
+dependency, or external service failures. Pending, timed-out, query-error,
+missing-check, stale-head, failed, or unapproved states are never mergeable.
+Generated dependency repair tasks are exact-path, one-attempt, local-commit-only
+instructions; they cannot push or merge by themselves.
 
 ## Git Automation Gate
 

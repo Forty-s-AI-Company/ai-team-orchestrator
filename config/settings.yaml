@@ -40,6 +40,7 @@ antigravity:
   run_timeout_seconds: 40
   execution_enabled: true
   prompt_max_chars: 500
+  diagnostics_cache_ttl_seconds: 30
 
 workspace:
   allowlist:

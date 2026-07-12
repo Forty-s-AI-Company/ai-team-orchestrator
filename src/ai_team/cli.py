@@ -10,6 +10,7 @@ import yaml
 from ai_team.core.orchestrator import Orchestrator, WorkflowError, load_workflow
 from ai_team.core.git_policy import evaluate_git_action
 from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action
+from ai_team.core.ci_monitor import monitor_pull_request, write_repair_completion_receipt
 from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
@@ -155,6 +156,65 @@ def evaluate_git_policy(project_path: str, action: str, files: list[str] | None)
         raise SystemExit(2)
 
 
+def monitor_pr(
+    project_path: str,
+    repository: str,
+    pr_identifier: str,
+    report_dir: str | None,
+    wait_seconds: int,
+    poll_seconds: int,
+) -> None:
+    settings = load_settings()
+    loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
+    result = monitor_pull_request(
+        project_root=loaded.root,
+        repository=repository,
+        pr_identifier=pr_identifier,
+        report_dir=Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "ci-monitor",
+        wait_seconds=wait_seconds,
+        poll_seconds=poll_seconds,
+    )
+    print(
+        json.dumps(
+            {
+                "status": result.status,
+                "mergeReady": result.merge_ready,
+                "evidencePath": str(result.evidence_path),
+                "repairTaskPath": str(result.repair_task_path) if result.repair_task_path else None,
+                "blockers": result.evidence.get("blockers", []),
+                "failureEvidence": [
+                    {
+                        "check": item.get("check"),
+                        "workflow": item.get("workflow"),
+                        "classification": item.get("classification"),
+                        "runId": item.get("runId"),
+                    }
+                    for item in result.evidence.get("failureEvidence", [])
+                ],
+            },
+            indent=2,
+            default=str,
+        )
+    )
+
+
+def create_repair_receipt(
+    project_path: str,
+    repair_task_path: str,
+    final_ci_evidence_path: str,
+    report_dir: str | None,
+) -> None:
+    settings = load_settings()
+    loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
+    path = write_repair_completion_receipt(
+        loaded.root,
+        Path(repair_task_path).resolve(),
+        Path(final_ci_evidence_path).resolve(),
+        Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "ci-monitor",
+    )
+    print(json.dumps({"receiptPath": str(path)}, indent=2))
+
+
 def build_openhands_provider(settings: dict) -> OpenHandsProvider:
     openhands = settings.get("openhands", {}) if isinstance(settings.get("openhands"), dict) else {}
     provider_settings = OpenHandsSettings(
@@ -221,6 +281,7 @@ def build_antigravity_provider(settings: dict) -> AntigravityProvider:
         run_timeout_seconds=float(antigravity.get("run_timeout_seconds") or 180),
         execution_enabled=bool(antigravity.get("execution_enabled", False)),
         prompt_max_chars=int(antigravity.get("prompt_max_chars") or 1200),
+        diagnostics_cache_ttl_seconds=float(antigravity.get("diagnostics_cache_ttl_seconds") or 30),
     )
     return AntigravityProvider(provider_settings)
 
@@ -500,6 +561,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("doctor", help="Check provider settings and provider-native loopback status")
 
+    monitor_parser = subparsers.add_parser("pr-monitor", help="Collect PR checks and produce guarded CI evidence")
+    monitor_parser.add_argument("project", nargs="?", default=".")
+    monitor_parser.add_argument("--repo", required=True)
+    monitor_parser.add_argument("--pr", required=True)
+    monitor_parser.add_argument("--report-dir")
+    monitor_parser.add_argument("--wait-seconds", type=int, default=0)
+    monitor_parser.add_argument("--poll-seconds", type=int, default=10)
+
+    repair_receipt_parser = subparsers.add_parser(
+        "repair-receipt",
+        help="Create an attested completion receipt for an exact-path CI repair",
+    )
+    repair_receipt_parser.add_argument("project", nargs="?", default=".")
+    repair_receipt_parser.add_argument("--task-path", required=True)
+    repair_receipt_parser.add_argument("--final-ci-evidence", required=True)
+    repair_receipt_parser.add_argument("--report-dir")
+
     git_policy_parser = subparsers.add_parser("git-policy", help="Evaluate guarded git automation policy")
     git_policy_parser.add_argument("project", nargs="?", default=".")
     git_policy_parser.add_argument(
@@ -601,6 +679,22 @@ def main() -> None:
             validate_profile(args.project)
         elif args.command == "doctor":
             doctor()
+        elif args.command == "pr-monitor":
+            monitor_pr(
+                args.project,
+                args.repo,
+                args.pr,
+                args.report_dir,
+                args.wait_seconds,
+                args.poll_seconds,
+            )
+        elif args.command == "repair-receipt":
+            create_repair_receipt(
+                args.project,
+                args.task_path,
+                args.final_ci_evidence,
+                args.report_dir,
+            )
         elif args.command == "git-policy":
             evaluate_git_policy(args.project, args.action, args.file)
         elif args.command == "run":

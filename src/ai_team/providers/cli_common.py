@@ -177,8 +177,9 @@ def cli_run_result(
     settings: CliProviderSettings,
     request: ProviderRequest,
     prompt_arg_mode: str = "append",
+    diagnostics_override: dict[str, Any] | None = None,
 ) -> ProviderResult:
-    diagnostics = build_diagnostics(provider_name, settings)
+    diagnostics = diagnostics_override or build_diagnostics(provider_name, settings)
     blocked = result_from_diagnostics(provider_name, diagnostics, request)
     if blocked is not None:
         return blocked
