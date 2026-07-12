@@ -6,9 +6,12 @@ This repository is separate from both:
 
 - `../CelebrateDeal`: the product repository.
 - `../OpenHands`: the official OpenHands source repository.
+- `../HandsFreeCode`: the local OpenHands-like runtime.
 
 The orchestrator talks to OpenHands through loopback HTTP only. It does not
 import or modify OpenHands Python modules.
+It talks to HandsFreeCode through loopback HTTP only and does not import the
+HandsFreeCode package directly.
 
 ## Quick Start
 
@@ -27,6 +30,46 @@ ai-team supervise ..\CelebrateDeal --once
 
 Default provider for `run` is `mock`, so local smoke tests do not require
 OpenHands or a model key.
+
+## HandsFreeCode Provider
+
+Default endpoint:
+
+```text
+http://127.0.0.1:31025
+```
+
+Start the runtime from the sibling project:
+
+```powershell
+cd C:\Users\eden\Downloads\AI\HandsFreeCode
+.\.venv\Scripts\Activate.ps1
+
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+$env:HANDSFREECODE_SESSION_API_KEY = [Convert]::ToHexString($bytes).ToLowerInvariant()
+
+hfc serve
+```
+
+Use the same `HANDSFREECODE_SESSION_API_KEY` in the orchestrator shell:
+
+```powershell
+cd C:\Users\eden\Downloads\AI\ai-team-orchestrator
+.\.venv\Scripts\Activate.ps1
+ai-team doctor
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider handsfreecode --mode create-only
+```
+
+The HandsFreeCode provider calls `/ready` and `/api/tasks/run` with
+`X-Session-API-Key`. If the local key is missing it fails closed before sending
+a request. If the runtime is down, `doctor` marks HandsFreeCode as provider
+native `externalRequired`; mock results must not be reported as HandsFreeCode,
+Codex, or Antigravity passes.
+
+HandsFreeCode may use Ollama internally for low-risk fallback work. The
+orchestrator still records the outer provider as `handsfreecode` and the inner
+runtime provider as `ollama`, never `codex` or `antigravity`.
 
 ## OpenHands Provider
 
@@ -64,7 +107,7 @@ reports/receipts/
 ```
 
 Receipts include project path, branch, provider, workflow, stages, commit SHA,
-provider-native ready result, OpenHands conversation id, task id when available,
+provider-native ready result, conversation id, task id when available,
 started/completed timestamps, duration, and validation result. Runtime receipts
 are ignored by Git.
 
@@ -141,6 +184,8 @@ branch protection checks, and reviewed receipts.
 ## External Required
 
 - `OPENHANDS_LLM_API_KEY` for true `run-agent` execution.
+- `HANDSFREECODE_SESSION_API_KEY` and the HandsFreeCode loopback server for
+  HandsFreeCode provider-native runs.
 - Codex CLI authenticated quota for Codex-backed stages.
 - Antigravity CLI authenticated quota for provider-native browser QA.
 - GitHub CLI authentication and branch protection policy before automated push,

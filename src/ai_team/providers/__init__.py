@@ -7,10 +7,13 @@ from .base import (
     RetryingProvider,
     redact_secrets,
 )
+from .handsfreecode import HandsFreeCodeProvider, HandsFreeCodeSettings
 from .openhands import OpenHandsProvider, OpenHandsSettings
 
 __all__ = [
     "BaseProvider",
+    "HandsFreeCodeProvider",
+    "HandsFreeCodeSettings",
     "MockProvider",
     "OpenHandsProvider",
     "OpenHandsSettings",

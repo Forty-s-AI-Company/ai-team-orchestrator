@@ -12,6 +12,14 @@ openhands:
   llm_api_key: "placeholder-not-a-real-secret"
   max_retries: 2
 
+handsfreecode:
+  base_url: "http://127.0.0.1:31025"
+  session_key_env: "HANDSFREECODE_SESSION_API_KEY"
+  ready_path: "/ready"
+  task_run_path: "/api/tasks/run"
+  timeout_seconds: 30
+  default_runtime_provider: "mock"
+
 workspace:
   allowlist:
     - "C:/Users/eden/Downloads/AI"

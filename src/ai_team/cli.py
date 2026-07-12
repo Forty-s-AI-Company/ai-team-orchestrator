@@ -11,7 +11,13 @@ from ai_team.core.orchestrator import Orchestrator, WorkflowError, load_workflow
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
 from ai_team.core.supervisor import SupervisorOptions, run_supervisor
-from ai_team.providers import MockProvider, OpenHandsProvider, OpenHandsSettings
+from ai_team.providers import (
+    HandsFreeCodeProvider,
+    HandsFreeCodeSettings,
+    MockProvider,
+    OpenHandsProvider,
+    OpenHandsSettings,
+)
 from ai_team.providers.base import redact_secrets
 
 
@@ -151,15 +157,53 @@ def build_openhands_provider(settings: dict) -> OpenHandsProvider:
     return OpenHandsProvider(provider_settings)
 
 
+def build_handsfreecode_provider(settings: dict) -> HandsFreeCodeProvider:
+    handsfreecode = settings.get("handsfreecode", {}) if isinstance(settings.get("handsfreecode"), dict) else {}
+    provider_settings = HandsFreeCodeSettings(
+        base_url=str(handsfreecode.get("base_url") or "http://127.0.0.1:31025"),
+        session_key_env=str(handsfreecode.get("session_key_env") or "HANDSFREECODE_SESSION_API_KEY"),
+        ready_path=str(handsfreecode.get("ready_path") or "/ready"),
+        task_run_path=str(handsfreecode.get("task_run_path") or "/api/tasks/run"),
+        timeout_seconds=float(handsfreecode.get("timeout_seconds") or 30),
+        default_runtime_provider=str(handsfreecode.get("default_runtime_provider") or "mock"),
+    )
+    return HandsFreeCodeProvider(provider_settings)
+
+
+def build_provider(provider_name: str, settings: dict):
+    if provider_name == "mock":
+        return MockProvider()
+    if provider_name == "handsfreecode":
+        return build_handsfreecode_provider(settings)
+    return build_openhands_provider(settings)
+
+
 def doctor() -> None:
     settings = load_settings()
-    provider = build_openhands_provider(settings)
-    diagnostics = provider.diagnostics()
+    openhands = build_openhands_provider(settings).diagnostics()
+    handsfreecode = build_handsfreecode_provider(settings).diagnostics()
     print(
         json.dumps(
             {
                 "settings": str(DEFAULT_SETTINGS_PATH),
-                "openhands": diagnostics,
+                "openhands": openhands,
+                "handsfreecode": handsfreecode,
+                "providerNative": {
+                    "openhands": {
+                        "ready": openhands.get("ready") is True,
+                        "externalRequired": not openhands.get("ready"),
+                    },
+                    "handsfreecode": {
+                        "ready": handsfreecode.get("ready") is True
+                        and handsfreecode.get("authConfigured") is True
+                        and handsfreecode.get("sessionKeyPresent") is True,
+                        "externalRequired": not (
+                            handsfreecode.get("ready") is True
+                            and handsfreecode.get("authConfigured") is True
+                            and handsfreecode.get("sessionKeyPresent") is True
+                        ),
+                    },
+                },
             },
             indent=2,
             default=str,
@@ -178,8 +222,8 @@ def run_workflow(
     settings = load_settings()
     loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
     load_workflow(workflow_name)
-    provider = MockProvider() if provider_name == "mock" else build_openhands_provider(settings)
-    timeout_seconds = provider.settings.timeout_seconds if isinstance(provider, OpenHandsProvider) else 30
+    provider = build_provider(provider_name, settings)
+    timeout_seconds = provider.settings.timeout_seconds if isinstance(provider, (OpenHandsProvider, HandsFreeCodeProvider)) else 30
     result = Orchestrator(provider=provider, max_retries=2).run(
         loaded,
         workflow_name=workflow_name,
@@ -224,7 +268,7 @@ def supervise(
     report_dir: str | None,
 ) -> None:
     settings = load_settings()
-    provider = MockProvider() if provider_name == "mock" else build_openhands_provider(settings)
+    provider = build_provider(provider_name, settings)
     summary = run_supervisor(
         SupervisorOptions(
             project_path=Path(project_path).resolve(),
@@ -267,12 +311,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("validate", help="Validate .ai-team/project.yaml")
     validate_parser.add_argument("project", nargs="?", default=".")
 
-    subparsers.add_parser("doctor", help="Check provider settings and OpenHands loopback status")
+    subparsers.add_parser("doctor", help="Check provider settings and provider-native loopback status")
 
     run_parser = subparsers.add_parser("run", help="Run a guarded workflow")
     run_parser.add_argument("project", nargs="?", default=".")
     run_parser.add_argument("--workflow", required=True)
-    run_parser.add_argument("--provider", choices=["mock", "openhands"], default="mock")
+    run_parser.add_argument("--provider", choices=["mock", "openhands", "handsfreecode"], default="mock")
     run_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--receipt-dir")
@@ -280,7 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_parser = subparsers.add_parser("supervise", help="Run autonomous safe supervisor loop")
     supervisor_parser.add_argument("project", nargs="?", default=".")
     supervisor_parser.add_argument("--workflow", default="project-analysis")
-    supervisor_parser.add_argument("--provider", choices=["mock", "openhands"], default="mock")
+    supervisor_parser.add_argument("--provider", choices=["mock", "openhands", "handsfreecode"], default="mock")
     supervisor_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
     supervisor_parser.add_argument("--dry-run", action="store_true", default=True)
     supervisor_parser.add_argument("--execute", action="store_false", dest="dry_run")

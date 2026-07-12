@@ -2,6 +2,7 @@
 
 This runbook keeps `ai-team-orchestrator`, `CelebrateDeal`, and official
 `OpenHands` source code separated.
+HandsFreeCode is a sibling runtime and remains separate as well.
 
 ## Local Layout
 
@@ -9,10 +10,58 @@ This runbook keeps `ai-team-orchestrator`, `CelebrateDeal`, and official
 C:\Users\eden\Downloads\AI\
 ├─ CelebrateDeal
 ├─ OpenHands
-└─ ai-team-orchestrator
+├─ ai-team-orchestrator
+└─ HandsFreeCode
 ```
 
 Do not edit `OpenHands` from this orchestrator. Treat it as an external worker.
+Do not import HandsFreeCode directly; call it through loopback HTTP.
+
+## HandsFreeCode Loopback
+
+HandsFreeCode is reserved for:
+
+```text
+http://127.0.0.1:31025
+```
+
+Start it from its own repository:
+
+```powershell
+cd C:\Users\eden\Downloads\AI\HandsFreeCode
+.\.venv\Scripts\Activate.ps1
+
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+$env:HANDSFREECODE_SESSION_API_KEY = [Convert]::ToHexString($bytes).ToLowerInvariant()
+
+hfc serve
+```
+
+In the orchestrator shell, use the same local-only value:
+
+```powershell
+cd C:\Users\eden\Downloads\AI\ai-team-orchestrator
+.\.venv\Scripts\Activate.ps1
+ai-team doctor
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider handsfreecode --mode create-only
+```
+
+The provider calls:
+
+```text
+GET  /ready
+POST /api/tasks/run
+```
+
+Protected calls use `X-Session-API-Key`. Missing
+`HANDSFREECODE_SESSION_API_KEY` fails closed locally before a task request is
+sent. A remote 401 is treated as auth failure; a remote 503 is treated as
+`external_required`.
+
+HandsFreeCode may call Ollama internally. That result is recorded as
+`runtimeProvider: ollama` under the outer provider `handsfreecode`; it is never
+treated as a Codex or Antigravity provider-native pass.
 
 ## Port
 
@@ -23,6 +72,7 @@ http://127.0.0.1:31024
 ```
 
 The reservation is recorded in `C:\Users\eden\Downloads\AI\ports.json`.
+HandsFreeCode is also recorded there on port `31025`.
 
 ## SESSION_API_KEY
 
@@ -162,12 +212,15 @@ ai-team doctor
 ai-team inspect ..\CelebrateDeal
 ai-team validate ..\CelebrateDeal
 ai-team run ..\CelebrateDeal --workflow project-analysis
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider handsfreecode --mode create-only
 ```
 
 Expected without OpenHands:
 
 - `ai-team doctor` reports `ready: false`.
 - `sessionKeyPresent: false` means OpenHands provider is blocked by design.
+- HandsFreeCode reports `externalRequired` when its loopback server or local
+  session key is missing.
 - Mock workflow still works for local control-plane validation.
 
 ## Stop
@@ -181,6 +234,8 @@ docker stop openhands-local
 - Real OpenHands container/image availability.
 - Local model or remote LLM credentials configured inside OpenHands.
 - `OPENHANDS_LLM_API_KEY` before `run-agent` can call `/api/conversations/{id}/run`.
+- `HANDSFREECODE_SESSION_API_KEY` and the HandsFreeCode loopback server before
+  provider-native HandsFreeCode runs.
 - Codex CLI and Antigravity CLI login/quota for provider-native automation.
 - GitHub CLI authentication and branch protection policy before automated push,
   PR, or merge.

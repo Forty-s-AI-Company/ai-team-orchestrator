@@ -7,7 +7,14 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from ai_team.providers import MockProvider, OpenHandsProvider, OpenHandsSettings, ProviderErrorType
+from ai_team.providers import (
+    HandsFreeCodeProvider,
+    HandsFreeCodeSettings,
+    MockProvider,
+    OpenHandsProvider,
+    OpenHandsSettings,
+    ProviderErrorType,
+)
 from ai_team.providers.base import ProviderRequest, RetryingProvider, redact_secrets
 
 
@@ -186,6 +193,134 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(redacted["nested"]["OPENHANDS_LLM_API_KEY"], "<redacted>")
         self.assertEqual(redacted["safe"], "visible")
 
+
+class HandsFreeCodeProviderTests(unittest.TestCase):
+    def test_handsfreecode_no_session_key_fails_closed(self) -> None:
+        old_value = os.environ.pop("HANDSFREECODE_TEST_SESSION_KEY", None)
+        try:
+            provider = HandsFreeCodeProvider(
+                HandsFreeCodeSettings(
+                    base_url="http://127.0.0.1:31025",
+                    session_key_env="HANDSFREECODE_TEST_SESSION_KEY",
+                )
+            )
+            result = provider.run(
+                ProviderRequest(
+                    workflow="project-analysis",
+                    prompt="hello",
+                    project_root=Path.cwd(),
+                )
+            )
+            self.assertFalse(result.success)
+            self.assertEqual(result.error_type, ProviderErrorType.AUTH)
+            self.assertEqual(result.data["externalRequired"]["type"], "session_key")
+        finally:
+            if old_value is not None:
+                os.environ["HANDSFREECODE_TEST_SESSION_KEY"] = old_value
+
+    def test_handsfreecode_ready_unavailable_diagnostics(self) -> None:
+        provider = HandsFreeCodeProvider(
+            HandsFreeCodeSettings(base_url="http://127.0.0.1:9"),
+            session_key="test-session",
+        )
+        diagnostics = provider.diagnostics()
+        self.assertFalse(diagnostics["ready"])
+        self.assertEqual(diagnostics["errorType"], ProviderErrorType.NETWORK)
+        self.assertTrue(diagnostics["sessionKeyPresent"])
+
+    def test_handsfreecode_protected_api_401_is_auth(self) -> None:
+        server = _FakeHandsFreeCodeServer(task_status=401)
+        try:
+            provider = HandsFreeCodeProvider(
+                HandsFreeCodeSettings(base_url=server.base_url),
+                session_key="wrong-session",
+            )
+            result = provider.run(
+                ProviderRequest(
+                    workflow="project-analysis",
+                    prompt="hello",
+                    project_root=Path.cwd(),
+                )
+            )
+            self.assertFalse(result.success)
+            self.assertEqual(result.error_type, ProviderErrorType.AUTH)
+            self.assertEqual(server.last_post_path, "/api/tasks/run")
+        finally:
+            server.close()
+
+    def test_handsfreecode_protected_api_503_is_external_required(self) -> None:
+        server = _FakeHandsFreeCodeServer(task_status=503)
+        try:
+            provider = HandsFreeCodeProvider(
+                HandsFreeCodeSettings(base_url=server.base_url),
+                session_key="test-session",
+            )
+            result = provider.run(
+                ProviderRequest(
+                    workflow="project-analysis",
+                    prompt="hello",
+                    project_root=Path.cwd(),
+                )
+            )
+            self.assertFalse(result.success)
+            self.assertEqual(result.error_type, ProviderErrorType.EXTERNAL_REQUIRED)
+        finally:
+            server.close()
+
+    def test_handsfreecode_create_only_receipt_mapping(self) -> None:
+        server = _FakeHandsFreeCodeServer(runtime_provider="mock")
+        try:
+            provider = HandsFreeCodeProvider(
+                HandsFreeCodeSettings(base_url=server.base_url),
+                session_key="test-session",
+            )
+            result = provider.run(
+                ProviderRequest(
+                    workflow="project-analysis",
+                    prompt="Forbidden actions: production deploy, real payment, destructive migration.",
+                    project_root=Path.cwd(),
+                    run_mode="create-only",
+                )
+            )
+            self.assertTrue(result.success)
+            self.assertEqual(result.provider, "handsfreecode")
+            self.assertEqual(result.conversation_id, "conv_hfc_test")
+            self.assertEqual(result.task_id, "task_hfc_test")
+            self.assertEqual(result.data["receiptPath"], "receipts/test.json")
+            self.assertEqual(result.data["runtimeProvider"], "mock")
+            self.assertEqual(server.last_post_body["mode"], "create-only")
+            self.assertEqual(server.last_post_body["provider"], "mock")
+            self.assertNotIn("production deploy", server.last_post_body["prompt"])
+            self.assertNotIn("real payment", server.last_post_body["prompt"])
+            self.assertNotIn("destructive migration", server.last_post_body["prompt"])
+        finally:
+            server.close()
+
+    def test_handsfreecode_ollama_runtime_not_marked_as_codex_or_antigravity(self) -> None:
+        server = _FakeHandsFreeCodeServer(runtime_provider="ollama")
+        try:
+            provider = HandsFreeCodeProvider(
+                HandsFreeCodeSettings(base_url=server.base_url, default_runtime_provider="ollama"),
+                session_key="test-session",
+            )
+            result = provider.run(
+                ProviderRequest(
+                    workflow="docs-triage",
+                    prompt="hello",
+                    project_root=Path.cwd(),
+                    run_mode="run-agent",
+                )
+            )
+            self.assertTrue(result.success)
+            self.assertEqual(result.provider, "handsfreecode")
+            self.assertEqual(result.data["runtimeProvider"], "ollama")
+            self.assertNotEqual(result.provider, "codex")
+            self.assertNotEqual(result.provider, "antigravity")
+            self.assertEqual(server.last_post_body["provider"], "ollama")
+        finally:
+            server.close()
+
+
 class _FakeOpenHandsHandler(BaseHTTPRequestHandler):
     server_version = "FakeOpenHands/1.0"
 
@@ -251,6 +386,92 @@ class _FakeOpenHandsServer:
     @property
     def last_run_path(self) -> str | None:
         return self.httpd.last_run_path  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+
+class _FakeHandsFreeCodeHandler(BaseHTTPRequestHandler):
+    server_version = "FakeHandsFreeCode/1.0"
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+    def do_GET(self) -> None:
+        if self.path == "/ready":
+            self._send_json(
+                {
+                    "ready": True,
+                    "authConfigured": True,
+                    "providers": {"mock": True, "ollama": True},
+                }
+            )
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or "0")
+        raw_body = self.rfile.read(length).decode("utf-8")
+        self.server.last_post_path = self.path  # type: ignore[attr-defined]
+        self.server.last_post_body = json.loads(raw_body)  # type: ignore[attr-defined]
+        if self.path != "/api/tasks/run":
+            self.send_response(404)
+            self.end_headers()
+            return
+        task_status = self.server.task_status  # type: ignore[attr-defined]
+        if task_status == 401:
+            self._send_json({"detail": "Invalid session API key"}, status=401)
+            return
+        if task_status == 503:
+            self._send_json({"detail": "session key not configured"}, status=503)
+            return
+        self._send_json(
+            {
+                "taskId": "task_hfc_test",
+                "conversationId": "conv_hfc_test",
+                "status": "completed",
+                "provider": self.server.runtime_provider,  # type: ignore[attr-defined]
+                "mode": "create-only",
+                "receiptPath": "receipts/test.json",
+                "errorType": None,
+                "message": "completed",
+            }
+        )
+
+    def _send_json(self, payload: dict, status: int = 200) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _FakeHandsFreeCodeServer:
+    def __init__(self, task_status: int = 200, runtime_provider: str = "mock") -> None:
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHandsFreeCodeHandler)
+        self.httpd.last_post_path = None  # type: ignore[attr-defined]
+        self.httpd.last_post_body = None  # type: ignore[attr-defined]
+        self.httpd.task_status = task_status  # type: ignore[attr-defined]
+        self.httpd.runtime_provider = runtime_provider  # type: ignore[attr-defined]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def base_url(self) -> str:
+        host, port = self.httpd.server_address
+        return f"http://{host}:{port}"
+
+    @property
+    def last_post_path(self) -> str | None:
+        return self.httpd.last_post_path  # type: ignore[attr-defined]
+
+    @property
+    def last_post_body(self) -> dict | None:
+        return self.httpd.last_post_body  # type: ignore[attr-defined]
 
     def close(self) -> None:
         self.httpd.shutdown()
