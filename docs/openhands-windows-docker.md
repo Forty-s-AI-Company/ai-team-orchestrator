@@ -179,6 +179,31 @@ ai-team supervise ..\CelebrateDeal --once
 ai-team supervise ..\CelebrateDeal --interval-minutes 60 --max-runtime-minutes 480
 ```
 
+Use HandsFreeCode as the provider:
+
+```powershell
+cd C:\Users\eden\Downloads\AI\HandsFreeCode
+.\.venv\Scripts\Activate.ps1
+$env:HANDSFREECODE_SESSION_API_KEY = "<local-random-value>"
+hfc serve
+
+cd C:\Users\eden\Downloads\AI\ai-team-orchestrator
+.\.venv\Scripts\Activate.ps1
+$env:HANDSFREECODE_SESSION_API_KEY = "<same-local-random-value>"
+ai-team supervise ..\CelebrateDeal `
+  --provider handsfreecode `
+  --mode create-only `
+  --interval-minutes 60 `
+  --max-runtime-minutes 480 `
+  --state-path reports\supervisor\handsfreecode-state.json
+```
+
+Pause by closing the shell or stopping the process with `Ctrl+C`.
+Resume by running the same command with the same `--state-path`; the next report
+will include the previous state revision. Stop by ending the supervisor process
+and, if needed, stopping HandsFreeCode with `Stop-Process` or by closing its
+terminal.
+
 The supervisor stages are discovery, quality review, triage, safe auto-cycle,
 QA handoff, regression planning, and Git evidence collection. Reports are
 written to:
@@ -191,6 +216,45 @@ This is currently a safe patrol loop. It does not push, merge, deploy, run
 production payments, or run destructive migrations. Automated git push / PR /
 merge requires a later policy gate with GitHub CLI authentication, branch
 protection checks, reviewed receipts, and explicit project safety settings.
+
+## Quota and Ollama Fallback
+
+When Codex or Antigravity reports quota exhaustion, the supervisor records the
+provider, parsed reset time when available, fallback policy, and next action in
+state. It does not pretend that fallback work is provider-native.
+
+Allowed Ollama fallback scope:
+
+- documentation
+- triage
+- review
+- report
+- project analysis
+
+Blocked Ollama fallback scope:
+
+- implementation/write workflows
+- production deployment
+- payments
+- migrations
+- settlement / payout work
+
+If HandsFreeCode uses Ollama internally, reports keep:
+
+```json
+{
+  "provider": "handsfreecode",
+  "runtimeProvider": "ollama",
+  "masqueradeAsCodexOrAntigravity": false
+}
+```
+
+## External Required Interpretation
+
+- `handsfreecode_loopback`: start `hfc serve` on `127.0.0.1:31025`.
+- `session_key`: set the local session key in the current shell.
+- `llm_credentials`: set the provider's local LLM credential before agent mode.
+- quota exhaustion: wait until reset time or allow only low-risk Ollama fallback.
 
 ## Receipts
 

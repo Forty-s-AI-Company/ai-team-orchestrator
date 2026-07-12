@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ai_team.core.fallback_policy import decide_fallback, state_timestamp
 from ai_team.core.orchestrator import Orchestrator
 from ai_team.core.project_loader import LoadedProject, ProjectConfigError, load_project
 from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderResult, redact_secrets
@@ -27,6 +28,7 @@ class SupervisorOptions:
     max_runtime_minutes: int | None = None
     report_dir: Path = Path("reports/supervisor")
     workspace_allowlist: list[str] | None = None
+    state_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,22 @@ def run_supervisor(options: SupervisorOptions) -> SupervisorRunSummary:
 
 def run_supervisor_cycle(options: SupervisorOptions, cycle_number: int) -> Path:
     started = datetime.now(UTC)
+    state_path = _state_path(options)
+    previous_state = _load_state(state_path)
+    _write_state(
+        state_path,
+        {
+            "schemaVersion": 1,
+            "revision": int(previous_state.get("revision") or 0) + 1,
+            "status": "running",
+            "provider": options.provider.name,
+            "workflow": options.workflow,
+            "runMode": options.run_mode,
+            "cycleNumber": cycle_number,
+            "startedAt": started.isoformat(),
+            "previous": _state_summary(previous_state),
+        },
+    )
     loaded: LoadedProject | None = None
     project_error: str | None = None
 
@@ -78,6 +96,7 @@ def run_supervisor_cycle(options: SupervisorOptions, cycle_number: int) -> Path:
     stages.append(_stage("triage", loaded is not None, _triage(loaded)))
 
     provider_result: ProviderResult | None = None
+    provider_error_message: str | None = None
     if loaded is not None:
         try:
             provider_result = Orchestrator(options.provider, max_retries=1).run(
@@ -100,10 +119,24 @@ def run_supervisor_cycle(options: SupervisorOptions, cycle_number: int) -> Path:
                 )
             )
         except Exception as exc:
+            provider_error_message = str(exc)
             stages.append(_stage("auto-cycle", False, {"message": str(exc)}))
     else:
         stages.append(_stage("auto-cycle", False, {"message": "project profile unavailable"}))
 
+    fallback_decision = decide_fallback(provider_result, options.workflow)
+    stages.append(
+        _stage(
+            "fallback-policy",
+            True,
+            {
+                **fallback_decision.as_dict(),
+                "provider": provider_result.provider if provider_result else options.provider.name,
+                "runtimeProvider": (provider_result.data.get("runtimeProvider") if provider_result else None),
+                "note": "Ollama fallback is never reported as Codex or Antigravity provider-native pass.",
+            },
+        )
+    )
     stages.append(_stage("qa-handoff", True, _qa_handoff(provider_result)))
     stages.append(_stage("regression", True, _regression_plan(loaded)))
     stages.append(_stage("git-commit-evidence", True, _git_evidence(loaded)))
@@ -120,6 +153,12 @@ def run_supervisor_cycle(options: SupervisorOptions, cycle_number: int) -> Path:
         "workflow": options.workflow,
         "runMode": options.run_mode,
         "dryRun": options.dry_run,
+        "provider": options.provider.name,
+        "statePath": str(state_path),
+        "resume": {
+            "previousState": _state_summary(previous_state),
+            "duplicateResumeSafe": True,
+        },
         "stages": stages,
         "status": "completed" if all(stage["ok"] for stage in stages) else "attention_required",
     }
@@ -128,6 +167,26 @@ def run_supervisor_cycle(options: SupervisorOptions, cycle_number: int) -> Path:
     timestamp = started.isoformat().replace(":", "").replace("+", "Z").replace(".", "")
     path = options.report_dir / f"{timestamp}-cycle-{cycle_number}-{uuid4().hex[:8]}.json"
     path.write_text(json.dumps(redact_secrets(report), indent=2, default=str), encoding="utf-8")
+    _write_state(
+        state_path,
+        {
+            "schemaVersion": 1,
+            "revision": int(previous_state.get("revision") or 0) + 2,
+            "status": report["status"],
+            "provider": options.provider.name,
+            "workflow": options.workflow,
+            "runMode": options.run_mode,
+            "cycleNumber": cycle_number,
+            "startedAt": started.isoformat(),
+            "completedAt": completed.isoformat(),
+            "lastReportPath": str(path),
+            "providerResult": _provider_state(provider_result),
+            "fallbackPolicy": fallback_decision.as_dict(),
+            "providerErrorMessage": provider_error_message,
+            "nextAction": _next_action(provider_result, fallback_decision),
+            "updatedAt": state_timestamp(),
+        },
+    )
     return path
 
 
@@ -169,7 +228,16 @@ def _qa_handoff(provider_result: ProviderResult | None) -> dict[str, Any]:
     if provider_result is None:
         return {"status": "not-created"}
     if provider_result.provider == "openhands" and provider_result.success:
-        return {"status": "provider-native-ready", "conversationId": provider_result.conversation_id}
+        return {"status": "provider-native-ready", "provider": "openhands", "conversationId": provider_result.conversation_id}
+    if provider_result.provider == "handsfreecode" and provider_result.success:
+        return {
+            "status": "provider-native-ready",
+            "provider": "handsfreecode",
+            "conversationId": provider_result.conversation_id,
+            "taskId": provider_result.task_id,
+            "runtimeProvider": provider_result.data.get("runtimeProvider"),
+            "masqueradeAsCodexOrAntigravity": False,
+        }
     if provider_result.error_type == ProviderErrorType.EXTERNAL_REQUIRED:
         return {"status": "external-required", "details": provider_result.data.get("externalRequired")}
     return {"status": "manual-review-required", "errorType": provider_result.error_type}
@@ -215,3 +283,66 @@ def _git_status(root: Path) -> str:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"unavailable: {exc}"
     return result.stdout.strip()
+
+
+def _state_path(options: SupervisorOptions) -> Path:
+    if options.state_path is not None:
+        return options.state_path
+    return options.report_dir / "state.json"
+
+
+def _load_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"status": "unreadable", "path": str(path)}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _write_state(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(redact_secrets(payload), indent=2, default=str), encoding="utf-8")
+
+
+def _state_summary(state: dict[str, Any]) -> dict[str, Any]:
+    if not state:
+        return {"available": False}
+    return {
+        "available": True,
+        "revision": state.get("revision"),
+        "status": state.get("status"),
+        "provider": state.get("provider"),
+        "workflow": state.get("workflow"),
+        "cycleNumber": state.get("cycleNumber"),
+        "lastReportPath": state.get("lastReportPath"),
+        "nextAction": state.get("nextAction"),
+    }
+
+
+def _provider_state(provider_result: ProviderResult | None) -> dict[str, Any]:
+    if provider_result is None:
+        return {"available": False}
+    return {
+        "available": True,
+        "provider": provider_result.provider,
+        "success": provider_result.success,
+        "errorType": provider_result.error_type,
+        "conversationId": provider_result.conversation_id,
+        "taskId": provider_result.task_id,
+        "runtimeProvider": provider_result.data.get("runtimeProvider"),
+        "externalRequired": provider_result.data.get("externalRequired"),
+    }
+
+
+def _next_action(provider_result: ProviderResult | None, fallback_decision) -> str:
+    if provider_result is None:
+        return "manual-review"
+    if provider_result.success:
+        return "scheduled-discovery"
+    if fallback_decision.quota_exhausted and fallback_decision.fallback_allowed:
+        return "ollama-low-risk-fallback"
+    if provider_result.error_type == ProviderErrorType.EXTERNAL_REQUIRED:
+        return "external-required"
+    return "manual-review"

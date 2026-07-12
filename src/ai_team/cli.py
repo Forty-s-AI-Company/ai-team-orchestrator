@@ -266,6 +266,7 @@ def supervise(
     interval_minutes: int,
     max_runtime_minutes: int | None,
     report_dir: str | None,
+    state_path: str | None,
 ) -> None:
     settings = load_settings()
     provider = build_provider(provider_name, settings)
@@ -280,6 +281,7 @@ def supervise(
             interval_minutes=interval_minutes,
             max_runtime_minutes=max_runtime_minutes,
             report_dir=Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "supervisor",
+            state_path=Path(state_path).resolve() if state_path else None,
             workspace_allowlist=workspace_allowlist(settings),
         )
     )
@@ -332,6 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_parser.add_argument("--interval-minutes", type=int, default=60)
     supervisor_parser.add_argument("--max-runtime-minutes", type=int)
     supervisor_parser.add_argument("--report-dir")
+    supervisor_parser.add_argument("--state-path")
 
     return parser
 
@@ -372,6 +375,7 @@ def main() -> None:
                 args.interval_minutes,
                 args.max_runtime_minutes,
                 args.report_dir,
+                args.state_path,
             )
     except (ProjectConfigError, WorkflowError) as exc:
         print(f"ai-team error: {exc}", file=sys.stderr)

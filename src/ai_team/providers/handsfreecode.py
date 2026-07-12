@@ -101,9 +101,17 @@ class HandsFreeCodeProvider(BaseProvider):
             return ProviderResult(
                 provider=self.name,
                 success=False,
-                error_type=ready_result.get("errorType") or ProviderErrorType.NETWORK,
+                error_type=ProviderErrorType.EXTERNAL_REQUIRED,
                 content=str(ready_result.get("message") or "HandsFreeCode is not ready"),
-                data={"runMode": request.run_mode, "ready": redact_secrets(ready_result)},
+                data={
+                    "runMode": request.run_mode,
+                    "ready": redact_secrets(ready_result),
+                    "externalRequired": {
+                        "type": "handsfreecode_loopback",
+                        "baseUrl": self.settings.base_url,
+                        "message": "Start HandsFreeCode loopback before provider-native runs.",
+                    },
+                },
             )
 
         payload = self._task_payload(request)

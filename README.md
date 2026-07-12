@@ -163,11 +163,41 @@ Run hourly safe patrol:
 ai-team supervise ..\CelebrateDeal --interval-minutes 60 --max-runtime-minutes 480
 ```
 
+Run hourly patrol through HandsFreeCode:
+
+```powershell
+ai-team supervise ..\CelebrateDeal `
+  --provider handsfreecode `
+  --mode create-only `
+  --interval-minutes 60 `
+  --max-runtime-minutes 480 `
+  --state-path reports\supervisor\handsfreecode-state.json
+```
+
 The current supervisor is intentionally conservative. It writes structured
 reports to `reports/supervisor/` and does not push, merge, deploy, run real
 payments, or modify production data. Git push, PR, and merge automation must be
 enabled later through explicit project safety policy, authenticated GitHub CLI,
 branch protection checks, and reviewed receipts.
+
+Supervisor state is written to `reports/supervisor/state.json` by default, or
+to `--state-path` when supplied. Re-running the supervisor resumes from that
+state by recording the prior revision in the next report; duplicate resumes are
+safe and simply advance the state revision.
+
+## Quota Fallback Policy
+
+Codex and Antigravity quota exhaustion are treated as recoverable control-plane
+states. The supervisor stores reset-time evidence when it can parse it and marks
+the next action in state.
+
+Ollama fallback is limited to documentation, triage, review, report, and
+project-analysis workflows. It is blocked for write workflows, payments,
+deployments, migrations, settlements, and payouts.
+
+Fallback output is never reported as a Codex or Antigravity provider-native
+pass. If HandsFreeCode uses Ollama internally, reports keep the outer provider
+as `handsfreecode` and set `runtimeProvider: ollama`.
 
 ## Safety Rules
 
@@ -180,12 +210,15 @@ branch protection checks, and reviewed receipts.
 - Provider logs and results redact token, secret, password, bearer, and `sk-*`
   patterns, including JSON keys such as `api_key`.
 - The provider does not inherit or forward the full process environment.
+- Ollama fallback is limited by workflow allowlist and never masquerades as a
+  provider-native Codex or Antigravity result.
 
 ## External Required
 
 - `OPENHANDS_LLM_API_KEY` for true `run-agent` execution.
 - `HANDSFREECODE_SESSION_API_KEY` and the HandsFreeCode loopback server for
   HandsFreeCode provider-native runs.
+- Codex / Antigravity quota reset time when the provider CLI is exhausted.
 - Codex CLI authenticated quota for Codex-backed stages.
 - Antigravity CLI authenticated quota for provider-native browser QA.
 - GitHub CLI authentication and branch protection policy before automated push,
