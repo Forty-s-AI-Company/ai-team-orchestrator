@@ -92,7 +92,20 @@ def evaluate_git_action(
             evidence=evidence,
         )
 
-    if normalized_action in {"pr", "pull-request", "merge"}:
+    if normalized_action in {"pr", "pull-request"}:
+        if not loaded_project.is_disposable_worktree():
+            reasons.append("pull request creation requires a disposable linked worktree")
+        if not loaded_project.profile.safety.allow_git_push:
+            reasons.append("project safety policy does not allow git push required for pull request creation")
+        return GitPolicyDecision(
+            action=normalized_action,
+            allowed=not reasons,
+            external_required=not loaded_project.profile.safety.allow_git_push,
+            reasons=reasons,
+            evidence=evidence,
+        )
+
+    if normalized_action == "merge":
         return GitPolicyDecision(
             action=normalized_action,
             allowed=False,

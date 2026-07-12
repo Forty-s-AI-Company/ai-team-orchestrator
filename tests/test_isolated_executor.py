@@ -48,6 +48,14 @@ safety:
     subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
 
 
+def make_disposable_worktree_marker(root: Path) -> None:
+    git_marker = root / ".git"
+    git_marker_dir = root / ".git-dir"
+    if git_marker.is_dir():
+        git_marker.rename(git_marker_dir)
+    git_marker.write_text(f"gitdir: {git_marker_dir.as_posix()}\n", encoding="utf-8")
+
+
 class IsolatedExecutorTests(unittest.TestCase):
     def test_write_workflow_runs_in_disposable_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,6 +186,20 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertFalse(decision.allowed)
             self.assertTrue(decision.external_required)
             self.assertIn("branch protection", " ".join(decision.reasons))
+
+    def test_github_gate_pr_dry_run_allowed_when_policy_inputs_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_github_action(loaded, "pr", dry_run=True, validation_log_hash="abc123")
+
+            self.assertTrue(decision.allowed, decision.reasons)
+            self.assertFalse(decision.external_required)
 
 
 class _WritingProvider(BaseProvider):

@@ -294,8 +294,10 @@ Default policy:
 - protected branches such as `master` and `main` block automated writes.
 - ignored files, runtime artifacts, logs, reports, receipts, caches, venvs, and
   suspected secret files are blocked.
-- `push`, `pr`, and `merge` remain `externalRequired` until GitHub auth, branch
-  protection, reviewed receipts, and explicit project safety policy are wired.
+- `push` and `pr` require a disposable worktree plus explicit project push
+  policy; PR also requires a validation log hash.
+- `merge` remains `externalRequired` until branch protection and review status
+  are wired.
 
 `ai-team github-gate` evaluates GitHub-level automation. It is dry-run by
 default and does not push, create PRs, or merge.
@@ -306,10 +308,10 @@ ai-team github-gate ..\CelebrateDeal --action pr --validation-log-hash <sha256>
 ai-team github-gate ..\CelebrateDeal --action merge --validation-log-hash <sha256>
 ```
 
-Push, PR, and merge execution require GitHub CLI authentication, branch
-protection, validation log hashes, reviewed executor receipts, and explicit
-project safety policy. Merge remains blocked until branch protection and review
-status are wired into the gate.
+Push and PR execution require GitHub CLI authentication, validation log hashes,
+reviewed executor receipts, and explicit project safety policy. PR dry-run can
+pass when those static inputs are present. Merge remains blocked until branch
+protection and review status are wired into the gate.
 
 ## Safety Rules
 

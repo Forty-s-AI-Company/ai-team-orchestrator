@@ -340,9 +340,11 @@ Current gate behavior:
 - `master` and `main` are protected by default.
 - ignored files, runtime artifacts, logs, reports, receipts, cache folders,
   virtualenvs, and suspected secret files are rejected.
-- `push`, PR creation, and merge are intentionally `External required` until
-  GitHub CLI auth, branch protection, reviewed receipts, staged secret scan,
-  and explicit project safety policy are connected.
+- `push` and PR creation require a disposable worktree, reviewed receipts,
+  staged secret scan, validation hash, GitHub CLI auth for execution, and
+  explicit project safety policy.
+- merge is intentionally `External required` until branch protection and review
+  status are connected.
 
 GitHub-level automation is guarded separately:
 
@@ -352,10 +354,10 @@ ai-team github-gate ..\CelebrateDeal --action pr --validation-log-hash <sha256>
 ai-team github-gate ..\CelebrateDeal --action merge --validation-log-hash <sha256>
 ```
 
-`github-gate` is dry-run by default. It must not perform real push, PR, or
-merge operations unless a later policy explicitly enables execution and the
-required receipts, validation hash, GitHub CLI authentication, and branch
-protection checks are present.
+`github-gate` is dry-run by default. PR dry-run may pass when the project is a
+disposable worktree, push policy is enabled, and a validation hash is present.
+Execution still requires GitHub CLI authentication. Merge remains blocked until
+branch protection and review status are connected.
 
 ## Receipts
 

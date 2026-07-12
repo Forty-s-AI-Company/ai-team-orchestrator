@@ -139,6 +139,20 @@ class GitPolicyTests(unittest.TestCase):
             self.assertFalse(pr.allowed)
             self.assertTrue(pr.external_required)
 
+    def test_pr_allowed_on_disposable_worktree_when_push_policy_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root, allow_git_push=True)
+            make_disposable_worktree(root)
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_git_action(loaded, "pr")
+
+            self.assertTrue(decision.allowed, decision.reasons)
+            self.assertFalse(decision.external_required)
+
 
 if __name__ == "__main__":
     unittest.main()
