@@ -10,7 +10,9 @@ import yaml
 from ai_team.core.orchestrator import Orchestrator, WorkflowError, load_workflow
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
+from ai_team.core.supervisor import SupervisorOptions, run_supervisor
 from ai_team.providers import MockProvider, OpenHandsProvider, OpenHandsSettings
+from ai_team.providers.base import redact_secrets
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -201,13 +203,52 @@ def run_workflow(
         "errorType": result.provider_result.error_type,
         "conversationId": result.provider_result.conversation_id,
         "taskId": result.provider_result.task_id,
-        "content": result.provider_result.content,
-        "data": result.provider_result.data,
+        "content": _safe_stdout_content(result.provider_result.content),
+        "data": redact_secrets(result.provider_result.data),
         "receiptPath": str(receipt_path),
     }
-    print(json.dumps(payload, indent=2, default=str))
+    print(json.dumps(redact_secrets(payload), indent=2, default=str))
     if not result.provider_result.success:
         raise SystemExit(2)
+
+
+def supervise(
+    project_path: str,
+    workflow_name: str,
+    provider_name: str,
+    dry_run: bool,
+    mode: str,
+    once: bool,
+    interval_minutes: int,
+    max_runtime_minutes: int | None,
+    report_dir: str | None,
+) -> None:
+    settings = load_settings()
+    provider = MockProvider() if provider_name == "mock" else build_openhands_provider(settings)
+    summary = run_supervisor(
+        SupervisorOptions(
+            project_path=Path(project_path).resolve(),
+            provider=provider,
+            workflow=workflow_name,
+            run_mode=mode,
+            dry_run=dry_run,
+            once=once,
+            interval_minutes=interval_minutes,
+            max_runtime_minutes=max_runtime_minutes,
+            report_dir=Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "supervisor",
+            workspace_allowlist=workspace_allowlist(settings),
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "completedCycles": summary.completed_cycles,
+                "stoppedReason": summary.stopped_reason,
+                "reportPaths": [str(path) for path in summary.report_paths],
+            },
+            indent=2,
+        )
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -236,7 +277,29 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--receipt-dir")
 
+    supervisor_parser = subparsers.add_parser("supervise", help="Run autonomous safe supervisor loop")
+    supervisor_parser.add_argument("project", nargs="?", default=".")
+    supervisor_parser.add_argument("--workflow", default="project-analysis")
+    supervisor_parser.add_argument("--provider", choices=["mock", "openhands"], default="mock")
+    supervisor_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
+    supervisor_parser.add_argument("--dry-run", action="store_true", default=True)
+    supervisor_parser.add_argument("--execute", action="store_false", dest="dry_run")
+    supervisor_parser.add_argument("--once", action="store_true")
+    supervisor_parser.add_argument("--interval-minutes", type=int, default=60)
+    supervisor_parser.add_argument("--max-runtime-minutes", type=int)
+    supervisor_parser.add_argument("--report-dir")
+
     return parser
+
+
+def _safe_stdout_content(content: str) -> str:
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        redacted = redact_secrets(content)
+    else:
+        redacted = json.dumps(redact_secrets(parsed), default=str)
+    return redacted if isinstance(redacted, str) else ""
 
 
 def main() -> None:
@@ -254,6 +317,18 @@ def main() -> None:
             doctor()
         elif args.command == "run":
             run_workflow(args.project, args.workflow, args.provider, args.dry_run, args.receipt_dir, args.mode)
+        elif args.command == "supervise":
+            supervise(
+                args.project,
+                args.workflow,
+                args.provider,
+                args.dry_run,
+                args.mode,
+                args.once,
+                args.interval_minutes,
+                args.max_runtime_minutes,
+                args.report_dir,
+            )
     except (ProjectConfigError, WorkflowError) as exc:
         print(f"ai-team error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

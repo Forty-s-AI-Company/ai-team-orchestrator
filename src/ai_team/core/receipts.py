@@ -57,7 +57,12 @@ def write_run_receipt(
 
 
 def _safe_content(content: str) -> str:
-    redacted = redact_secrets(content)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        redacted = redact_secrets(content)
+    else:
+        redacted = json.dumps(redact_secrets(parsed), default=str)
     if not isinstance(redacted, str):
         return ""
     return redacted[:4000]

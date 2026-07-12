@@ -117,6 +117,31 @@ ai-team run ..\CelebrateDeal-openhands-disposable --workflow project-analysis --
 Without `OPENHANDS_LLM_API_KEY`, `run-agent` returns `external_required` and
 does not create a conversation.
 
+## Autonomous Supervisor
+
+Use the supervisor as the single unattended entry point instead of calling
+individual provider probes by hand:
+
+```powershell
+cd C:\Users\eden\Downloads\AI\ai-team-orchestrator
+.\.venv\Scripts\Activate.ps1
+ai-team supervise ..\CelebrateDeal --once
+ai-team supervise ..\CelebrateDeal --interval-minutes 60 --max-runtime-minutes 480
+```
+
+The supervisor stages are discovery, quality review, triage, safe auto-cycle,
+QA handoff, regression planning, and Git evidence collection. Reports are
+written to:
+
+```text
+C:\Users\eden\Downloads\AI\ai-team-orchestrator\reports\supervisor
+```
+
+This is currently a safe patrol loop. It does not push, merge, deploy, run
+production payments, or run destructive migrations. Automated git push / PR /
+merge requires a later policy gate with GitHub CLI authentication, branch
+protection checks, reviewed receipts, and explicit project safety settings.
+
 ## Receipts
 
 Runtime receipts are written to:
@@ -155,4 +180,9 @@ docker stop openhands-local
 
 - Real OpenHands container/image availability.
 - Local model or remote LLM credentials configured inside OpenHands.
+- `OPENHANDS_LLM_API_KEY` before `run-agent` can call `/api/conversations/{id}/run`.
+- Codex CLI and Antigravity CLI login/quota for provider-native automation.
+- GitHub CLI authentication and branch protection policy before automated push,
+  PR, or merge.
+- PayUni remains sandbox-only until production approval.
 - Human login or provider dashboard work, if OpenHands requires it.

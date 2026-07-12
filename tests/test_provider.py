@@ -46,6 +46,7 @@ class ProviderTests(unittest.TestCase):
             self.assertTrue(result.success)
             self.assertEqual(result.conversation_id, "11111111-1111-4111-8111-111111111111")
             self.assertEqual(result.data["executionStatus"], "idle")
+            self.assertEqual(result.data["tokenUsage"], 0)
             self.assertEqual(server.last_post_path, "/api/conversations")
             self.assertIsNone(server.last_run_path)
         finally:
@@ -174,6 +175,17 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("abc.def.ghi", redacted)
         self.assertNotIn("sk-" + "test123456789", redacted)
 
+    def test_secret_redaction_by_sensitive_json_key(self) -> None:
+        sample = {
+            "api_key": "plain-local-key",
+            "nested": {"OPENHANDS_LLM_API_KEY": "plain-local-key"},
+            "safe": "visible",
+        }
+        redacted = redact_secrets(sample)
+        self.assertEqual(redacted["api_key"], "<redacted>")
+        self.assertEqual(redacted["nested"]["OPENHANDS_LLM_API_KEY"], "<redacted>")
+        self.assertEqual(redacted["safe"], "visible")
+
 class _FakeOpenHandsHandler(BaseHTTPRequestHandler):
     server_version = "FakeOpenHands/1.0"
 
@@ -204,6 +216,7 @@ class _FakeOpenHandsHandler(BaseHTTPRequestHandler):
             {
                 "id": "11111111-1111-4111-8111-111111111111",
                 "execution_status": "idle",
+                "stats": {"total_tokens": 999},
                 "workspace": {"kind": "LocalWorkspace", "working_dir": "/projects/sample"},
             }
         )

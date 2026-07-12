@@ -61,11 +61,18 @@ SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_\-]{10,}"),
     re.compile(r"(?i)Bearer\s+[A-Za-z0-9_\-.]+"),
 ]
+SECRET_KEY_PATTERN = re.compile(r"(?i)(api[_-]?key|token|secret|password|hash[_-]?key|hash[_-]?iv)")
 
 
 def redact_secrets(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: redact_secrets(item) for key, item in value.items()}
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str) and SECRET_KEY_PATTERN.search(key):
+                redacted[key] = "<redacted>" if item else item
+            else:
+                redacted[key] = redact_secrets(item)
+        return redacted
     if isinstance(value, list):
         return [redact_secrets(item) for item in value]
     if not isinstance(value, str):

@@ -22,6 +22,7 @@ ai-team validate ..\CelebrateDeal
 ai-team doctor
 ai-team run ..\CelebrateDeal --workflow project-analysis
 ai-team run ..\CelebrateDeal --workflow bug-fix-loop --dry-run
+ai-team supervise ..\CelebrateDeal --once
 ```
 
 Default provider for `run` is `mock`, so local smoke tests do not require
@@ -91,6 +92,40 @@ $env:OPENHANDS_LLM_API_KEY = "<local-llm-key>"
 ai-team run ..\CelebrateDeal-openhands-disposable --workflow project-analysis --provider openhands --mode run-agent
 ```
 
+If `OPENHANDS_LLM_API_KEY` is not set, `run-agent` must not create an
+OpenHands conversation. It returns `external_required` so the control plane can
+resume later without pretending a provider-native agent pass happened.
+
+## Autonomous Supervisor
+
+The supervisor is the unified unattended loop entry point. It performs:
+
+- discovery
+- quality review
+- triage
+- safe auto-cycle
+- QA handoff
+- regression planning
+- Git evidence collection
+
+Run one cycle:
+
+```powershell
+ai-team supervise ..\CelebrateDeal --once
+```
+
+Run hourly safe patrol:
+
+```powershell
+ai-team supervise ..\CelebrateDeal --interval-minutes 60 --max-runtime-minutes 480
+```
+
+The current supervisor is intentionally conservative. It writes structured
+reports to `reports/supervisor/` and does not push, merge, deploy, run real
+payments, or modify production data. Git push, PR, and merge automation must be
+enabled later through explicit project safety policy, authenticated GitHub CLI,
+branch protection checks, and reviewed receipts.
+
 ## Safety Rules
 
 - Project roots must remain inside the configured workspace allowlist.
@@ -100,8 +135,17 @@ ai-team run ..\CelebrateDeal-openhands-disposable --workflow project-analysis --
 - Workflows must explicitly forbid production deploy, real payment, and
   destructive migration.
 - Provider logs and results redact token, secret, password, bearer, and `sk-*`
-  patterns.
+  patterns, including JSON keys such as `api_key`.
 - The provider does not inherit or forward the full process environment.
+
+## External Required
+
+- `OPENHANDS_LLM_API_KEY` for true `run-agent` execution.
+- Codex CLI authenticated quota for Codex-backed stages.
+- Antigravity CLI authenticated quota for provider-native browser QA.
+- GitHub CLI authentication and branch protection policy before automated push,
+  pull request creation, or merge.
+- PayUni remains sandbox-only until production payment approval.
 
 ## Tests
 

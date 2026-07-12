@@ -95,6 +95,40 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(result.workflow.name, "project-analysis")
             self.assertIn("inspect", result.stages)
 
+    def test_receipt_does_not_include_llm_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            loaded = load_project(root)
+            result = Orchestrator(MockProvider()).run(
+                loaded,
+                workflow_name="project-analysis",
+                dry_run=True,
+            )
+            redaction_result = replace(
+                result,
+                provider_result=replace(
+                    result.provider_result,
+                    data={
+                        "runMode": "run-agent",
+                        "response": {
+                            "agent": {
+                                "llm": {
+                                    "api_key": "plain-local-llm-key",
+                                }
+                            }
+                        },
+                        "runEndpointResult": {"success": True},
+                    },
+                    content='{"api_key":"plain-local-llm-key"}',
+                ),
+            )
+            receipt = write_run_receipt(loaded, redaction_result, Path(tmp) / "receipts")
+            content = receipt.read_text(encoding="utf-8")
+            self.assertNotIn("plain-local-llm-key", content)
+            self.assertIn("<redacted>", content)
+
     def test_receipt_names_are_unique(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

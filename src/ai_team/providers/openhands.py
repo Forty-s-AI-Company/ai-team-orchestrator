@@ -152,6 +152,7 @@ class OpenHandsProvider(BaseProvider):
                         "conversationId": ids.get("conversationId"),
                         "taskId": ids.get("taskId"),
                         "executionStatus": ids.get("executionStatus"),
+                        "tokenUsage": _token_usage(data, request.run_mode),
                         "runEndpointResult": redact_secrets(run_endpoint_result),
                         "response": redact_secrets(data),
                     },
@@ -350,3 +351,24 @@ def _extract_ids(data: Any) -> dict[str, str | None]:
 def _tag_value(value: str) -> str:
     normalized = "".join(char.lower() for char in value if char.isalnum())
     return normalized[:64] or "workflow"
+
+
+def _token_usage(data: Any, run_mode: str) -> int:
+    if run_mode == "create-only":
+        return 0
+    if not isinstance(data, dict):
+        return 0
+
+    for key in ("total_tokens", "totalTokens", "tokens"):
+        value = data.get(key)
+        if isinstance(value, int):
+            return value
+
+    usage = data.get("usage") or data.get("stats")
+    if isinstance(usage, dict):
+        for key in ("total_tokens", "totalTokens", "tokens"):
+            value = usage.get(key)
+            if isinstance(value, int):
+                return value
+
+    return 0
