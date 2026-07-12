@@ -84,12 +84,16 @@ def run_in_disposable_worktree(
         if not scope_check["allowed"]:
             git_policy["allowed"] = False
             git_policy.setdefault("reasons", []).extend(scope_check["reasons"])
-        validation_result = run_validation_commands(
-            loaded.root,
-            validation_commands or [],
-            require_nonempty=require_validation,
-            dependency_root=source.root,
-        )
+        dependency_link = prepare_dependency_link(loaded.root, source.root)
+        try:
+            validation_result = run_validation_commands(
+                loaded.root,
+                validation_commands or [],
+                require_nonempty=require_validation,
+                dependency_root=source.root,
+            )
+        finally:
+            remove_dependency_link(dependency_link)
         effective_validation_hash = validation_log_hash or validation_result["hash"]
         effective_test_hash = test_evidence_hash or validation_result["hash"]
         commit_result = maybe_commit_changed_files(
@@ -194,6 +198,33 @@ def inspect_write_scope(changed_files: list[str], allowed_write_paths: list[str]
         "allowedWritePaths": sorted(normalized),
         "reasons": [f"changed file is outside trusted task scope: {item}" for item in outside],
     }
+
+
+def prepare_dependency_link(worktree_root: Path, source_root: Path) -> Path | None:
+    source_modules = source_root / "node_modules"
+    target_modules = worktree_root / "node_modules"
+    if not source_modules.is_dir() or target_modules.exists():
+        return None
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(target_modules), str(source_modules)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return target_modules if result.returncode == 0 and target_modules.exists() else None
+    target_modules.symlink_to(source_modules, target_is_directory=True)
+    return target_modules
+
+
+def remove_dependency_link(link: Path | None) -> None:
+    if link is None or not link.exists():
+        return
+    if link.is_symlink():
+        link.unlink()
+    else:
+        os.rmdir(link)
 
 
 def run_validation_commands(

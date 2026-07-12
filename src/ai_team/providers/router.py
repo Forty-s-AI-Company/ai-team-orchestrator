@@ -62,6 +62,11 @@ class RouterProvider(BaseProvider):
                 attempts.append(ProviderRouteAttempt(provider=provider.name, ready=False))
                 continue
             result = provider.run(request)
+            if (
+                request.metadata.get("writeRequired") is True
+                and result.error_type in {ProviderErrorType.NETWORK, ProviderErrorType.TIMEOUT}
+            ):
+                result = provider.run(request)
             attempts.append(
                 ProviderRouteAttempt(
                     provider=result.provider,

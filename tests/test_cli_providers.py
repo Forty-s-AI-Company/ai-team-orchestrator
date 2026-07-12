@@ -46,6 +46,21 @@ class CliProviderTests(unittest.TestCase):
         self.assertTrue(allowed.success)
         self.assertIn("write", allowed.content)
 
+    def test_windows_sandbox_helper_failure_is_not_reported_as_success(self) -> None:
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "import sys; sys.stderr.write('windows sandbox failed: orchestrator_helper_incomplete')"],
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.NETWORK)
+
     def test_codex_quota_exhaustion_parses_reset_time(self) -> None:
         provider = CodexProvider(
             CodexSettings(
