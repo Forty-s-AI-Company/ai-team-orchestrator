@@ -260,7 +260,7 @@ def _string_list(value, fallback: list[str]) -> list[str]:
 def build_codex_provider(settings: dict) -> CodexProvider:
     codex = settings.get("codex", {}) if isinstance(settings.get("codex"), dict) else {}
     provider_settings = CodexSettings(
-        executable=str(codex.get("executable") or "codex"),
+        executable=_resolve_codex_executable(str(codex.get("executable") or "codex")),
         status_args=_string_list(codex.get("status_args"), ["--version"]),
         quota_args=_string_list(codex.get("quota_args"), ["doctor", "--json"]),
         run_args=_string_list(codex.get("run_args"), ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]),
@@ -273,6 +273,17 @@ def build_codex_provider(settings: dict) -> CodexProvider:
         execution_enabled=bool(codex.get("execution_enabled", True)),
     )
     return CodexProvider(provider_settings)
+
+
+def _resolve_codex_executable(configured: str) -> str:
+    if configured != "auto-native":
+        return configured
+    extension_root = Path.home() / ".vscode" / "extensions"
+    candidates = sorted(
+        extension_root.glob("openai.chatgpt-*/bin/windows-x86_64/codex.exe"),
+        reverse=True,
+    )
+    return str(candidates[0]) if candidates else "codex"
 
 
 def build_antigravity_provider(settings: dict) -> AntigravityProvider:

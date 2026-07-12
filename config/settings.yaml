@@ -23,7 +23,8 @@ handsfreecode:
   default_runtime_provider: "ollama"
 
 codex:
-  executable: "codex"
+  # Prefer a bundled native binary; avoids broken npm sandbox-helper installations on Windows.
+  executable: "auto-native"
   status_args: ["--version"]
   quota_args: []
   run_args: ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]
