@@ -128,7 +128,7 @@ class CliProviderTests(unittest.TestCase):
                 executable=sys.executable,
                 status_args=["--version"],
                 quota_args=[],
-                run_args=["-c", "import sys; print(sys.argv[-1])"],
+                run_args=["-c", "import sys; print(sys.stdin.read())"],
             )
         )
 

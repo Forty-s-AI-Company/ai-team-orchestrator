@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .base import BaseProvider, ProviderRequest, ProviderResult
@@ -57,9 +57,11 @@ class CodexProvider(BaseProvider):
                     success=False,
                     content="workspace-write requires a disposable linked worktree",
                 )
+        cli_settings = self.settings.to_cli_settings(write_enabled=write_enabled)
+        cli_settings = replace(cli_settings, run_args=[*cli_settings.run_args, "-"])
         return cli_run_result(
             self.name,
-            self.settings.to_cli_settings(write_enabled=write_enabled),
+            cli_settings,
             request,
-            prompt_arg_mode="append",
+            prompt_arg_mode="stdin",
         )

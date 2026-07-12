@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import shlex
 import shutil
 import subprocess
@@ -87,6 +88,7 @@ def run_in_disposable_worktree(
             loaded.root,
             validation_commands or [],
             require_nonempty=require_validation,
+            dependency_root=source.root,
         )
         effective_validation_hash = validation_log_hash or validation_result["hash"]
         effective_test_hash = test_evidence_hash or validation_result["hash"]
@@ -94,14 +96,21 @@ def run_in_disposable_worktree(
             loaded,
             changed_files=changed_files,
             git_policy=git_policy,
-            enabled=auto_commit and result.provider_result.success and validation_result["success"],
+            enabled=(
+                auto_commit
+                and result.provider_result.success
+                and bool(changed_files)
+                and validation_result["success"]
+            ),
             commit_message=commit_message or default_commit_message(workflow_name),
         )
-        if auto_commit and (not result.provider_result.success or not validation_result["success"]):
+        if auto_commit and (
+            not result.provider_result.success or not changed_files or not validation_result["success"]
+        ):
             commit_result = {
                 "attempted": False,
                 "committed": False,
-                "reason": "provider validation failed or validation command failed; commit denied",
+                "reason": "provider validation failed, produced no diff, or validation command failed; commit denied",
                 "validation": validation_result,
             }
         run_receipt = write_run_receipt(
@@ -192,6 +201,7 @@ def run_validation_commands(
     commands: list[str],
     *,
     require_nonempty: bool = False,
+    dependency_root: Path | None = None,
 ) -> dict[str, Any]:
     if require_nonempty and not commands:
         payload: dict[str, Any] = {
@@ -218,6 +228,7 @@ def run_validation_commands(
             capture_output=True,
             text=True,
             timeout=900,
+            env=_validation_env(dependency_root),
         )
         results.append({
             "command": command,
@@ -232,6 +243,20 @@ def run_validation_commands(
         json.dumps(redact_secrets(payload), sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
     return redact_secrets(payload)
+
+
+def _validation_env(dependency_root: Path | None) -> dict[str, str]:
+    allowed = {
+        "APPDATA", "COMSPEC", "HOME", "LOCALAPPDATA", "PATHEXT", "PATH",
+        "PROGRAMDATA", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "WINDIR",
+    }
+    env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    if dependency_root is not None:
+        dependency_bin = dependency_root / "node_modules" / ".bin"
+        env["PATH"] = f"{dependency_bin}{os.pathsep}{env.get('PATH', '')}"
+    env["CI"] = "1"
+    env["NODE_ENV"] = "test"
+    return env
 
 
 def maybe_commit_changed_files(
