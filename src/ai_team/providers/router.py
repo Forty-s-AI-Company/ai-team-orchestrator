@@ -48,6 +48,15 @@ class RouterProvider(BaseProvider):
     def run(self, request: ProviderRequest) -> ProviderResult:
         attempts: list[ProviderRouteAttempt] = []
         for provider in self.providers:
+            if request.metadata.get("writeRequired") is True and provider.name not in {"codex", "antigravity"}:
+                attempts.append(
+                    ProviderRouteAttempt(
+                        provider=provider.name,
+                        ready=False,
+                        details={"blockedReason": "write workflow requires an approved provider-native CLI"},
+                    )
+                )
+                continue
             ready = _provider_ready(provider)
             if not ready:
                 attempts.append(ProviderRouteAttempt(provider=provider.name, ready=False))

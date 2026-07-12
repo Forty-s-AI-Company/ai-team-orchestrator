@@ -21,6 +21,31 @@ from ai_team.providers.antigravity import _compact_prompt
 
 
 class CliProviderTests(unittest.TestCase):
+    def test_codex_workspace_write_requires_linked_worktree_marker(self) -> None:
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "print('read')"],
+                write_run_args=["-c", "print('write')"],
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            denied = provider.run(
+                ProviderRequest("bug-fix-loop", "task", root, metadata={"writeRequired": True})
+            )
+            (root / ".git").write_text("gitdir: test", encoding="utf-8")
+            allowed = provider.run(
+                ProviderRequest("bug-fix-loop", "task", root, metadata={"writeRequired": True})
+            )
+
+        self.assertFalse(denied.success)
+        self.assertIn("disposable linked worktree", denied.content)
+        self.assertTrue(allowed.success)
+        self.assertIn("write", allowed.content)
+
     def test_codex_quota_exhaustion_parses_reset_time(self) -> None:
         provider = CodexProvider(
             CodexSettings(

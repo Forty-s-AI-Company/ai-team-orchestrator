@@ -11,6 +11,7 @@ from ai_team.core.orchestrator import Orchestrator, WorkflowError, load_workflow
 from ai_team.core.git_policy import evaluate_git_action
 from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action
 from ai_team.core.ci_monitor import monitor_pull_request, write_repair_completion_receipt
+from ai_team.core.delivery import DeliveryOptions, run_delivery_supervisor
 from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
@@ -263,6 +264,10 @@ def build_codex_provider(settings: dict) -> CodexProvider:
         status_args=_string_list(codex.get("status_args"), ["--version"]),
         quota_args=_string_list(codex.get("quota_args"), ["doctor", "--json"]),
         run_args=_string_list(codex.get("run_args"), ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]),
+        write_run_args=_string_list(
+            codex.get("write_run_args"),
+            ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check"],
+        ),
         timeout_seconds=float(codex.get("timeout_seconds") or 45),
         run_timeout_seconds=float(codex.get("run_timeout_seconds") or 180),
         execution_enabled=bool(codex.get("execution_enabled", True)),
@@ -508,9 +513,29 @@ def supervise(
     github_execute: bool,
     validation_log_hash: str | None,
     test_evidence_hash: str | None,
+    delivery: bool,
 ) -> None:
     settings = load_settings()
     provider = build_provider(provider_name, settings)
+    selected_report_dir = Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "supervisor"
+    if delivery:
+        selected_state_path = Path(state_path).resolve() if state_path else selected_report_dir / "delivery-state.json"
+        result = run_delivery_supervisor(
+            DeliveryOptions(
+                project_path=Path(project_path).resolve(),
+                provider=provider,
+                workspace_allowlist=workspace_allowlist(settings),
+                report_dir=selected_report_dir,
+                state_path=selected_state_path,
+                queue_path=selected_report_dir / "trusted-task-queue.json",
+                once=once,
+                interval_minutes=interval_minutes,
+                max_runtime_minutes=max_runtime_minutes,
+                github_execute=github_execute,
+            )
+        )
+        print(json.dumps(redact_secrets(result), indent=2, default=str))
+        return
     summary = run_supervisor(
         SupervisorOptions(
             project_path=Path(project_path).resolve(),
@@ -521,7 +546,7 @@ def supervise(
             once=once,
             interval_minutes=interval_minutes,
             max_runtime_minutes=max_runtime_minutes,
-            report_dir=Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "supervisor",
+            report_dir=selected_report_dir,
             state_path=Path(state_path).resolve() if state_path else None,
             workspace_allowlist=workspace_allowlist(settings),
             isolated_auto_commit=isolated_auto_commit,
@@ -652,6 +677,11 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_parser.add_argument("--github-execute", action="store_true")
     supervisor_parser.add_argument("--validation-log-hash")
     supervisor_parser.add_argument("--test-evidence-hash")
+    supervisor_parser.add_argument(
+        "--delivery",
+        action="store_true",
+        help="Discover and execute trusted product tasks in disposable worktrees",
+    )
 
     return parser
 
@@ -716,6 +746,7 @@ def main() -> None:
                 args.github_branch,
                 args.validation_log_hash,
                 args.test_evidence_hash,
+                args.delivery,
             )
         elif args.command == "github-gate":
             evaluate_github_gate(

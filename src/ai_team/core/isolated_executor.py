@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -44,6 +47,10 @@ def run_in_disposable_worktree(
     github_branch: str | None = None,
     validation_log_hash: str | None = None,
     test_evidence_hash: str | None = None,
+    task_instruction: str | None = None,
+    allowed_write_paths: list[str] | None = None,
+    validation_commands: list[str] | None = None,
+    require_validation: bool = False,
 ) -> IsolatedRunResult:
     source = load_project(source_project_path, allowlist=workspace_allowlist)
     workflow = load_workflow(workflow_name)
@@ -64,24 +71,38 @@ def run_in_disposable_worktree(
             workflow_name=workflow_name,
             dry_run=dry_run,
             run_mode=run_mode,
+            task_instruction=task_instruction,
         )
         changed_files = list_changed_files(loaded.root)
         file_check = inspect_candidate_files(loaded.root, changed_files)
+        scope_check = inspect_write_scope(changed_files, allowed_write_paths)
         git_policy = evaluate_git_action(loaded, "commit", candidate_files=changed_files).as_dict()
         git_policy["changedFiles"] = changed_files
         git_policy["fileCheck"] = file_check
+        git_policy["scopeCheck"] = scope_check
+        if not scope_check["allowed"]:
+            git_policy["allowed"] = False
+            git_policy.setdefault("reasons", []).extend(scope_check["reasons"])
+        validation_result = run_validation_commands(
+            loaded.root,
+            validation_commands or [],
+            require_nonempty=require_validation,
+        )
+        effective_validation_hash = validation_log_hash or validation_result["hash"]
+        effective_test_hash = test_evidence_hash or validation_result["hash"]
         commit_result = maybe_commit_changed_files(
             loaded,
             changed_files=changed_files,
             git_policy=git_policy,
-            enabled=auto_commit and result.provider_result.success,
+            enabled=auto_commit and result.provider_result.success and validation_result["success"],
             commit_message=commit_message or default_commit_message(workflow_name),
         )
-        if auto_commit and not result.provider_result.success:
+        if auto_commit and (not result.provider_result.success or not validation_result["success"]):
             commit_result = {
                 "attempted": False,
                 "committed": False,
-                "reason": "provider validation failed; commit denied",
+                "reason": "provider validation failed or validation command failed; commit denied",
+                "validation": validation_result,
             }
         run_receipt = write_run_receipt(
             loaded,
@@ -96,8 +117,8 @@ def run_in_disposable_worktree(
             execute=github_execute,
             branch_name=github_branch,
             run_receipt=run_receipt,
-            validation_log_hash=validation_log_hash,
-            test_evidence_hash=test_evidence_hash,
+            validation_log_hash=effective_validation_hash,
+            test_evidence_hash=effective_test_hash,
         )
         executor_receipt = write_executor_receipt(
             source_project=source,
@@ -109,6 +130,7 @@ def run_in_disposable_worktree(
             commit_result=commit_result,
             github_result=github_result,
             keep_worktree=keep_worktree,
+            validation_result=validation_result,
         )
         return IsolatedRunResult(
             worktree_path=worktree_path,
@@ -137,7 +159,7 @@ def remove_worktree(repository_root: Path, worktree_path: Path) -> None:
 
 
 def list_changed_files(project_root: Path) -> list[str]:
-    result = _run_git(project_root, ["status", "--porcelain"])
+    result = _run_git(project_root, ["status", "--porcelain", "--untracked-files=all"])
     files: list[str] = []
     for line in result.stdout.splitlines():
         if not line.strip():
@@ -148,6 +170,68 @@ def list_changed_files(project_root: Path) -> list[str]:
         if path:
             files.append(path)
     return files
+
+
+def inspect_write_scope(changed_files: list[str], allowed_write_paths: list[str] | None) -> dict[str, Any]:
+    if not allowed_write_paths:
+        return {"allowed": True, "allowedWritePaths": [], "reasons": []}
+    normalized = {Path(item).as_posix().rstrip("/") for item in allowed_write_paths}
+    outside = [
+        item for item in changed_files
+        if not any(Path(item).as_posix() == root or Path(item).as_posix().startswith(f"{root}/") for root in normalized)
+    ]
+    return {
+        "allowed": not outside,
+        "allowedWritePaths": sorted(normalized),
+        "reasons": [f"changed file is outside trusted task scope: {item}" for item in outside],
+    }
+
+
+def run_validation_commands(
+    project_root: Path,
+    commands: list[str],
+    *,
+    require_nonempty: bool = False,
+) -> dict[str, Any]:
+    if require_nonempty and not commands:
+        payload: dict[str, Any] = {
+            "success": False,
+            "commands": [],
+            "reason": "trusted write tasks require at least one validation command",
+        }
+        payload["hash"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return payload
+    if not commands:
+        payload = {"success": True, "commands": [], "legacyNoValidation": True}
+        payload["hash"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return payload
+    results: list[dict[str, Any]] = []
+    for command in commands:
+        args = shlex.split(command, posix=False)
+        executable = shutil.which(args[0])
+        if executable:
+            args[0] = executable
+        completed = subprocess.run(
+            args,
+            cwd=project_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        results.append({
+            "command": command,
+            "returnCode": completed.returncode,
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+        })
+        if completed.returncode != 0:
+            break
+    payload = {"success": all(item["returnCode"] == 0 for item in results), "commands": results}
+    payload["hash"] = hashlib.sha256(
+        json.dumps(redact_secrets(payload), sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return redact_secrets(payload)
 
 
 def maybe_commit_changed_files(
@@ -247,6 +331,7 @@ def write_executor_receipt(
     commit_result: dict[str, Any],
     github_result: dict[str, Any] | None,
     keep_worktree: bool,
+    validation_result: dict[str, Any],
 ) -> Path:
     receipt_dir.mkdir(parents=True, exist_ok=True)
     generated_at = datetime.now(UTC).isoformat()
@@ -269,11 +354,12 @@ def write_executor_receipt(
         "commitResult": commit_result,
         "githubResult": github_result,
         "keepWorktree": keep_worktree,
-        "validationResult": {
+        "providerValidationResult": {
             "success": result.provider_result.success,
             "errorType": result.provider_result.error_type,
             "durationMs": result.duration_ms,
         },
+        "commandValidationResult": validation_result,
     }
     path.write_text(json.dumps(redact_secrets(payload), indent=2, default=str), encoding="utf-8")
     return path

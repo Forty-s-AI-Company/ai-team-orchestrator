@@ -470,3 +470,18 @@ passed the configured validation gates.
 python -m unittest discover -s tests
 python -m compileall src tests
 ```
+
+## Autonomous Delivery Supervisor
+
+Use `--delivery` to enable deterministic discovery, trusted task promotion, an
+isolated write worktree, validation-before-commit, and guarded PR creation:
+
+```powershell
+ai-team supervise ..\CelebrateDeal --provider auto --delivery --execute `
+  --auto-commit --github-action pr --github-execute --interval-minutes 60
+```
+
+Runtime state and the normalized trusted queue are written under
+`reports/supervisor/`. Without `--delivery`, `supervise` retains its read-only
+project-analysis behavior. Automated merge remains gated by successful CI,
+receipt and secret-scan evidence, and an approved GitHub review.

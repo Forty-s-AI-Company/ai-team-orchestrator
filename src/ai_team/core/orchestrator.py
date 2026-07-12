@@ -80,6 +80,7 @@ class Orchestrator:
         dry_run: bool = False,
         timeout_seconds: float | None = None,
         run_mode: str = "create-only",
+        task_instruction: str | None = None,
     ) -> WorkflowRunResult:
         workflow = load_workflow(workflow_name)
 
@@ -94,7 +95,12 @@ class Orchestrator:
             if not loaded_project.profile.safety.allow_destructive_commands:
                 pass
 
-        prompt = build_workflow_prompt(loaded_project, workflow, dry_run=dry_run)
+        prompt = build_workflow_prompt(
+            loaded_project,
+            workflow,
+            dry_run=dry_run,
+            task_instruction=task_instruction,
+        )
         request = ProviderRequest(
             workflow=workflow.name,
             prompt=prompt,
@@ -105,6 +111,7 @@ class Orchestrator:
                 "stages": workflow.stages,
                 "dryRun": dry_run,
                 "runMode": run_mode,
+                "writeRequired": workflow.write_required and not dry_run,
             },
             timeout_seconds=timeout_seconds,
             dry_run=dry_run,
@@ -125,7 +132,12 @@ class Orchestrator:
         )
 
 
-def build_workflow_prompt(loaded_project: LoadedProject, workflow: WorkflowDefinition, dry_run: bool) -> str:
+def build_workflow_prompt(
+    loaded_project: LoadedProject,
+    workflow: WorkflowDefinition,
+    dry_run: bool,
+    task_instruction: str | None = None,
+) -> str:
     safety = loaded_project.profile.safety
     lines = [
         f"Project: {loaded_project.profile.project.name}",
@@ -139,4 +151,6 @@ def build_workflow_prompt(loaded_project: LoadedProject, workflow: WorkflowDefin
         f"Safety allow_deploy: {safety.allow_deploy}",
         "Return a concise execution report with findings, planned changes, tests, and blockers.",
     ]
+    if task_instruction:
+        lines.extend(["Trusted task instruction:", task_instruction])
     return "\n".join(lines)

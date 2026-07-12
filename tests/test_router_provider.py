@@ -93,6 +93,29 @@ class RouterProviderTests(unittest.TestCase):
         self.assertEqual(result.data["routeAttempts"][0]["errorType"], ProviderErrorType.RATE_LIMIT)
         self.assertEqual(result.data["routeAttempts"][1]["errorType"], ProviderErrorType.TIMEOUT)
 
+    def test_write_workflow_never_falls_back_to_local_or_mock_provider(self) -> None:
+        router = RouterProvider(
+            [
+                _StaticProvider("codex", ready=True, result=_result("codex", False, ProviderErrorType.RATE_LIMIT)),
+                _StaticProvider("handsfreecode", ready=True, result=_result("handsfreecode", True)),
+                _StaticProvider("mock", ready=True, result=_result("mock", True)),
+            ]
+        )
+        request = ProviderRequest(
+            workflow="bug-fix-loop",
+            prompt="write",
+            project_root=Path.cwd(),
+            metadata={"writeRequired": True},
+        )
+
+        result = router.run(request)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.EXTERNAL_REQUIRED)
+        attempts = {item["provider"]: item for item in result.data["routeAttempts"]}
+        self.assertIn("approved provider-native CLI", attempts["handsfreecode"]["details"]["blockedReason"])
+        self.assertFalse(attempts["mock"]["ready"])
+
 
 class _StaticProvider(BaseProvider):
     def __init__(self, name: str, ready: bool, result: ProviderResult | None) -> None:

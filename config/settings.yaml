@@ -27,6 +27,7 @@ codex:
   status_args: ["--version"]
   quota_args: []
   run_args: ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]
+  write_run_args: ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check"]
   timeout_seconds: 45
   run_timeout_seconds: 180
   execution_enabled: true
