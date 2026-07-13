@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action, sanitize_branch_name
 from ai_team.core.github_gate import evaluate_github_action
@@ -417,11 +418,23 @@ class IsolatedExecutorTests(unittest.TestCase):
                 commands.append(args)
                 return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
-            result = execute_github_action(
-                loaded,
-                GitHubExecutionOptions(action="push", dry_run=False, receipt_path=receipt, branch_name="ai-team/test"),
-                runner=fake_runner,
-            )
+            with (
+                patch("ai_team.core.github_gate.shutil.which", return_value="/usr/bin/gh"),
+                patch(
+                    "ai_team.core.github_gate._gh_auth_status",
+                    return_value={"authenticated": True},
+                ),
+            ):
+                result = execute_github_action(
+                    loaded,
+                    GitHubExecutionOptions(
+                        action="push",
+                        dry_run=False,
+                        receipt_path=receipt,
+                        branch_name="ai-team/test",
+                    ),
+                    runner=fake_runner,
+                )
 
             self.assertTrue(result.success, result.reasons)
             self.assertIn(["git", "push", "-u", "origin", "HEAD:ai-team/test"], commands)
@@ -465,18 +478,25 @@ class IsolatedExecutorTests(unittest.TestCase):
                     )
                 return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
-            result = execute_github_action(
-                loaded,
-                GitHubExecutionOptions(
-                    action="merge",
-                    dry_run=False,
-                    validation_log_hash=VALIDATION_HASH,
-                    receipt_path=receipt,
-                    test_evidence_hash=TEST_HASH,
-                    pr_identifier="123",
+            with (
+                patch("ai_team.core.github_gate.shutil.which", return_value="/usr/bin/gh"),
+                patch(
+                    "ai_team.core.github_gate._gh_auth_status",
+                    return_value={"authenticated": True},
                 ),
-                runner=fake_runner,
-            )
+            ):
+                result = execute_github_action(
+                    loaded,
+                    GitHubExecutionOptions(
+                        action="merge",
+                        dry_run=False,
+                        validation_log_hash=VALIDATION_HASH,
+                        receipt_path=receipt,
+                        test_evidence_hash=TEST_HASH,
+                        pr_identifier="123",
+                    ),
+                    runner=fake_runner,
+                )
 
             self.assertTrue(result.success, result.reasons)
             self.assertIn(["gh", "pr", "merge", "123", "--squash"], commands)
@@ -513,18 +533,25 @@ class IsolatedExecutorTests(unittest.TestCase):
                     stderr="",
                 )
 
-            result = execute_github_action(
-                loaded,
-                GitHubExecutionOptions(
-                    action="merge",
-                    dry_run=False,
-                    validation_log_hash=VALIDATION_HASH,
-                    receipt_path=receipt,
-                    test_evidence_hash=TEST_HASH,
-                    pr_identifier="123",
+            with (
+                patch("ai_team.core.github_gate.shutil.which", return_value="/usr/bin/gh"),
+                patch(
+                    "ai_team.core.github_gate._gh_auth_status",
+                    return_value={"authenticated": True},
                 ),
-                runner=fake_runner,
-            )
+            ):
+                result = execute_github_action(
+                    loaded,
+                    GitHubExecutionOptions(
+                        action="merge",
+                        dry_run=False,
+                        validation_log_hash=VALIDATION_HASH,
+                        receipt_path=receipt,
+                        test_evidence_hash=TEST_HASH,
+                        pr_identifier="123",
+                    ),
+                    runner=fake_runner,
+                )
 
             self.assertFalse(result.success)
             self.assertIn("approved review", " ".join(result.reasons))
