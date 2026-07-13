@@ -110,19 +110,49 @@ The file is intentionally not tracked by Git.
 
 ## Auto Provider Routing
 
-`--provider auto` routes through Codex CLI, Antigravity CLI, HandsFreeCode,
-OpenHands, then mock fallback. Quota, timeout, and network failures are recorded
-in `routeAttempts`. If HandsFreeCode uses Ollama internally, the receipt stays
+Without a role, `--provider auto` routes only through the three audited native
+providers: Codex CLI, Antigravity CLI, then HandsFreeCode. OpenHands remains an
+explicit compatibility provider and mock remains an explicit test provider;
+neither can be selected automatically. Auth, unavailable, quota, timeout, and
+network failures are recorded in `routeAttempts`. If HandsFreeCode uses Ollama
+internally, the receipt stays
 `provider=handsfreecode`, `runtimeProvider=ollama`; it is never relabeled as a
 Codex or Antigravity pass.
 
-Current local evidence: `agy --version`, `agy models`, and a trivial
-Antigravity `--print` smoke pass on this machine, but workflow-sized prompts can
-still timeout. Treat that as provider-native timeout evidence and let auto
-routing continue to HandsFreeCode/Ollama until the Antigravity model path is
-stable.
+Role-aware routing selects an exact provider, account-visible model name, and
+reasoning level from the allowlisted profiles in `config/settings.yaml`:
+
+```bash
+ai-team run /home/eden/projects/CelebrateDeal \
+  --workflow project-analysis \
+  --provider auto \
+  --role project-analyst \
+  --mode read-only-agent
+```
+
+The current profiles are:
+
+| Role | Primary | Fallback / second opinion |
+| --- | --- | --- |
+| Product Manager | Antigravity Gemini 3.5 Flash (High) | Codex gpt-5.6-terra, medium |
+| Architect | Antigravity Gemini 3.1 Pro (High) | Codex gpt-5.6-sol, high fallback and second opinion |
+| Engineer | Codex gpt-5.6-terra, high | none for write workflows |
+| Reviewer | Codex gpt-5.5, high | Claude Sonnet 4.6 (Thinking) fallback and second opinion |
+| QA Engineer | HandsFreeCode / qwen2.5-coder:7b, provider default | none in read-only-agent mode |
+| Project Analyst | HandsFreeCode / qwen2.5-coder:7b, provider default | none in read-only-agent mode |
+
+Fallback is limited to provider availability failures. Invalid or unvalidated
+model output fails closed. Write workflows never cross-provider fallback, and
+second opinions are always forced to read-only metadata. Receipts record the
+role, selected model, reasoning effort, fallback chain, and redacted secondary
+review without changing the existing schema version.
 
 ## OpenHands Provider
+
+OpenHands is disabled by automatic routing policy because HandsFreeCode now
+provides the local runtime path. `ai-team doctor` reports
+`status=disabled_by_policy` and `externalRequired=false` for this policy state.
+The explicit provider remains available for compatibility testing only.
 
 Default endpoint:
 

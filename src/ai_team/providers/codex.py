@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -26,6 +27,8 @@ class CodexSettings:
     timeout_seconds: float = 45
     run_timeout_seconds: float = 180
     execution_enabled: bool = True
+    allowed_models: tuple[str, ...] = ()
+    allowed_reasoning_efforts: tuple[str, ...] = ("low", "medium", "high", "xhigh")
 
     def to_cli_settings(self, *, write_enabled: bool = False) -> CliProviderSettings:
         return CliProviderSettings(
@@ -68,13 +71,34 @@ class CodexProvider(BaseProvider):
                     content="trusted write requires a disposable linked worktree",
                 )
         cli_settings = self.settings.to_cli_settings(write_enabled=write_enabled)
+        try:
+            run_args = _apply_routing_options(
+                cli_settings.run_args,
+                request.metadata.get("requestedModel"),
+                request.metadata.get("reasoningEffort"),
+                self.settings,
+            )
+        except ValueError as exc:
+            return ProviderResult(
+                provider=self.name,
+                success=False,
+                error_type=ProviderErrorType.INVALID_RESPONSE,
+                content=str(exc),
+                data={
+                    "providerNative": True,
+                    "requestedModel": request.metadata.get("requestedModel"),
+                    "reasoningEffort": request.metadata.get("reasoningEffort"),
+                },
+            )
+        cli_settings = replace(cli_settings, run_args=run_args)
         cli_settings = replace(cli_settings, run_args=[*cli_settings.run_args, "-"])
-        return cli_run_result(
+        result = cli_run_result(
             self.name,
             cli_settings,
             request,
             prompt_arg_mode="stdin",
         )
+        return _with_routing_metadata(result, request)
 
     def _run_provider_smoke(self, request: ProviderRequest) -> ProviderResult:
         """Verify native Codex execution without exposing the project workspace."""
@@ -86,7 +110,22 @@ class CodexProvider(BaseProvider):
             f"challenge='{challenge}', provider='codex', status='ok'."
         )
         cli_settings = self.settings.to_cli_settings(write_enabled=False)
-        cli_settings = replace(cli_settings, run_args=[*cli_settings.run_args, "-"])
+        try:
+            routed_args = _apply_routing_options(
+                cli_settings.run_args,
+                request.metadata.get("requestedModel"),
+                request.metadata.get("reasoningEffort"),
+                self.settings,
+            )
+        except ValueError as exc:
+            return ProviderResult(
+                provider=self.name,
+                success=False,
+                error_type=ProviderErrorType.INVALID_RESPONSE,
+                content=str(exc),
+                data={"providerNative": True, "codexNativePass": False},
+            )
+        cli_settings = replace(cli_settings, run_args=[*routed_args, "-"])
         native_tmp = "/tmp" if os.name != "nt" else None
         with tempfile.TemporaryDirectory(prefix="ai-team-codex-smoke-", dir=native_tmp) as tmp:
             smoke_request = replace(request, prompt=prompt, project_root=Path(tmp))
@@ -96,7 +135,8 @@ class CodexProvider(BaseProvider):
                 smoke_request,
                 prompt_arg_mode="stdin",
             )
-        return _validate_smoke_response(result, challenge)
+        validated = _validate_smoke_response(result, challenge)
+        return _with_routing_metadata(validated, request)
 
 
 def _validate_smoke_response(result: ProviderResult, challenge: str) -> ProviderResult:
@@ -145,3 +185,45 @@ def _validate_smoke_response(result: ProviderResult, challenge: str) -> Provider
             "responseSchema": payload.get("schema") if isinstance(payload, dict) else None,
         },
     )
+
+
+def _apply_routing_options(
+    run_args: list[str],
+    model: Any,
+    reasoning_effort: Any,
+    settings: CodexSettings,
+) -> list[str]:
+    """Add audited model controls without accepting arbitrary CLI arguments."""
+    args = list(run_args)
+    if model is not None:
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("Codex routing model must be a non-empty string")
+        if not settings.allowed_models or model not in settings.allowed_models:
+            raise ValueError(f"Codex routing model is not allowlisted: {model}")
+        args.extend(["--model", model])
+    if reasoning_effort is not None:
+        if not isinstance(reasoning_effort, str) or reasoning_effort not in settings.allowed_reasoning_efforts:
+            raise ValueError(f"Codex reasoning effort is not allowlisted: {reasoning_effort}")
+        args.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
+    return args
+
+
+def _with_routing_metadata(result: ProviderResult, request: ProviderRequest) -> ProviderResult:
+    token_usage = _extract_token_usage(result)
+    return replace(
+        result,
+        data={
+            **result.data,
+            "requestedModel": request.metadata.get("requestedModel"),
+            "reasoningEffort": request.metadata.get("reasoningEffort"),
+            "tokenUsage": token_usage if token_usage is not None else result.data.get("tokenUsage", 0),
+            "tokenUsageReported": token_usage is not None,
+        },
+    )
+
+
+def _extract_token_usage(result: ProviderResult) -> int | None:
+    command = result.data.get("command") if isinstance(result.data, dict) else None
+    stderr = command.get("stderr", "") if isinstance(command, dict) else ""
+    match = re.search(r"(?im)^tokens used\s*\n\s*([0-9][0-9,]*)\s*$", str(stderr))
+    return int(match.group(1).replace(",", "")) if match else None

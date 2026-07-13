@@ -27,6 +27,8 @@ class AntigravitySettings:
     execution_enabled: bool = False
     prompt_max_chars: int = 1200
     diagnostics_cache_ttl_seconds: float = 30
+    allowed_models: tuple[str, ...] = ()
+    allowed_reasoning_efforts: tuple[str, ...] = ("low", "medium", "high", "thinking")
 
     def to_cli_settings(self) -> CliProviderSettings:
         return CliProviderSettings(
@@ -125,9 +127,28 @@ class AntigravityProvider(BaseProvider):
             timeout_seconds=remaining,
         )
         cli_settings = self.settings.to_cli_settings()
+        try:
+            routed_args = _apply_routing_options(
+                cli_settings.run_args,
+                request.metadata.get("requestedModel"),
+                request.metadata.get("reasoningEffort"),
+                self.settings,
+            )
+        except ValueError as exc:
+            return ProviderResult(
+                provider=self.name,
+                success=False,
+                error_type=ProviderErrorType.INVALID_RESPONSE,
+                content=str(exc),
+                data={
+                    "providerNative": True,
+                    "requestedModel": request.metadata.get("requestedModel"),
+                    "reasoningEffort": request.metadata.get("reasoningEffort"),
+                },
+            )
         cli_settings = replace(
             cli_settings,
-            run_args=_bounded_run_args(cli_settings.run_args, workspace_root, remaining),
+            run_args=_bounded_run_args(routed_args, workspace_root, remaining),
             run_timeout_seconds=min(cli_settings.run_timeout_seconds, remaining),
         )
         command_result = cli_run_result(
@@ -137,7 +158,17 @@ class AntigravityProvider(BaseProvider):
             prompt_arg_mode="append",
             diagnostics_override=diagnostics,
         )
-        return _validate_response(command_result, request, challenge, probe)
+        result = _validate_response(command_result, request, challenge, probe)
+        return replace(
+            result,
+            data={
+                **result.data,
+                "requestedModel": request.metadata.get("requestedModel"),
+                "reasoningEffort": request.metadata.get("reasoningEffort"),
+                "tokenUsage": result.data.get("tokenUsage", 0),
+                "tokenUsageReported": "tokenUsage" in result.data,
+            },
+        )
 
     def _cache_is_valid(self, now: float) -> bool:
         return bool(
@@ -219,6 +250,51 @@ def _bounded_run_args(run_args: list[str], project_root: Path, remaining: float)
     insert_at = args.index("--print") if "--print" in args else len(args)
     args[insert_at:insert_at] = ["--add-dir", str(project_root)]
     return args
+
+
+def _apply_routing_options(
+    run_args: list[str],
+    model: Any,
+    reasoning_effort: Any,
+    settings: AntigravitySettings,
+) -> list[str]:
+    """Replace only the model value; never pass profile text as arbitrary flags."""
+    args = list(run_args)
+    if model is not None:
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("Antigravity routing model must be a non-empty string")
+        if not settings.allowed_models or model not in settings.allowed_models:
+            raise ValueError(f"Antigravity routing model is not allowlisted: {model}")
+        if "--model" in args:
+            index = args.index("--model")
+            if index + 1 >= len(args):
+                raise ValueError("Antigravity base arguments contain an incomplete --model option")
+            args[index + 1] = model
+        else:
+            args[0:0] = ["--model", model]
+    if reasoning_effort is not None and (
+        not isinstance(reasoning_effort, str)
+        or reasoning_effort not in settings.allowed_reasoning_efforts
+    ):
+        raise ValueError(f"Antigravity reasoning effort is not allowlisted: {reasoning_effort}")
+    if isinstance(model, str) and isinstance(reasoning_effort, str):
+        expected = _reasoning_from_model_name(model)
+        if expected is not None and expected != reasoning_effort:
+            raise ValueError(
+                "Antigravity reasoning effort does not match the allowlisted model name: "
+                f"{model}"
+            )
+    return args
+
+
+def _reasoning_from_model_name(model: str) -> str | None:
+    suffixes = {
+        "(Low)": "low",
+        "(Medium)": "medium",
+        "(High)": "high",
+        "(Thinking)": "thinking",
+    }
+    return next((effort for suffix, effort in suffixes.items() if model.endswith(suffix)), None)
 
 
 def _validate_response(

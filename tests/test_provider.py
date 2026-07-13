@@ -209,12 +209,14 @@ class ProviderTests(unittest.TestCase):
             "nested": {"OPENHANDS_LLM_API_KEY": "plain-local-key"},
             "safe": "visible",
             "tokenUsage": 42,
+            "tokenUsageReported": True,
         }
         redacted = redact_secrets(sample)
         self.assertEqual(redacted["api_key"], "<redacted>")
         self.assertEqual(redacted["nested"]["OPENHANDS_LLM_API_KEY"], "<redacted>")
         self.assertEqual(redacted["safe"], "visible")
         self.assertEqual(redacted["tokenUsage"], 42)
+        self.assertTrue(redacted["tokenUsageReported"])
 
     def test_secret_redaction_handles_quoted_json_and_ci_references(self) -> None:
         sample = (
@@ -225,6 +227,12 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("json-secret", redacted)
         self.assertNotIn("DEPLOY_TOKEN", redacted)
         self.assertNotIn("database-password", redacted)
+        self.assertIn("<redacted>", redacted)
+
+    def test_secret_redaction_removes_native_cli_session_id(self) -> None:
+        redacted = redact_secrets("session id: 019f5af1-private-runtime-id")
+
+        self.assertNotIn("019f5af1-private-runtime-id", redacted)
         self.assertIn("<redacted>", redacted)
 
 

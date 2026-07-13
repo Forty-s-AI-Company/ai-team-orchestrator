@@ -70,13 +70,20 @@ SECRET_PATTERNS = [
     re.compile(r"\b(?:ghp_|github_pat_|glpat-)[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"sk-[A-Za-z0-9_\-]{10,}"),
     re.compile(r"(?i)Bearer\s+[A-Za-z0-9_\-.]+"),
+    re.compile(r"(?i)\bsession\s+id\s*:\s*[A-Za-z0-9_-]+"),
 ]
 SECRET_KEY_PATTERN = re.compile(
     r"(?i)(api[_-]?key|token|secret|password|credential|cookie|private[_-]?key|"
     r"database[_-]?url|direct[_-]?url|hash[_-]?key|hash[_-]?iv)"
 )
 EVIDENCE_HASH_KEYS = {"receiptHash", "secretScanHash", "testEvidenceHash", "validationLogHash"}
-NON_SECRET_EVIDENCE_KEYS = {"tokenUsage", "promptEvalCount", "evalCount", "totalTokens"}
+NON_SECRET_EVIDENCE_KEYS = {
+    "tokenUsage",
+    "tokenUsageReported",
+    "promptEvalCount",
+    "evalCount",
+    "totalTokens",
+}
 
 
 def redact_secrets(value: Any) -> Any:

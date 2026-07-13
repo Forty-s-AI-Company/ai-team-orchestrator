@@ -21,6 +21,9 @@ handsfreecode:
   task_run_path: "/api/tasks/run"
   timeout_seconds: 30
   default_runtime_provider: "ollama"
+  allowed_models: ["qwen2.5-coder:7b"]
+  # Ollama qwen2.5-coder:7b has no provider-native reasoning-effort switch.
+  allowed_reasoning_efforts: ["default"]
 
 codex:
   # Pin the audited WSL standalone binary. Do not resolve through Windows PATH,
@@ -35,6 +38,17 @@ codex:
   timeout_seconds: 45
   run_timeout_seconds: 60
   execution_enabled: true
+  # Exact names exposed by the installed WSL Codex CLI. Profiles may select
+  # only these names and the four audited reasoning levels below.
+  allowed_models:
+    - "gpt-5.6-sol"
+    - "gpt-5.6-terra"
+    - "gpt-5.6-luna"
+    - "gpt-5.5"
+    - "gpt-5.4"
+    - "gpt-5.4-mini"
+    - "gpt-5.3-codex-spark"
+  allowed_reasoning_efforts: ["low", "medium", "high", "xhigh"]
 
 antigravity:
   # Pin the audited WSL-native CLI and use an authenticated command for doctor.
@@ -47,6 +61,88 @@ antigravity:
   execution_enabled: true
   prompt_max_chars: 500
   diagnostics_cache_ttl_seconds: 30
+  # Exact account-visible names returned by `agy models` in WSL.
+  allowed_models:
+    - "Gemini 3.5 Flash (Low)"
+    - "Gemini 3.5 Flash (Medium)"
+    - "Gemini 3.5 Flash (High)"
+    - "Gemini 3.1 Pro (Low)"
+    - "Gemini 3.1 Pro (High)"
+    - "Claude Sonnet 4.6 (Thinking)"
+    - "Claude Opus 4.6 (Thinking)"
+    - "GPT-OSS 120B (Medium)"
+  allowed_reasoning_efforts: ["low", "medium", "high", "thinking"]
+
+routing:
+  # Role profiles are deliberately explicit. Automatic routes never include
+  # OpenHands or mock, and write workflows never cross-provider fallback.
+  roles:
+    product-manager:
+      primary:
+        provider: antigravity
+        model: "Gemini 3.5 Flash (High)"
+        reasoning_effort: high
+      fallbacks:
+        - provider: codex
+          model: "gpt-5.6-terra"
+          reasoning_effort: medium
+      allow_write: false
+
+    architect:
+      primary:
+        provider: antigravity
+        model: "Gemini 3.1 Pro (High)"
+        reasoning_effort: high
+      fallbacks:
+        - provider: codex
+          model: "gpt-5.6-sol"
+          reasoning_effort: high
+      secondary:
+        provider: codex
+        model: "gpt-5.6-sol"
+        reasoning_effort: high
+      allow_write: false
+
+    engineer:
+      primary:
+        provider: codex
+        model: "gpt-5.6-terra"
+        reasoning_effort: high
+      fallbacks: []
+      allow_write: true
+
+    reviewer:
+      primary:
+        provider: codex
+        model: "gpt-5.5"
+        reasoning_effort: high
+      fallbacks:
+        - provider: antigravity
+          model: "Claude Sonnet 4.6 (Thinking)"
+          reasoning_effort: thinking
+      secondary:
+        provider: antigravity
+        model: "Claude Sonnet 4.6 (Thinking)"
+        reasoning_effort: thinking
+      allow_write: false
+
+    qa-engineer:
+      primary:
+        provider: handsfreecode
+        model: "qwen2.5-coder:7b"
+        reasoning_effort: default
+      fallbacks: []
+      allow_write: false
+      allow_read_only_agent: true
+
+    project-analyst:
+      primary:
+        provider: handsfreecode
+        model: "qwen2.5-coder:7b"
+        reasoning_effort: default
+      fallbacks: []
+      allow_write: false
+      allow_read_only_agent: true
 
 workspace:
   allowlist:
