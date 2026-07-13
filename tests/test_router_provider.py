@@ -3,7 +3,15 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from ai_team.providers import ProviderErrorType, ProviderRequest, ProviderResult, RouterProvider
+from ai_team.providers import (
+    ProviderErrorType,
+    ProviderRequest,
+    ProviderResult,
+    RoleRouterProvider,
+    RoleRoutingProfile,
+    RouteTarget,
+    RouterProvider,
+)
 from ai_team.providers.base import BaseProvider
 
 
@@ -93,6 +101,22 @@ class RouterProviderTests(unittest.TestCase):
         self.assertEqual(result.data["routeAttempts"][0]["errorType"], ProviderErrorType.RATE_LIMIT)
         self.assertEqual(result.data["routeAttempts"][1]["errorType"], ProviderErrorType.TIMEOUT)
 
+    def test_router_preserves_last_native_failure_classification(self) -> None:
+        router = RouterProvider(
+            [
+                _StaticProvider(
+                    "codex",
+                    ready=True,
+                    result=_result("codex", False, ProviderErrorType.RATE_LIMIT),
+                )
+            ]
+        )
+
+        result = router.run(_request())
+
+        self.assertEqual(result.provider, "codex")
+        self.assertEqual(result.error_type, ProviderErrorType.RATE_LIMIT)
+
     def test_write_workflow_never_falls_back_to_local_or_mock_provider(self) -> None:
         router = RouterProvider(
             [
@@ -111,10 +135,133 @@ class RouterProviderTests(unittest.TestCase):
         result = router.run(request)
 
         self.assertFalse(result.success)
-        self.assertEqual(result.error_type, ProviderErrorType.EXTERNAL_REQUIRED)
-        attempts = {item["provider"]: item for item in result.data["routeAttempts"]}
-        self.assertIn("approved provider-native CLI", attempts["handsfreecode"]["details"]["blockedReason"])
-        self.assertFalse(attempts["mock"]["ready"])
+        self.assertEqual(result.error_type, ProviderErrorType.RATE_LIMIT)
+        self.assertEqual(len(result.data["routeAttempts"]), 1)
+        self.assertEqual(result.data["routeAttempts"][0]["provider"], "codex")
+
+    def test_role_router_records_model_reasoning_and_transient_fallback(self) -> None:
+        codex = _StaticProvider(
+            "codex",
+            ready=True,
+            result=_result("codex", False, ProviderErrorType.RATE_LIMIT),
+        )
+        antigravity = _RecordingProvider("antigravity", _result("antigravity", True))
+        router = RoleRouterProvider(
+            RoleRoutingProfile(
+                role="product-manager",
+                primary=RouteTarget("codex", "gpt-5.6-terra", "medium"),
+                fallbacks=(RouteTarget("antigravity", "Gemini 3.5 Flash (High)", "high"),),
+            ),
+            {"codex": codex, "antigravity": antigravity},
+        )
+
+        result = router.run(_request())
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "antigravity")
+        self.assertEqual(result.data["role"], "product-manager")
+        self.assertEqual(result.data["selectedModel"], "Gemini 3.5 Flash (High)")
+        self.assertEqual(result.data["reasoningEffort"], "high")
+        self.assertTrue(result.data["fallbackUsed"])
+        self.assertEqual(antigravity.requests[0].metadata["requestedModel"], "Gemini 3.5 Flash (High)")
+
+    def test_role_router_fails_closed_on_invalid_response(self) -> None:
+        fallback = _RecordingProvider("handsfreecode", _result("handsfreecode", True))
+        router = RoleRouterProvider(
+            RoleRoutingProfile(
+                role="reviewer",
+                primary=RouteTarget("codex", "gpt-5.5", "high"),
+                fallbacks=(RouteTarget("handsfreecode", "qwen2.5-coder:7b", "medium"),),
+            ),
+            {
+                "codex": _StaticProvider(
+                    "codex",
+                    ready=True,
+                    result=_result("codex", False, ProviderErrorType.INVALID_RESPONSE),
+                ),
+                "handsfreecode": fallback,
+            },
+        )
+
+        result = router.run(_request())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
+        self.assertEqual(fallback.requests, [])
+
+    def test_role_router_preserves_quota_failure_when_no_fallback_succeeds(self) -> None:
+        router = RoleRouterProvider(
+            RoleRoutingProfile(
+                role="engineer",
+                primary=RouteTarget("codex", "gpt-5.6-terra", "high"),
+            ),
+            {
+                "codex": _StaticProvider(
+                    "codex",
+                    ready=True,
+                    result=_result("codex", False, ProviderErrorType.RATE_LIMIT),
+                )
+            },
+        )
+
+        result = router.run(_request())
+
+        self.assertEqual(result.provider, "codex")
+        self.assertEqual(result.error_type, ProviderErrorType.RATE_LIMIT)
+        self.assertEqual(result.data["selectedModel"], "gpt-5.6-terra")
+
+    def test_role_router_never_falls_back_for_write_workflow(self) -> None:
+        fallback = _RecordingProvider("antigravity", _result("antigravity", True))
+        router = RoleRouterProvider(
+            RoleRoutingProfile(
+                role="engineer",
+                primary=RouteTarget("codex", "gpt-5.6-terra", "high"),
+                fallbacks=(RouteTarget("antigravity", "Gemini 3.1 Pro (High)", "high"),),
+                allow_write=True,
+            ),
+            {
+                "codex": _StaticProvider(
+                    "codex",
+                    ready=True,
+                    result=_result("codex", False, ProviderErrorType.TIMEOUT),
+                ),
+                "antigravity": fallback,
+            },
+        )
+        request = ProviderRequest(
+            workflow="bug-fix-loop",
+            prompt="write",
+            project_root=Path.cwd(),
+            metadata={"writeRequired": True},
+        )
+
+        result = router.run(request)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.TIMEOUT)
+        self.assertEqual(fallback.requests, [])
+
+    def test_secondary_review_is_forced_read_only_and_recorded(self) -> None:
+        reviewer = _RecordingProvider("antigravity", _result("antigravity", True))
+        router = RoleRouterProvider(
+            RoleRoutingProfile(
+                role="architect",
+                primary=RouteTarget("codex", "gpt-5.6-sol", "high"),
+                secondary=RouteTarget("antigravity", "Gemini 3.1 Pro (High)", "high"),
+            ),
+            {
+                "codex": _StaticProvider("codex", ready=True, result=_result("codex", True)),
+                "antigravity": reviewer,
+            },
+        )
+
+        result = router.run(_request())
+
+        self.assertTrue(result.data["secondaryReview"]["success"])
+        self.assertEqual(result.data["secondaryReview"]["tokenUsage"], 0)
+        self.assertFalse(result.data["secondaryReview"]["tokenUsageReported"])
+        self.assertFalse(reviewer.requests[0].metadata["writeRequired"])
+        self.assertFalse(reviewer.requests[0].metadata["writeAccess"])
 
 
 class _StaticProvider(BaseProvider):
@@ -130,6 +277,16 @@ class _StaticProvider(BaseProvider):
         if self._result is None:
             return ProviderResult(provider=self.name, success=False, error_type=ProviderErrorType.EXTERNAL_REQUIRED)
         return self._result
+
+
+class _RecordingProvider(_StaticProvider):
+    def __init__(self, name: str, result: ProviderResult) -> None:
+        super().__init__(name, ready=True, result=result)
+        self.requests: list[ProviderRequest] = []
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        self.requests.append(request)
+        return super().run(request)
 
 
 def _request() -> ProviderRequest:

@@ -15,6 +15,7 @@ from ai_team.core.delivery import DeliveryOptions, run_delivery_supervisor
 from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
+from ai_team.core.routing_config import ROLE_CHOICES, load_role_profile
 from ai_team.core.supervisor import SupervisorOptions, run_supervisor
 from ai_team.providers import (
     AntigravityProvider,
@@ -26,6 +27,7 @@ from ai_team.providers import (
     MockProvider,
     OpenHandsProvider,
     OpenHandsSettings,
+    RoleRouterProvider,
     RouterProvider,
     WriteSmokeProvider,
 )
@@ -271,6 +273,10 @@ def build_codex_provider(settings: dict) -> CodexProvider:
         timeout_seconds=float(codex.get("timeout_seconds") or 45),
         run_timeout_seconds=float(codex.get("run_timeout_seconds") or 180),
         execution_enabled=bool(codex.get("execution_enabled", True)),
+        allowed_models=tuple(_string_list(codex.get("allowed_models"), [])),
+        allowed_reasoning_efforts=tuple(
+            _string_list(codex.get("allowed_reasoning_efforts"), ["low", "medium", "high", "xhigh"])
+        ),
     )
     return CodexProvider(provider_settings)
 
@@ -298,21 +304,31 @@ def build_antigravity_provider(settings: dict) -> AntigravityProvider:
         execution_enabled=bool(antigravity.get("execution_enabled", False)),
         prompt_max_chars=int(antigravity.get("prompt_max_chars") or 1200),
         diagnostics_cache_ttl_seconds=float(antigravity.get("diagnostics_cache_ttl_seconds") or 30),
+        allowed_models=tuple(_string_list(antigravity.get("allowed_models"), [])),
+        allowed_reasoning_efforts=tuple(
+            _string_list(
+                antigravity.get("allowed_reasoning_efforts"),
+                ["low", "medium", "high", "thinking"],
+            )
+        ),
     )
     return AntigravityProvider(provider_settings)
 
 
-def build_provider(provider_name: str, settings: dict):
+def build_provider(provider_name: str, settings: dict, role: str | None = None):
+    if role and provider_name != "auto":
+        raise WorkflowError("--role requires --provider auto so routing decisions remain auditable")
+    providers = {
+        "codex": build_codex_provider(settings),
+        "antigravity": build_antigravity_provider(settings),
+        "handsfreecode": build_handsfreecode_provider(settings),
+    }
+    if role:
+        return RoleRouterProvider(load_role_profile(settings, role), providers)
     if provider_name == "auto":
-        return RouterProvider(
-            [
-                build_codex_provider(settings),
-                build_antigravity_provider(settings),
-                build_handsfreecode_provider(settings),
-                build_openhands_provider(settings),
-                MockProvider(),
-            ]
-        )
+        # OpenHands remains available only by explicit request. Mock is a test
+        # provider and must never masquerade as an automatic production route.
+        return RouterProvider(list(providers.values()))
     if provider_name == "mock":
         return MockProvider()
     if provider_name == "write-smoke":
@@ -328,7 +344,16 @@ def build_provider(provider_name: str, settings: dict):
 
 def doctor() -> None:
     settings = load_settings()
-    openhands = build_openhands_provider(settings).diagnostics()
+    openhands_diagnostics = build_openhands_provider(settings).diagnostics()
+    openhands = {
+        "provider": "openhands",
+        "ready": False,
+        "externalRequired": False,
+        "enabledByPolicy": False,
+        "deprecated": True,
+        "status": "disabled_by_policy",
+        "explicitProviderDiagnostics": openhands_diagnostics,
+    }
     handsfreecode = build_handsfreecode_provider(settings).diagnostics()
     codex = build_codex_provider(settings).diagnostics()
     antigravity = build_antigravity_provider(settings).diagnostics()
@@ -344,10 +369,11 @@ def doctor() -> None:
                 "auto": auto,
                 "providerNative": {
                     "openhands": {
-                        "ready": openhands.get("ready") is True and openhands.get("sessionKeyPresent") is True,
-                        "externalRequired": not (
-                            openhands.get("ready") is True and openhands.get("sessionKeyPresent") is True
-                        ),
+                        "ready": False,
+                        "externalRequired": False,
+                        "enabledByPolicy": False,
+                        "deprecated": True,
+                        "status": "disabled_by_policy",
                     },
                     "handsfreecode": {
                         "ready": handsfreecode.get("ready") is True
@@ -386,11 +412,12 @@ def run_workflow(
     dry_run: bool,
     receipt_dir: str | None,
     mode: str,
+    role: str | None = None,
 ) -> None:
     settings = load_settings()
     loaded = load_project(project_path, allowlist=workspace_allowlist(settings))
     load_workflow(workflow_name)
-    provider = build_provider(provider_name, settings)
+    provider = build_provider(provider_name, settings, role)
     result = Orchestrator(provider=provider, max_retries=2).run(
         loaded,
         workflow_name=workflow_name,
@@ -439,9 +466,10 @@ def run_isolated_workflow(
     github_branch: str | None,
     validation_log_hash: str | None,
     test_evidence_hash: str | None,
+    role: str | None = None,
 ) -> None:
     settings = load_settings()
-    provider = build_provider(provider_name, settings)
+    provider = build_provider(provider_name, settings, role)
     result = run_in_disposable_worktree(
         source_project_path=project_path,
         provider=provider,
@@ -525,9 +553,10 @@ def supervise(
     validation_log_hash: str | None,
     test_evidence_hash: str | None,
     delivery: bool,
+    role: str | None = None,
 ) -> None:
     settings = load_settings()
-    provider = build_provider(provider_name, settings)
+    provider = build_provider(provider_name, settings, role)
     selected_report_dir = Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "supervisor"
     if delivery:
         selected_state_path = Path(state_path).resolve() if state_path else selected_report_dir / "delivery-state.json"
@@ -638,6 +667,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--receipt-dir")
+    run_parser.add_argument("--role", choices=ROLE_CHOICES)
 
     isolated_parser = subparsers.add_parser("isolated-run", help="Run a write workflow in a disposable worktree")
     isolated_parser.add_argument("project", nargs="?", default=".")
@@ -660,6 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
     isolated_parser.add_argument("--github-branch")
     isolated_parser.add_argument("--validation-log-hash")
     isolated_parser.add_argument("--test-evidence-hash")
+    isolated_parser.add_argument("--role", choices=ROLE_CHOICES)
 
     github_parser = subparsers.add_parser("github-gate", help="Evaluate guarded GitHub automation policy")
     github_parser.add_argument("project", nargs="?", default=".")
@@ -679,6 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "mock", "openhands", "handsfreecode", "codex", "antigravity"],
         default="mock",
     )
+    supervisor_parser.add_argument("--role", choices=ROLE_CHOICES)
     supervisor_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
     supervisor_parser.add_argument("--dry-run", action="store_true", default=True)
     supervisor_parser.add_argument("--execute", action="store_false", dest="dry_run")
@@ -743,7 +775,15 @@ def main() -> None:
         elif args.command == "git-policy":
             evaluate_git_policy(args.project, args.action, args.file)
         elif args.command == "run":
-            run_workflow(args.project, args.workflow, args.provider, args.dry_run, args.receipt_dir, args.mode)
+            run_workflow(
+                args.project,
+                args.workflow,
+                args.provider,
+                args.dry_run,
+                args.receipt_dir,
+                args.mode,
+                args.role,
+            )
         elif args.command == "isolated-run":
             run_isolated_workflow(
                 args.project,
@@ -761,6 +801,7 @@ def main() -> None:
                 args.github_branch,
                 args.validation_log_hash,
                 args.test_evidence_hash,
+                args.role,
             )
         elif args.command == "github-gate":
             evaluate_github_gate(
@@ -790,6 +831,7 @@ def main() -> None:
                 args.validation_log_hash,
                 args.test_evidence_hash,
                 args.delivery,
+                args.role,
             )
     except (ProjectConfigError, WorkflowError) as exc:
         print(f"ai-team error: {exc}", file=sys.stderr)

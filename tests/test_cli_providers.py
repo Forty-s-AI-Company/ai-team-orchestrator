@@ -15,13 +15,58 @@ from ai_team.providers import (
     CodexSettings,
     ProviderErrorType,
     ProviderRequest,
+    ProviderResult,
     WriteSmokeProvider,
 )
 from ai_team.providers.cli_common import CliProviderSettings, run_cli_command
 from ai_team.providers.antigravity import _compact_prompt
+from ai_team.providers.antigravity import _apply_routing_options as apply_antigravity_routing
+from ai_team.providers.codex import _apply_routing_options as apply_codex_routing
+from ai_team.providers.codex import _extract_token_usage
 
 
 class CliProviderTests(unittest.TestCase):
+    def test_codex_routing_adds_allowlisted_model_and_reasoning(self) -> None:
+        settings = CodexSettings(allowed_models=("gpt-5.6-terra",))
+
+        args = apply_codex_routing(["exec", "--sandbox", "read-only"], "gpt-5.6-terra", "high", settings)
+
+        self.assertEqual(args[-4:], ["--model", "gpt-5.6-terra", "--config", 'model_reasoning_effort="high"'])
+
+    def test_codex_routing_rejects_unknown_model_and_reasoning(self) -> None:
+        settings = CodexSettings(allowed_models=("gpt-5.6-terra",))
+
+        with self.assertRaises(ValueError):
+            apply_codex_routing([], "lookalike-model", "high", settings)
+        with self.assertRaises(ValueError):
+            apply_codex_routing([], "gpt-5.6-terra", "unbounded", settings)
+
+    def test_codex_token_usage_is_parsed_from_native_stderr(self) -> None:
+        result = ProviderResult(
+            provider="codex",
+            success=True,
+            data={"command": {"stderr": "model: gpt-5.6-terra\ntokens used\n7,044\n"}},
+        )
+
+        self.assertEqual(_extract_token_usage(result), 7044)
+
+    def test_antigravity_routing_replaces_only_allowlisted_model(self) -> None:
+        settings = AntigravitySettings(allowed_models=("Gemini 3.1 Pro (High)",))
+
+        args = apply_antigravity_routing(
+            ["--model", "Gemini 3.5 Flash (Low)", "--print"],
+            "Gemini 3.1 Pro (High)",
+            "high",
+            settings,
+        )
+
+        self.assertEqual(args, ["--model", "Gemini 3.1 Pro (High)", "--print"])
+
+    def test_antigravity_routing_rejects_mismatched_reasoning_label(self) -> None:
+        settings = AntigravitySettings(allowed_models=("Gemini 3.5 Flash (Low)",))
+
+        with self.assertRaises(ValueError):
+            apply_antigravity_routing([], "Gemini 3.5 Flash (Low)", "high", settings)
     def test_codex_trusted_write_requires_linked_worktree_marker(self) -> None:
         provider = CodexProvider(
             CodexSettings(

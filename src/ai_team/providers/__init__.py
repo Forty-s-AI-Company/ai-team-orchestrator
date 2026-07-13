@@ -11,7 +11,7 @@ from .antigravity import AntigravityProvider, AntigravitySettings
 from .codex import CodexProvider, CodexSettings
 from .handsfreecode import HandsFreeCodeProvider, HandsFreeCodeSettings
 from .openhands import OpenHandsProvider, OpenHandsSettings
-from .router import RouterProvider
+from .router import RoleRouterProvider, RoleRoutingProfile, RouteTarget, RouterProvider
 from .write_smoke import WriteSmokeProvider
 
 __all__ = [
@@ -29,6 +29,9 @@ __all__ = [
     "ProviderRequest",
     "ProviderResult",
     "RetryingProvider",
+    "RoleRouterProvider",
+    "RoleRoutingProfile",
+    "RouteTarget",
     "RouterProvider",
     "WriteSmokeProvider",
     "redact_secrets",

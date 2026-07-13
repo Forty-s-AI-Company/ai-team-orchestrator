@@ -140,6 +140,19 @@ class WorkflowTests(unittest.TestCase):
                     content="SESSION_API_KEY" + "=supersecret",
                     data={
                         "runMode": "run-agent",
+                        "role": "architect",
+                        "routingProfile": "architect",
+                        "selectedProvider": "codex",
+                        "selectedModel": "gpt-5.6-sol",
+                        "reasoningEffort": "high",
+                        "primaryRoute": {
+                            "provider": "antigravity",
+                            "model": "Gemini 3.1 Pro (High)",
+                            "reasoningEffort": "high",
+                        },
+                        "fallbackUsed": True,
+                        "fallbackChain": [{"provider": "antigravity", "errorType": "timeout"}],
+                        "secondaryReview": {"content": "token=secondary-secret"},
                         "conversationId": "11111111-1111-4111-8111-111111111111",
                         "taskId": "task-123",
                         "executionStatus": "idle",
@@ -155,6 +168,12 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("\"runMode\": \"run-agent\"", content)
             self.assertIn("durationMs", content)
             self.assertNotIn("supersecret", content)
+            self.assertNotIn("secondary-secret", content)
+            payload = json.loads(content)
+            self.assertEqual(payload["role"], "architect")
+            self.assertEqual(payload["selectedModel"], "gpt-5.6-sol")
+            self.assertEqual(payload["reasoningEffort"], "high")
+            self.assertTrue(payload["fallbackUsed"])
             self.assertEqual(result.workflow.name, "project-analysis")
             self.assertIn("inspect", result.stages)
 

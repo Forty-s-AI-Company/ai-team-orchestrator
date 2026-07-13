@@ -109,7 +109,11 @@ class Orchestrator:
             raise WorkflowError(f"unsupported run mode: {run_mode}")
 
         if run_mode == READ_ONLY_AGENT_MODE:
-            if self.provider.name != "handsfreecode":
+            if self.provider.name != "handsfreecode" and not getattr(
+                self.provider.provider,
+                "supports_read_only_agent",
+                False,
+            ):
                 raise WorkflowError("read-only-agent is only supported by provider=handsfreecode")
             if workflow.write_required:
                 raise WorkflowError("read-only-agent requires a workflow with write_required=false")
