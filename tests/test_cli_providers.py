@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import subprocess
 import tempfile
@@ -154,6 +155,49 @@ class CliProviderTests(unittest.TestCase):
         self.assertFalse(result.data["masqueradeAsProvider"])
         self.assertIn("hello cli", result.content)
 
+    def test_codex_provider_smoke_uses_sterile_workspace_and_validates_challenge(self) -> None:
+        script = (
+            "import json,os,re,sys; "
+            "p=sys.stdin.read(); c=re.search(r\"challenge='([0-9a-f]+)'\",p).group(1); "
+            "print(json.dumps({'schema':'ai-team-codex-smoke/v1','challenge':c,"
+            "'provider':'codex','status':'ok','saw_env':os.path.exists('.env')}))"
+        )
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", script],
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".env").write_text("TEST_SECRET=do-not-read", encoding="utf-8")
+            result = provider.run(_request(root=root, workflow="provider-smoke"))
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.data["providerNative"])
+        self.assertTrue(result.data["codexNativePass"])
+        self.assertTrue(result.data["responseValidated"])
+        self.assertFalse(json.loads(result.content)["saw_env"])
+        self.assertNotIn("do-not-read", str(result.data))
+
+    def test_codex_provider_smoke_fails_closed_on_unvalidated_output(self) -> None:
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "print('not-json')"],
+            )
+        )
+
+        result = provider.run(_request(workflow="provider-smoke"))
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
+        self.assertFalse(result.data["codexNativePass"])
+
     def test_cli_status_failure_is_not_ready(self) -> None:
         provider = CodexProvider(
             CodexSettings(
@@ -283,7 +327,8 @@ class CliProviderTests(unittest.TestCase):
             "f=re.search(r\"tracked file '([^']+)'\",p).group(1); root=pathlib.Path(sys.argv[sys.argv.index('--add-dir')+1]); "
             "h=hashlib.sha256((root/f).read_bytes()).hexdigest(); print(json.dumps({"
             "'schema':'ai-team-repository-smoke/v1','challenge':c,'probe':{'path':f,'sha256':h},"
-            "'summary':'visible','findings':[],'tests':[],'blockers':[]}))"
+            "'summary':'visible','findings':[],'tests':[],'blockers':[],"
+            "'saw_env':(root/'.env').exists()}))"
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -291,6 +336,7 @@ class CliProviderTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.email", "test@example.local"], cwd=root, check=True)
             subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
             (root / "package.json").write_text('{"name":"sample"}\n', encoding="utf-8")
+            (root / ".env").write_text("TEST_SECRET=do-not-read\n", encoding="utf-8")
             subprocess.run(["git", "add", "package.json"], cwd=root, check=True)
             subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
             provider = AntigravityProvider(
@@ -314,6 +360,28 @@ class CliProviderTests(unittest.TestCase):
         self.assertTrue(result.success, result.content)
         self.assertTrue(result.data["repositorySmokePassed"])
         self.assertTrue(result.data["antigravityNativePass"])
+        self.assertFalse(json.loads(result.content)["saw_env"])
+        self.assertNotIn("do-not-read", str(result.data))
+
+    def test_antigravity_repository_smoke_fails_closed_without_safe_probe(self) -> None:
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "print('must-not-run')"],
+                execution_enabled=True,
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            result = provider.run(_request(root=root, workflow="provider-smoke"))
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
+        self.assertFalse(result.data["antigravityNativePass"])
+        self.assertNotIn("must-not-run", result.content)
 
     def test_antigravity_ready_then_run_reuses_successful_diagnostics(self) -> None:
         diagnostics = {"provider": "antigravity", "ready": True, "quotaExhausted": False}
@@ -422,8 +490,13 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("create-only", run_agent.content)
 
 
-def _request(prompt: str = "hello") -> ProviderRequest:
-    return ProviderRequest(workflow="project-analysis", prompt=prompt, project_root=Path.cwd())
+def _request(
+    prompt: str = "hello",
+    *,
+    root: Path | None = None,
+    workflow: str = "project-analysis",
+) -> ProviderRequest:
+    return ProviderRequest(workflow=workflow, prompt=prompt, project_root=root or Path.cwd())
 
 
 if __name__ == "__main__":

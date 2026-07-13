@@ -1,12 +1,12 @@
 openhands:
   base_url: "http://127.0.0.1:31024"
   session_key_env: "SESSION_API_KEY"
-  session_key_file: "%USERPROFILE%/.openhands/agent-canvas/api-key.txt"
+  session_key_file: "~/.openhands/agent-canvas/api-key.txt"
   ready_path: "/ready"
   conversation_path: "/api/conversations"
   cancel_path_template: "/api/conversations/{task_id}/interrupt"
   timeout_seconds: 30
-  host_workspace_root: "C:/Users/eden/Downloads/AI"
+  host_workspace_root: "/home/eden/projects"
   container_workspace_root: "/projects"
   llm_model: "openai/gpt-5.5"
   llm_api_key_env: "OPENHANDS_LLM_API_KEY"
@@ -23,22 +23,23 @@ handsfreecode:
   default_runtime_provider: "ollama"
 
 codex:
-  # Use exactly one bundled native binary. Do not silently fall back to npm,
-  # Desktop, or other Codex distributions because their sandbox helpers differ.
-  executable: "auto-native"
-  status_args: ["--version"]
+  # Pin the audited WSL standalone binary. Do not resolve through Windows PATH,
+  # Desktop bridges, or npm shims because their sandbox helpers differ.
+  executable: "/home/eden/.local/bin/codex"
+  status_args: ["login", "status"]
   quota_args: []
   run_args: ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]
   # Trusted writes are allowed only after the isolated executor creates a
   # disposable linked worktree and applies allowed_write_paths + validation gates.
   write_run_args: ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]
   timeout_seconds: 45
-  run_timeout_seconds: 180
+  run_timeout_seconds: 60
   execution_enabled: true
 
 antigravity:
-  executable: "agy"
-  status_args: ["--version"]
+  # Pin the audited WSL-native CLI and use an authenticated command for doctor.
+  executable: "/home/eden/.local/bin/agy"
+  status_args: ["models"]
   quota_args: []
   run_args: ["--model", "Gemini 3.5 Flash (Low)", "--print-timeout", "30s", "--mode", "plan", "--sandbox", "--print"]
   timeout_seconds: 20
@@ -49,4 +50,4 @@ antigravity:
 
 workspace:
   allowlist:
-    - "C:/Users/eden/Downloads/AI"
+    - "/home/eden/projects"
