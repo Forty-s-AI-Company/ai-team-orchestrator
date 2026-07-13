@@ -10,3 +10,19 @@ stages:
   - plan
   - review
   - report
+evidence:
+  include:
+    - package.json
+    - tsconfig.json
+    - next.config.*
+    - eslint.config.*
+    - src/app/layout.tsx
+    - src/app/page.tsx
+    - .github/workflows/*.yml
+    - .github/workflows/*.yaml
+    - README*
+  per_file_max_bytes: 1100
+  total_content_max_bytes: 7600
+  max_candidate_bytes: 65536
+  max_tree_entries: 80
+  max_tree_chars: 1400

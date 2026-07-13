@@ -74,6 +74,26 @@ HandsFreeCode may use Ollama internally for low-risk fallback work. The
 orchestrator still records the outer provider as `handsfreecode` and the inner
 runtime provider as `ollama`, never `codex` or `antigravity`.
 
+For real LLM generation on a read-only workflow without creating a disposable
+worktree, use the explicit HandsFreeCode-only mode:
+
+```powershell
+ai-team run ..\CelebrateDeal --workflow project-analysis --provider handsfreecode --mode read-only-agent
+```
+
+The outer receipt records `runMode=read-only-agent`; HandsFreeCode maps the
+runtime call to `run-agent` with `writeAccess=false`. Write workflows and all
+other providers fail closed in this mode. `create-only` continues to create
+state and receipts without calling an LLM.
+
+For workflows that declare a bounded evidence policy, `read-only-agent`
+collects only platform-allowlisted text files. It rejects sensitive paths,
+symlinks, binary or oversized candidates, applies per-file and total prompt
+limits, and redacts content before sending it to HandsFreeCode. The receipt
+stores file hashes and exclusion counts rather than excluded paths or secret
+values. Provider execution, evidence collection, and analysis grounding are
+validated separately; unsupported dependency or coverage claims fail closed.
+
 For unattended Windows runs, both HandsFreeCode and this orchestrator can read a
 local key file outside the repository:
 
@@ -149,8 +169,10 @@ reports/receipts/
 
 Receipts include project path, branch, provider, workflow, stages, commit SHA,
 provider-native ready result, conversation id, task id when available,
-started/completed timestamps, duration, and validation result. Runtime receipts
-are ignored by Git.
+started/completed timestamps, duration, and validation result. Read-only
+analysis receipts also include a content-free evidence manifest with relative
+paths, sizes, SHA-256 hashes, truncation flags, limits, redaction counts, and
+grounding validation. Runtime receipts are ignored by Git.
 
 ## Write Workflows
 

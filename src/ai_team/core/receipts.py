@@ -34,6 +34,11 @@ def write_run_receipt(
         "commitSha": loaded_project.commit_sha,
         "sourceCommitSha": source_commit_sha or loaded_project.commit_sha,
         "runMode": result.provider_result.data.get("runMode"),
+        "runtimeMode": result.provider_result.data.get("runtimeMode"),
+        "writeAccess": result.provider_result.data.get("writeAccess"),
+        "runtimeProvider": result.provider_result.data.get("runtimeProvider"),
+        "tokenUsage": result.provider_result.data.get("tokenUsage", 0),
+        "evidenceManifest": redact_secrets(result.provider_result.data.get("evidenceManifest")),
         "startedAt": result.started_at.replace(microsecond=0).isoformat(),
         "completedAt": result.completed_at.replace(microsecond=0).isoformat(),
         "durationMs": result.duration_ms,
@@ -45,6 +50,10 @@ def write_run_receipt(
             "conversationId": result.provider_result.conversation_id,
             "taskId": result.provider_result.task_id,
             "executionStatus": result.provider_result.data.get("executionStatus"),
+            "runtimeMode": result.provider_result.data.get("runtimeMode"),
+            "writeAccess": result.provider_result.data.get("writeAccess"),
+            "runtimeProvider": result.provider_result.data.get("runtimeProvider"),
+            "tokenUsage": result.provider_result.data.get("tokenUsage", 0),
             "runEndpointResult": redact_secrets(result.provider_result.data.get("runEndpointResult")),
             "externalRequired": redact_secrets(result.provider_result.data.get("externalRequired")),
             "responseValidated": result.provider_result.data.get("responseValidated"),
@@ -56,6 +65,21 @@ def write_run_receipt(
             "dryRun": result.dry_run,
             "attempts": result.provider_result.attempts,
             "errorType": result.provider_result.error_type,
+            "providerExecution": {
+                **(
+                    result.provider_result.data.get("providerExecutionValidation")
+                    or {
+                        "status": "passed" if result.provider_result.success else "failed",
+                        "errorType": result.provider_result.error_type,
+                    }
+                ),
+            },
+            "evidenceCollection": redact_secrets(
+                result.provider_result.data.get("evidenceCollectionValidation")
+            ),
+            "analysisGrounding": redact_secrets(
+                result.provider_result.data.get("analysisGroundingValidation")
+            ),
         },
         "providerContent": _safe_content(result.provider_result.content),
         "providerData": redact_secrets(result.provider_result.data),

@@ -631,7 +631,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "mock", "openhands", "handsfreecode", "codex", "antigravity"],
         default="mock",
     )
-    run_parser.add_argument("--mode", choices=["create-only", "run-agent"], default="create-only")
+    run_parser.add_argument(
+        "--mode",
+        choices=["create-only", "read-only-agent", "run-agent"],
+        default="create-only",
+    )
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--receipt-dir")
 

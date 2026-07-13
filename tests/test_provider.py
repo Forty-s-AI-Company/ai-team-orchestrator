@@ -7,6 +7,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from ai_team.providers import (
     HandsFreeCodeProvider,
@@ -207,11 +208,24 @@ class ProviderTests(unittest.TestCase):
             "api_key": "plain-local-key",
             "nested": {"OPENHANDS_LLM_API_KEY": "plain-local-key"},
             "safe": "visible",
+            "tokenUsage": 42,
         }
         redacted = redact_secrets(sample)
         self.assertEqual(redacted["api_key"], "<redacted>")
         self.assertEqual(redacted["nested"]["OPENHANDS_LLM_API_KEY"], "<redacted>")
         self.assertEqual(redacted["safe"], "visible")
+        self.assertEqual(redacted["tokenUsage"], 42)
+
+    def test_secret_redaction_handles_quoted_json_and_ci_references(self) -> None:
+        sample = (
+            '{"apiKey": "json-secret", "ci": "${{ secrets.DEPLOY_TOKEN }}", '
+            '"DATABASE_URL": "postgresql://user:database-password@localhost/db"}'
+        )
+        redacted = redact_secrets(sample)
+        self.assertNotIn("json-secret", redacted)
+        self.assertNotIn("DEPLOY_TOKEN", redacted)
+        self.assertNotIn("database-password", redacted)
+        self.assertIn("<redacted>", redacted)
 
 
 class HandsFreeCodeProviderTests(unittest.TestCase):
@@ -389,6 +403,54 @@ class HandsFreeCodeProviderTests(unittest.TestCase):
         finally:
             server.close()
 
+    def test_handsfreecode_read_only_agent_maps_to_run_agent_without_write_access(self) -> None:
+        server = _FakeHandsFreeCodeServer(runtime_provider="ollama")
+        try:
+            provider = HandsFreeCodeProvider(
+                HandsFreeCodeSettings(base_url=server.base_url, default_runtime_provider="ollama"),
+                session_key="test-session",
+            )
+            result = provider.run(
+                ProviderRequest(
+                    workflow="project-analysis",
+                    prompt="hello",
+                    project_root=Path.cwd(),
+                    run_mode="read-only-agent",
+                )
+            )
+            self.assertTrue(result.success)
+            self.assertEqual(server.last_post_body["mode"], "read-only-agent")
+            self.assertFalse(server.last_post_body["writeAccess"])
+            self.assertEqual(server.last_post_body["metadata"]["outerRunMode"], "read-only-agent")
+            self.assertEqual(result.data["runMode"], "read-only-agent")
+            self.assertEqual(result.data["runtimeMode"], "run-agent")
+            self.assertFalse(result.data["writeAccess"])
+            self.assertEqual(result.data["runtimeProvider"], "ollama")
+            self.assertEqual(result.data["tokenUsage"], 23)
+        finally:
+            server.close()
+
+    def test_handsfreecode_read_only_agent_fails_closed_for_mock_runtime(self) -> None:
+        provider = HandsFreeCodeProvider(
+            HandsFreeCodeSettings(default_runtime_provider="mock"),
+            session_key="test-session",
+        )
+        with patch.object(provider, "diagnostics", return_value={
+            "ready": True,
+            "authConfigured": True,
+            "providers": {"mock": True, "ollama": True},
+        }):
+            result = provider.run(
+                ProviderRequest(
+                    workflow="project-analysis",
+                    prompt="hello",
+                    project_root=Path.cwd(),
+                    run_mode="read-only-agent",
+                )
+            )
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.EXTERNAL_REQUIRED)
+
 
 class _FakeOpenHandsHandler(BaseHTTPRequestHandler):
     server_version = "FakeOpenHands/1.0"
@@ -503,7 +565,14 @@ class _FakeHandsFreeCodeHandler(BaseHTTPRequestHandler):
                 "conversationId": "conv_hfc_test",
                 "status": "completed",
                 "provider": self.server.runtime_provider,  # type: ignore[attr-defined]
-                "mode": "create-only",
+                "mode": self.server.last_post_body["mode"],  # type: ignore[attr-defined]
+                "runtimeMode": (
+                    "run-agent"
+                    if self.server.last_post_body["mode"] == "read-only-agent"  # type: ignore[attr-defined]
+                    else self.server.last_post_body["mode"]  # type: ignore[attr-defined]
+                ),
+                "writeAccess": self.server.last_post_body["writeAccess"],  # type: ignore[attr-defined]
+                "tokenUsage": 23,
                 "receiptPath": "receipts/test.json",
                 "errorType": None,
                 "message": "completed",

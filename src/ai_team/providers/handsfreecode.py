@@ -129,6 +129,30 @@ class HandsFreeCodeProvider(BaseProvider):
                 },
             )
 
+        if request.run_mode == "read-only-agent":
+            if self.settings.default_runtime_provider != "ollama":
+                return ProviderResult(
+                    provider=self.name,
+                    success=False,
+                    error_type=ProviderErrorType.EXTERNAL_REQUIRED,
+                    content="read-only-agent requires the native Ollama runtime",
+                    data={"runMode": request.run_mode, "runtimeMode": "run-agent", "writeAccess": False},
+                )
+            providers = ready_result.get("providers")
+            if not isinstance(providers, dict) or providers.get("ollama") is not True:
+                return ProviderResult(
+                    provider=self.name,
+                    success=False,
+                    error_type=ProviderErrorType.EXTERNAL_REQUIRED,
+                    content="read-only-agent requires Ollama to be ready",
+                    data={
+                        "runMode": request.run_mode,
+                        "runtimeMode": "run-agent",
+                        "writeAccess": False,
+                        "ready": redact_secrets(ready_result),
+                    },
+                )
+
         payload = self._task_payload(request)
         http_request = urllib.request.Request(
             self._url(self.settings.task_run_path),
@@ -156,6 +180,9 @@ class HandsFreeCodeProvider(BaseProvider):
                         "taskId": ids.get("taskId"),
                         "executionStatus": _execution_status(data),
                         "runtimeProvider": _runtime_provider(data),
+                        "runtimeMode": _runtime_mode(data, request),
+                        "writeAccess": _write_access(data),
+                        "tokenUsage": _token_usage(data),
                         "receiptPath": _receipt_path(data),
                         "response": redact_secrets(data),
                     },
@@ -213,6 +240,7 @@ class HandsFreeCodeProvider(BaseProvider):
                 **request.metadata,
                 "source": "ai-team-orchestrator",
                 "dryRun": request.dry_run,
+                "outerRunMode": request.run_mode,
             },
         }
 
@@ -284,6 +312,27 @@ def _receipt_path(data: Any) -> str | None:
         return None
     value = data.get("receiptPath") or data.get("receipt_path")
     return str(value) if value else None
+
+
+def _runtime_mode(data: Any, request: ProviderRequest) -> str:
+    if isinstance(data, dict):
+        value = data.get("runtimeMode") or data.get("runtime_mode")
+        if value:
+            return str(value)
+    return "run-agent" if request.run_mode == "read-only-agent" else request.run_mode
+
+
+def _write_access(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    return data.get("writeAccess") is True or data.get("write_access") is True
+
+
+def _token_usage(data: Any) -> int:
+    if not isinstance(data, dict):
+        return 0
+    value = data.get("tokenUsage") or data.get("token_usage")
+    return value if isinstance(value, int) and value >= 0 else 0
 
 
 def _safe_prompt_for_runtime(prompt: str) -> str:

@@ -57,19 +57,38 @@ class ProviderError(RuntimeError):
 
 
 SECRET_PATTERNS = [
-    re.compile(r"(?i)(session[_-]?api[_-]?key|api[_-]?key|token|secret|password)\s*[:=]\s*([^\s,;]+)"),
+    re.compile(
+        r"(?i)[\"']?(session[_-]?api[_-]?key|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+        r"client[_-]?secret|private[_-]?key|credential|cookie|token|secret|password)[\"']?"
+        r"\s*[:=]\s*[\"']?([^\s,;}\"']+)"
+    ),
+    re.compile(r"(?i)\$\{\{\s*secrets\.[^}]+\}\}"),
+    re.compile(r"(?i)\b(?:database[_-]?url|direct[_-]?url)\s*[:=]\s*[^\s,;}]+"),
+    re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?)://[^\s\"'<>]+"),
+    re.compile(r"(?i)-----BEGIN [^-\n]*PRIVATE KEY-----.*?-----END [^-\n]*PRIVATE KEY-----", re.DOTALL),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\b(?:ghp_|github_pat_|glpat-)[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"sk-[A-Za-z0-9_\-]{10,}"),
     re.compile(r"(?i)Bearer\s+[A-Za-z0-9_\-.]+"),
 ]
-SECRET_KEY_PATTERN = re.compile(r"(?i)(api[_-]?key|token|secret|password|hash[_-]?key|hash[_-]?iv)")
+SECRET_KEY_PATTERN = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|credential|cookie|private[_-]?key|"
+    r"database[_-]?url|direct[_-]?url|hash[_-]?key|hash[_-]?iv)"
+)
 EVIDENCE_HASH_KEYS = {"receiptHash", "secretScanHash", "testEvidenceHash", "validationLogHash"}
+NON_SECRET_EVIDENCE_KEYS = {"tokenUsage", "promptEvalCount", "evalCount", "totalTokens"}
 
 
 def redact_secrets(value: Any) -> Any:
     if isinstance(value, dict):
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
-            if isinstance(key, str) and key not in EVIDENCE_HASH_KEYS and SECRET_KEY_PATTERN.search(key):
+            if (
+                isinstance(key, str)
+                and key not in EVIDENCE_HASH_KEYS
+                and key not in NON_SECRET_EVIDENCE_KEYS
+                and SECRET_KEY_PATTERN.search(key)
+            ):
                 redacted[key] = "<redacted>" if item else item
             else:
                 redacted[key] = redact_secrets(item)
@@ -81,7 +100,7 @@ def redact_secrets(value: Any) -> Any:
 
     redacted = value
     for pattern in SECRET_PATTERNS:
-        if pattern.pattern.startswith("(?i)(session"):
+        if pattern.groups:
             redacted = pattern.sub(lambda match: f"{match.group(1)}=<redacted>", redacted)
         else:
             redacted = pattern.sub("<redacted>", redacted)
