@@ -119,6 +119,7 @@ class AntigravityProvider(BaseProvider):
             self.settings.prompt_max_chars,
             challenge=challenge,
             probe_path=probe[0] if probe else None,
+            bounded_stage=request.metadata.get("boundedStage"),
         )
         compact_request = replace(
             request,
@@ -183,6 +184,7 @@ def _compact_prompt(
     max_chars: int,
     challenge: str,
     probe_path: str | None = None,
+    bounded_stage: Any = None,
 ) -> str:
     values: dict[str, str] = {}
     for line in prompt.splitlines():
@@ -190,7 +192,30 @@ def _compact_prompt(
             continue
         key, value = line.split(":", 1)
         values[key.strip().lower()] = value.strip()
-    if probe_path:
+    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa"}:
+        task = values.get("task", "unknown")[:120]
+        instruction = values.get("instruction", "unknown")[:280]
+        allowed_paths = values.get("allowed write paths", "[]")[:220]
+        validation_commands = values.get("validation commands", "[]")[:280]
+        implementation_evidence = values.get("implementation evidence", "{}")[:220]
+        stage_requirements = {
+            "pm": "Include a non-empty acceptanceCriteria string array.",
+            "architect": (
+                "Include non-empty plan, allowedWritePaths, validationCommands arrays and "
+                "schemaOrApiChange=false. Do not expand paths or commands beyond the task."
+            ),
+            "qa": "Report only evidence-backed diff findings. Use findings=[] when acceptance evidence passes.",
+        }[bounded_stage]
+        normalized = (
+            f"Bounded read-only stage={bounded_stage}; Challenge={challenge}. "
+            "Return JSON only: schema='ai-team-bounded-delivery/v1', challenge, stage, "
+            "status='passed', findings=[], tests=[], blockers=[]. No Markdown. "
+            "Forbidden: edit, shell, migrate, seed, deploy, payment, secrets, data deletion, schema/API changes. "
+            f"{stage_requirements} Task={task}; Instruction={instruction}; "
+            f"AllowedWritePaths={allowed_paths}; ValidationCommands={validation_commands}; "
+            f"ImplementationEvidence={implementation_evidence}."
+        )
+    elif probe_path:
         normalized = (
             "Repository visibility smoke. Read the exact tracked file "
             f"'{probe_path}' and calculate its SHA-256 locally. Challenge={challenge}. "
@@ -208,7 +233,7 @@ def _compact_prompt(
             "Return only strict JSON with schema='ai-team-antigravity/v1', challenge, status, "
             "findings=[], tests=[], blockers=[]. Do not use Markdown fences."
         )
-    limit = max(240, max_chars)
+    limit = min(1600, max(240, max_chars))
     if len(normalized) <= limit:
         return normalized
     suffix = " [truncated]"
@@ -326,7 +351,11 @@ def _validate_response(
             data=base_data,
         )
     valid = isinstance(payload, dict) and payload.get("challenge") == challenge
-    expected_schema = "ai-team-repository-smoke/v1" if request.workflow == "provider-smoke" else "ai-team-antigravity/v1"
+    bounded_stage = request.metadata.get("boundedStage")
+    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa"}:
+        expected_schema = "ai-team-bounded-delivery/v1"
+    else:
+        expected_schema = "ai-team-repository-smoke/v1" if request.workflow == "provider-smoke" else "ai-team-antigravity/v1"
     valid = valid and payload.get("schema") == expected_schema
     valid = valid and all(isinstance(payload.get(key), list) for key in ("findings", "tests", "blockers"))
     repository_smoke_passed = False
@@ -341,6 +370,8 @@ def _validate_response(
         valid = repository_smoke_passed
     elif valid:
         valid = isinstance(payload.get("status"), str)
+        if expected_schema == "ai-team-bounded-delivery/v1":
+            valid = valid and payload.get("stage") == bounded_stage
     data = {
         **base_data,
         "responseValidated": valid,

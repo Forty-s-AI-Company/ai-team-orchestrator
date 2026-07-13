@@ -52,6 +52,7 @@ def run_in_disposable_worktree(
     allowed_write_paths: list[str] | None = None,
     validation_commands: list[str] | None = None,
     require_validation: bool = False,
+    reuse_worktree_path: Path | None = None,
 ) -> IsolatedRunResult:
     source = load_project(source_project_path, allowlist=workspace_allowlist)
     workflow = load_workflow(workflow_name)
@@ -60,7 +61,20 @@ def run_in_disposable_worktree(
     if source.is_disposable_worktree():
         raise ValueError("source project is already a disposable worktree; use ai-team run directly")
 
-    worktree_path = create_disposable_worktree(source, worktree_parent=worktree_parent)
+    reused_worktree = reuse_worktree_path is not None
+    if reused_worktree:
+        worktree_path = reuse_worktree_path.resolve()
+        parent = (worktree_parent or source.project_dir.parent).resolve()
+        try:
+            worktree_path.relative_to(parent)
+        except ValueError as exc:
+            raise ValueError("reused worktree escapes the approved disposable worktree parent") from exc
+        if worktree_path == source.root or not (worktree_path / ".git").is_file():
+            raise ValueError("reused worktree must be an existing disposable linked worktree")
+        if _git_common_dir(worktree_path) != _git_common_dir(source.root):
+            raise ValueError("reused worktree does not belong to the source repository")
+    else:
+        worktree_path = create_disposable_worktree(source, worktree_parent=worktree_parent)
     executor_receipt: Path | None = None
     try:
         loaded = load_project(worktree_path, allowlist=workspace_allowlist)
@@ -108,6 +122,9 @@ def run_in_disposable_worktree(
             ),
             commit_message=commit_message or default_commit_message(workflow_name),
         )
+        # Bounded delivery consumes this attested result rather than inferring
+        # validation success from a commit alone.
+        commit_result = {**commit_result, "validation": validation_result}
         if auto_commit and (
             not result.provider_result.success or not changed_files or not validation_result["success"]
         ):
@@ -155,7 +172,7 @@ def run_in_disposable_worktree(
             github_result=github_result,
         )
     finally:
-        if not keep_worktree and worktree_path.exists():
+        if not keep_worktree and not reused_worktree and worktree_path.exists():
             remove_worktree(source.root, worktree_path)
 
 
@@ -165,6 +182,12 @@ def create_disposable_worktree(source: LoadedProject, worktree_parent: Path | No
     target = parent / f"{source.profile.project.name}-ai-write-{uuid4().hex[:8]}"
     _run_git(source.root, ["worktree", "add", "--detach", str(target), source.commit_sha or "HEAD"])
     return target.resolve()
+
+
+def _git_common_dir(project_root: Path) -> Path:
+    output = _run_git(project_root, ["rev-parse", "--git-common-dir"]).stdout.strip()
+    path = Path(output)
+    return (project_root / path).resolve() if not path.is_absolute() else path.resolve()
 
 
 def remove_worktree(repository_root: Path, worktree_path: Path) -> None:

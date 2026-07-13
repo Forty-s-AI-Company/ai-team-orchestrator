@@ -149,6 +149,35 @@ class IsolatedExecutorTests(unittest.TestCase):
             )
             self.assertEqual(log.stdout.strip(), "chore(ai-team): test safe change")
 
+    def test_repair_can_reuse_the_same_disposable_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+            first = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=_WritingProvider("notes/change.md", "first\n"),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                auto_commit=True,
+            )
+            second = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=_WritingProvider("notes/change.md", "second\n"),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                auto_commit=True,
+                reuse_worktree_path=first.worktree_path,
+            )
+            self.assertEqual(second.worktree_path, first.worktree_path)
+            self.assertTrue(second.commit_result["committed"], second.commit_result)
+
     def test_write_smoke_auto_commit_and_pr_dry_run_records_all_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

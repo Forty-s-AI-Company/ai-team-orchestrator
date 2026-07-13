@@ -12,6 +12,7 @@ ROLE_CHOICES = [
     "product-manager",
     "project-analyst",
     "qa-engineer",
+    "delivery-qa",
     "reviewer",
 ]
 SUPPORTED_ROLE_PROVIDERS = {"codex", "antigravity", "handsfreecode"}
