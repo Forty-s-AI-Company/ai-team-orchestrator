@@ -59,7 +59,9 @@ antigravity:
   timeout_seconds: 20
   run_timeout_seconds: 40
   execution_enabled: true
-  prompt_max_chars: 500
+  # Bounded delivery needs enough room for task scope and validation evidence;
+  # the provider still enforces a hard 1,600-character cap.
+  prompt_max_chars: 1600
   diagnostics_cache_ttl_seconds: 30
   # Exact account-visible names returned by `agy models` in WSL.
   allowed_models:
@@ -134,6 +136,16 @@ routing:
       fallbacks: []
       allow_write: false
       allow_read_only_agent: true
+
+    # Bounded delivery QA is intentionally separate from the lightweight
+    # local project analyst: it requires a provider-native Antigravity review.
+    delivery-qa:
+      primary:
+        provider: antigravity
+        model: "Claude Sonnet 4.6 (Thinking)"
+        reasoning_effort: thinking
+      fallbacks: []
+      allow_write: false
 
     project-analyst:
       primary:

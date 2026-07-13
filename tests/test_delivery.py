@@ -18,6 +18,15 @@ class DeliveryTests(unittest.TestCase):
         args = build_parser().parse_args(["supervise", "project", "--delivery"])
         self.assertTrue(args.delivery)
 
+    def test_bounded_delivery_flags_are_parsed_with_safe_defaults(self) -> None:
+        args = build_parser().parse_args([
+            "supervise", "project", "--bounded-delivery", "--task-contract", "task.json", "--once", "--execute",
+        ])
+        self.assertTrue(args.bounded_delivery)
+        self.assertEqual(args.task_contract, "task.json")
+        self.assertEqual(args.max_iterations, 2)
+        self.assertEqual(args.max_repair_attempts, 1)
+
     def test_codex_auto_native_falls_back_without_extension(self) -> None:
         with patch("ai_team.cli.Path.home", return_value=Path("Z:/missing-home")):
             self.assertEqual(_resolve_codex_executable("auto-native"), "__codex_vscode_native_not_found__")

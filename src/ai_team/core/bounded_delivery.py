@@ -1,0 +1,436 @@
+"""Fail-closed, multi-role delivery loop for explicit trusted tasks only."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Callable
+
+from ai_team.core.isolated_executor import IsolatedRunResult, run_in_disposable_worktree
+from ai_team.core.project_loader import load_project
+from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderRequest, ProviderResult, redact_secrets
+
+
+SCHEMA = "ai-team-bounded-delivery/v1"
+FORBIDDEN_PATTERNS = (
+    r"\b(?:database\s+)?migrat(?:e|ion|ions)\b",
+    r"\bseeds?\b",
+    r"\b(?:production\s+)?deploy(?:ment|ing)?\b",
+    r"\b(?:real\s+)?payments?\b",
+    r"\b(?:read|write|expose|rotate|copy)\s+(?:a\s+)?(?:secret|credential|token|api[ _-]?key)\b",
+    r"\b(?:delete|drop|truncate)\s+(?:data|database|records?|volume)\b",
+    r"\bforce\s+push\b",
+    r"\b(?:schema\s+change|api\s+contract\s+change)\b",
+    r"\b(?:prisma\s+db\s+push|drizzle(?:-kit)?\s+push|git\s+push|gh\s+(?:pr|api))\b",
+)
+ROLE_BY_STAGE = {"pm": "product-manager", "architect": "architect", "engineer": "engineer", "qa": "delivery-qa", "review": "reviewer"}
+
+
+class BoundedDeliveryError(ValueError):
+    """Raised when a task contract or a stage result is unsafe."""
+
+
+@dataclass(frozen=True)
+class TrustedTaskContract:
+    id: str
+    title: str
+    source_kind: str
+    source_reference: str
+    instruction: str
+    allowed_write_paths: tuple[str, ...]
+    validation_commands: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DeliveryLimits:
+    max_iterations: int = 2
+    max_repair_attempts: int = 1
+    max_token_usage: int = 120_000
+    timeout_seconds: int = 180
+
+
+@dataclass(frozen=True)
+class EngineeringAttempt:
+    provider_result: ProviderResult
+    worktree_path: Path
+    changed_files: list[str]
+    validation: dict[str, Any]
+    commit_sha: str | None
+    run_receipt: Path | None = None
+    executor_receipt: Path | None = None
+
+
+@dataclass(frozen=True)
+class BoundedDeliveryOptions:
+    project_path: Path
+    task_contract_path: Path
+    provider_for_role: Callable[[str], BaseProvider]
+    workspace_allowlist: list[str] | None
+    report_dir: Path
+    state_path: Path
+    limits: DeliveryLimits = DeliveryLimits()
+    engineering_executor: Callable[[TrustedTaskContract, str, BaseProvider, int], EngineeringAttempt] | None = None
+
+
+def load_trusted_task_contract(path: Path) -> tuple[TrustedTaskContract, str]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BoundedDeliveryError(f"trusted task contract must be readable JSON: {path}") from exc
+    if not isinstance(raw, dict) or raw.get("schemaVersion") != 1:
+        raise BoundedDeliveryError("trusted task contract requires schemaVersion=1")
+    source = raw.get("source")
+    if not isinstance(source, dict) or source.get("kind") not in {"github-issue", "trusted-contract"}:
+        raise BoundedDeliveryError("task source must be github-issue or trusted-contract")
+    values = {
+        "id": raw.get("id"), "title": raw.get("title"), "instruction": raw.get("instruction"),
+        "source_kind": source.get("kind"), "source_reference": source.get("reference"),
+    }
+    if not all(isinstance(value, str) and value.strip() for value in values.values()):
+        raise BoundedDeliveryError("task contract requires non-empty id, title, instruction, and source reference")
+    paths = _string_list(raw.get("allowedWritePaths"), "allowedWritePaths")
+    commands = _string_list(raw.get("validationCommands"), "validationCommands")
+    if not paths or not commands:
+        raise BoundedDeliveryError("trusted write tasks require allowedWritePaths and validationCommands")
+    contract = TrustedTaskContract(
+        id=values["id"].strip(), title=values["title"].strip(), source_kind=values["source_kind"].strip(),
+        source_reference=values["source_reference"].strip(), instruction=values["instruction"].strip(),
+        allowed_write_paths=tuple(paths), validation_commands=tuple(commands),
+    )
+    _reject_forbidden(contract.instruction, "task instruction")
+    _validate_allowed_write_paths(contract.allowed_write_paths)
+    for command in contract.validation_commands:
+        _reject_forbidden(command, "validation command")
+    normalized = json.dumps(raw, sort_keys=True, separators=(",", ":"))
+    return contract, hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
+    contract, task_sha = load_trusted_task_contract(options.task_contract_path)
+    project = load_project(options.project_path, allowlist=options.workspace_allowlist)
+    _validate_contract_validation_commands(project, contract)
+    prior = _read_json(options.state_path)
+    if prior.get("status") == "completed" and prior.get("taskSha") == task_sha:
+        return {"status": "already-completed", "taskSha": task_sha, "statePath": str(options.state_path)}
+    prior_receipts = prior.get("receipts") if isinstance(prior.get("receipts"), list) else []
+    context: dict[str, Any] = {
+        "task": asdict(contract),
+        "taskSha": task_sha,
+        # Preserve prior redacted evidence when an attention-required task is
+        # deliberately retried; receipt names continue rather than overwrite.
+        "receipts": [item for item in prior_receipts if isinstance(item, str)],
+        "tokenUsage": 0,
+        "resumedFrom": prior.get("status"),
+    }
+    _write_state(options, "running", "pm", context)
+    try:
+        pm = _run_stage(options, project.root, "pm", context)
+        acceptance = _required_strings(pm, "acceptanceCriteria")
+        context["acceptanceCriteria"] = acceptance
+        architect = _run_stage(options, project.root, "architect", context)
+        plan = _required_strings(architect, "plan")
+        if architect.get("schemaOrApiChange") is not False:
+            return _stop(options, context, "architect-requires-product-decision", "architect")
+        _validate_plan_scope(architect, contract)
+        context["plan"] = plan
+        context["planAllowedWritePaths"] = _required_strings(architect, "allowedWritePaths")
+
+        repairs: list[dict[str, Any]] = []
+        for iteration in range(1, options.limits.max_iterations + 1):
+            instruction = _engineering_instruction(context, repairs)
+            engineer = options.provider_for_role(ROLE_BY_STAGE["engineer"])
+            attempt = (options.engineering_executor or _default_engineering_executor(options))(
+                contract, instruction, engineer, iteration
+            )
+            _record_engineering_receipt(options, context, attempt, iteration)
+            if not _native_success(attempt.provider_result, "codex"):
+                return _stop(options, context, _provider_stop_reason(attempt.provider_result), "engineer")
+            if not attempt.validation.get("success"):
+                return _stop(options, context, "deterministic-validation-failed", "validation")
+            if not attempt.commit_sha:
+                return _stop(options, context, "engineering-commit-missing", "engineer")
+            if not _paths_within(attempt.changed_files, tuple(context["planAllowedWritePaths"])):
+                return _stop(options, context, "engineering-diff-outside-allowed-paths", "engineer")
+            context.update({
+                "worktreePath": str(attempt.worktree_path),
+                "commitSha": attempt.commit_sha,
+                "changedFiles": attempt.changed_files,
+                "validation": attempt.validation,
+            })
+
+            qa = _run_stage(options, attempt.worktree_path, "qa", context)
+            review = _run_stage(options, attempt.worktree_path, "review", context)
+            findings = _findings(qa) + _findings(review)
+            if not findings:
+                return _complete(options, context)
+            if not _findings_are_attributable(findings, tuple(context["planAllowedWritePaths"])):
+                return _stop(options, context, "unattributed-or-out-of-scope-finding", "qa-review")
+            if len(repairs) >= options.limits.max_repair_attempts:
+                return _stop(options, context, "max-repair-attempts-reached", "qa-review")
+            repairs.append({"findingSha": _sha(findings), "findings": findings})
+            context["repairs"] = repairs
+        return _stop(options, context, "max-iterations-reached", "engineer")
+    except BoundedDeliveryError as exc:
+        return _stop(options, context, str(exc), "policy-or-provider")
+
+
+def _run_stage(options: BoundedDeliveryOptions, root: Path, stage: str, context: dict[str, Any]) -> dict[str, Any]:
+    provider = options.provider_for_role(ROLE_BY_STAGE[stage])
+    request = ProviderRequest(
+        workflow=f"bounded-delivery-{stage}", project_root=root, run_mode="run-agent",
+        timeout_seconds=options.limits.timeout_seconds,
+        prompt=_stage_prompt(stage, context),
+        metadata={
+            "role": ROLE_BY_STAGE[stage], "writeRequired": False, "writeAccess": False,
+            "taskSha": context["taskSha"], "boundedStage": stage,
+        },
+    )
+    result = provider.run(request)
+    expected = "antigravity" if stage in {"pm", "architect", "qa"} else "codex"
+    if not _native_success(result, expected):
+        _write_receipt(options, context, stage, result, {"validationError": _provider_stop_reason(result)})
+        raise BoundedDeliveryError(_provider_stop_reason(result))
+    try:
+        payload = json.loads(result.content)
+    except json.JSONDecodeError as exc:
+        _write_receipt(options, context, stage, result, {"validationError": f"{stage} returned non-JSON content"})
+        raise BoundedDeliveryError(f"{stage} returned non-JSON content") from exc
+    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA or payload.get("stage") != stage:
+        _write_receipt(options, context, stage, result, {"validationError": f"{stage} returned an invalid bounded-delivery schema"})
+        raise BoundedDeliveryError(f"{stage} returned an invalid bounded-delivery schema")
+    if payload.get("status") != "passed" or not isinstance(payload.get("findings"), list):
+        _write_receipt(options, context, stage, result, {"validationError": f"{stage} did not provide a passed, structured result"})
+        raise BoundedDeliveryError(f"{stage} did not provide a passed, structured result")
+    _write_receipt(options, context, stage, result, payload)
+    _reject_forbidden(json.dumps(payload, ensure_ascii=False), f"{stage} output")
+    if stage == "architect":
+        secondary = result.data.get("secondaryReview")
+        if not isinstance(secondary, dict) or secondary.get("success") is not True or secondary.get("provider") != "codex":
+            raise BoundedDeliveryError("architect-codex-read-only-review-failed")
+        _validate_secondary_review(secondary, stage)
+    _add_tokens(options, context, result)
+    return payload
+
+
+def _default_engineering_executor(options: BoundedDeliveryOptions) -> Callable[[TrustedTaskContract, str, BaseProvider, int], EngineeringAttempt]:
+    reusable_worktree: Path | None = None
+
+    def execute(contract: TrustedTaskContract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
+        nonlocal reusable_worktree
+        result: IsolatedRunResult = run_in_disposable_worktree(
+            source_project_path=options.project_path, provider=provider, workflow_name="bug-fix-loop",
+            workspace_allowlist=options.workspace_allowlist, receipt_dir=options.report_dir / "isolated",
+            worktree_parent=options.project_path.resolve().parent, dry_run=False, run_mode="run-agent",
+            keep_worktree=True, auto_commit=True, commit_message=f"fix: {contract.title}",
+            task_instruction=instruction, allowed_write_paths=list(contract.allowed_write_paths),
+            validation_commands=[*contract.validation_commands, "git diff --check"], require_validation=True,
+            reuse_worktree_path=reusable_worktree,
+        )
+        reusable_worktree = result.worktree_path
+        validation = result.commit_result.get("validation") or {"success": False}
+        return EngineeringAttempt(
+            provider_result=result.workflow_result.provider_result, worktree_path=result.worktree_path,
+            changed_files=list(result.git_policy.get("changedFiles") or []), validation=validation,
+            commit_sha=result.commit_result.get("commitSha"), run_receipt=result.run_receipt,
+            executor_receipt=result.executor_receipt,
+        )
+    return execute
+
+
+def _stage_prompt(stage: str, context: dict[str, Any]) -> str:
+    task = context["task"]
+    evidence = {
+        "allowedWritePaths": task["allowed_write_paths"],
+        "validationCommands": task["validation_commands"],
+        "changedFiles": context.get("changedFiles", []),
+        "commitSha": context.get("commitSha"),
+        "validation": context.get("validation", {"success": False, "reason": "validation evidence unavailable"}),
+        "repairs": [item["findingSha"] for item in context.get("repairs", [])],
+    }
+    return "\n".join((
+        f"Bounded delivery stage: {stage}", f"Task SHA: {context['taskSha']}",
+        f"Task: {redact_secrets(task['title'])}", f"Instruction: {redact_secrets(task['instruction'])}",
+        f"Allowed write paths: {json.dumps(evidence['allowedWritePaths'])}",
+        f"Validation commands: {json.dumps(evidence['validationCommands'])}",
+        f"Implementation evidence: {json.dumps(evidence)}",
+        "Return only JSON with schema='ai-team-bounded-delivery/v1', stage, status='passed', findings=[], tests=[], blockers=[].",
+        "Do not edit files, run shell commands, deploy, migrate, seed, process payments, read secrets, or propose schema/API changes.",
+        "PM: include non-empty acceptanceCriteria. Architect: include non-empty plan, allowedWritePaths, validationCommands, schemaOrApiChange=false.",
+        "QA/review: findings must be [] when passed; each failed finding must include path and message.",
+    ))
+
+
+def _record_engineering_receipt(options: BoundedDeliveryOptions, context: dict[str, Any], attempt: EngineeringAttempt, iteration: int) -> None:
+    _write_receipt(options, context, "engineer", attempt.provider_result, {
+        "iteration": iteration, "changedFiles": attempt.changed_files, "validation": attempt.validation,
+        "commitSha": attempt.commit_sha, "runReceipt": str(attempt.run_receipt) if attempt.run_receipt else None,
+        "executorReceipt": str(attempt.executor_receipt) if attempt.executor_receipt else None,
+    })
+    _add_tokens(options, context, attempt.provider_result)
+
+
+def _write_receipt(options: BoundedDeliveryOptions, context: dict[str, Any], stage: str, result: ProviderResult, evidence: dict[str, Any]) -> None:
+    options.report_dir.mkdir(parents=True, exist_ok=True)
+    path = options.report_dir / f"{len(context['receipts']) + 1:02d}-{stage}.json"
+    payload = redact_secrets({
+        "schemaVersion": 1, "stage": stage, "generatedAt": datetime.now(UTC).isoformat(),
+        "outerRunMode": "bounded-delivery", "runtimeMode": result.data.get("runtimeMode", "run-agent"),
+        "writeAccess": stage == "engineer", "inputTaskSha": context["taskSha"], "taskSha": context["taskSha"],
+        "provider": result.provider, "selectedModel": result.data.get("selectedModel"),
+        "reasoningEffort": result.data.get("reasoningEffort"), "tokenUsage": result.data.get("tokenUsage", 0),
+        "providerSuccess": result.success, "errorType": result.error_type,
+        "validationResult": evidence.get("validation", {"success": result.success, "kind": "provider-output"}),
+        "findingSha": _sha(evidence.get("findings", [])) if isinstance(evidence.get("findings"), list) else None,
+        "commitSha": evidence.get("commitSha"), "evidence": evidence,
+        "secondaryReview": result.data.get("secondaryReview"),
+    })
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    context["receipts"].append(str(path))
+
+
+def _add_tokens(options: BoundedDeliveryOptions, context: dict[str, Any], result: ProviderResult) -> None:
+    tokens = result.data.get("tokenUsage", 0)
+    context["tokenUsage"] += tokens if isinstance(tokens, int) and tokens >= 0 else 0
+    if context["tokenUsage"] > options.limits.max_token_usage:
+        raise BoundedDeliveryError("token-budget-exhausted")
+
+
+def _complete(options: BoundedDeliveryOptions, context: dict[str, Any]) -> dict[str, Any]:
+    _write_state(options, "completed", "complete", context)
+    return {"status": "completed", **context, "statePath": str(options.state_path)}
+
+
+def _stop(options: BoundedDeliveryOptions, context: dict[str, Any], reason: str, stage: str) -> dict[str, Any]:
+    _write_state(options, "attention-required", stage, context, reason)
+    return {"status": "attention-required", "stopReason": reason, **context, "statePath": str(options.state_path)}
+
+
+def _write_state(options: BoundedDeliveryOptions, status: str, stage: str, context: dict[str, Any], reason: str | None = None) -> None:
+    options.state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = redact_secrets({"schemaVersion": 1, "status": status, "stage": stage, "stopReason": reason, **context})
+    options.state_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def _native_success(result: ProviderResult, expected_provider: str) -> bool:
+    return result.success and result.provider == expected_provider and result.provider != "mock"
+
+
+def _provider_stop_reason(result: ProviderResult) -> str:
+    if result.provider == "mock":
+        return "mock-provider-denied"
+    if result.error_type == ProviderErrorType.RATE_LIMIT:
+        return "provider-quota-exhausted"
+    if result.error_type == ProviderErrorType.TIMEOUT:
+        return "provider-timeout"
+    return "provider-native-execution-failed"
+
+
+def _required_strings(payload: dict[str, Any], key: str) -> list[str]:
+    value = _string_list(payload.get(key), key)
+    if not value:
+        raise BoundedDeliveryError(f"{key} must be non-empty")
+    return value
+
+
+def _validate_plan_scope(payload: dict[str, Any], contract: TrustedTaskContract) -> None:
+    if not _paths_within(_required_strings(payload, "allowedWritePaths"), contract.allowed_write_paths):
+        raise BoundedDeliveryError("architect plan expands allowed write paths")
+    if not set(_required_strings(payload, "validationCommands")).issubset(set(contract.validation_commands)):
+        raise BoundedDeliveryError("architect plan expands validation commands")
+
+
+def _validate_contract_validation_commands(project: Any, contract: TrustedTaskContract) -> None:
+    required = [
+        project.profile.commands.lint,
+        project.profile.commands.typecheck,
+        project.profile.commands.test,
+        project.profile.commands.build,
+    ]
+    if not all(isinstance(command, str) and command.strip() for command in required):
+        raise BoundedDeliveryError("project contract must define lint, typecheck, test, and build for bounded delivery")
+    if set(contract.validation_commands) != set(required):
+        raise BoundedDeliveryError("trusted task contract must run exactly the project lint, typecheck, test, and build commands")
+
+
+def _validate_allowed_write_paths(paths: tuple[str, ...]) -> None:
+    for raw_path in paths:
+        path = Path(raw_path)
+        normalized = path.as_posix().rstrip("/")
+        if not normalized or path.is_absolute() or ".." in path.parts or normalized in {".", ".git"}:
+            raise BoundedDeliveryError("allowedWritePaths must be safe project-relative paths")
+        if any(part in {".git", "node_modules", ".next", "coverage", "dist", "build", "logs", "receipts"} for part in path.parts):
+            raise BoundedDeliveryError("allowedWritePaths contains a protected generated or Git path")
+        name = path.name.lower()
+        if name == ".env" or name.startswith(".env.") or any(token in name for token in ("credential", "session", "secret", "token")):
+            raise BoundedDeliveryError("allowedWritePaths contains a sensitive path")
+
+
+def _validate_secondary_review(secondary: dict[str, Any], stage: str) -> None:
+    content = secondary.get("content")
+    if not isinstance(content, str):
+        raise BoundedDeliveryError("architect-codex-read-only-review-content-missing")
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise BoundedDeliveryError("architect-codex-read-only-review-is-not-structured") from exc
+    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA or payload.get("stage") != stage:
+        raise BoundedDeliveryError("architect-codex-read-only-review-schema-invalid")
+    if payload.get("status") != "passed" or not isinstance(payload.get("findings"), list):
+        raise BoundedDeliveryError("architect-codex-read-only-review-not-approved")
+    _reject_forbidden(json.dumps(payload, ensure_ascii=False), "architect Codex review")
+
+
+def _findings(payload: dict[str, Any]) -> list[dict[str, str]]:
+    findings = payload.get("findings")
+    if not isinstance(findings, list):
+        raise BoundedDeliveryError("findings must be a list")
+    normalized: list[dict[str, str]] = []
+    for finding in findings:
+        if not isinstance(finding, dict) or not isinstance(finding.get("path"), str) or not isinstance(finding.get("message"), str):
+            raise BoundedDeliveryError("findings must include path and message")
+        normalized.append({"path": finding["path"], "message": finding["message"]})
+    return normalized
+
+
+def _findings_are_attributable(findings: list[dict[str, str]], allowed: tuple[str, ...]) -> bool:
+    return all(_paths_within([finding["path"]], allowed) for finding in findings)
+
+
+def _paths_within(paths: list[str], allowed: tuple[str, ...]) -> bool:
+    roots = tuple(Path(item).as_posix().rstrip("/") for item in allowed)
+    return all(any(path == root or path.startswith(f"{root}/") for root in roots) for path in paths)
+
+
+def _engineering_instruction(context: dict[str, Any], repairs: list[dict[str, Any]]) -> str:
+    return json.dumps({"task": context["task"], "acceptanceCriteria": context["acceptanceCriteria"], "plan": context["plan"], "repairs": repairs}, ensure_ascii=False)
+
+
+def _reject_forbidden(value: str, label: str) -> None:
+    lowered = value.lower()
+    if any(re.search(pattern, lowered) for pattern in FORBIDDEN_PATTERNS):
+        raise BoundedDeliveryError(f"{label} contains a prohibited action or product-contract change")
+
+
+def _string_list(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise BoundedDeliveryError(f"{label} must be a non-empty string list")
+    normalized = [item.strip() for item in value]
+    if len(set(normalized)) != len(normalized):
+        raise BoundedDeliveryError(f"{label} must not contain duplicate values")
+    return normalized
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _sha(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()

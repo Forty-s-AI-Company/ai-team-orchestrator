@@ -139,6 +139,7 @@ The current profiles are:
 | Engineer | Codex gpt-5.6-terra, high | none for write workflows |
 | Reviewer | Codex gpt-5.5, high | Claude Sonnet 4.6 (Thinking) fallback and second opinion |
 | QA Engineer | HandsFreeCode / qwen2.5-coder:7b, provider default | none in read-only-agent mode |
+| Delivery QA | Antigravity Claude Sonnet 4.6 (Thinking) | none; provider-native QA is mandatory |
 | Project Analyst | HandsFreeCode / qwen2.5-coder:7b, provider default | none in read-only-agent mode |
 
 Fallback is limited to provider availability failures. Invalid or unvalidated
@@ -537,3 +538,45 @@ Runtime state and the normalized trusted queue are written under
 `reports/supervisor/`. Without `--delivery`, `supervise` retains its read-only
 project-analysis behavior. Automated merge remains gated by successful CI,
 receipt and secret-scan evidence, and an approved GitHub review.
+
+### Bounded autonomous delivery
+
+`--bounded-delivery` is a separate, fail-closed single-task cycle. It never
+discovers product requirements itself: an operator supplies a versioned JSON
+task contract that cites either a GitHub issue or another trusted source. The
+contract must declare the exact approved write paths and must use exactly the
+project contract's `lint`, `typecheck`, `test`, and `build` commands.
+
+The cycle runs PM (Antigravity), Architect (Antigravity plus mandatory
+read-only Codex second opinion), Codex Engineer in a disposable worktree,
+deterministic validation plus `git diff --check`, Antigravity delivery QA, and
+Codex review (with optional Antigravity second opinion). It records a redacted
+receipt per stage and never invokes push, PR, merge, migration, seed, deploy,
+payment, secret, destructive-data, schema/API-contract, or force-push actions.
+
+Start with exactly one cycle. `--execute` and `--once` are both mandatory:
+
+```bash
+cat > /tmp/trusted-task.json <<'JSON'
+{
+  "schemaVersion": 1,
+  "id": "github-issue-123",
+  "title": "Exact issue title",
+  "source": {"kind": "github-issue", "reference": "owner/repo#123"},
+  "instruction": "Implement only the documented issue acceptance criteria.",
+  "allowedWritePaths": ["src/example.ts", "src/example.test.ts"],
+  "validationCommands": ["npm run lint", "npm run typecheck", "npm run test", "npm run build"]
+}
+JSON
+
+ai-team supervise /home/eden/projects/CelebrateDeal \
+  --provider auto --bounded-delivery --task-contract /tmp/trusted-task.json \
+  --execute --once --max-iterations 2 --max-repair-attempts 1 \
+  --max-token-usage 120000 --stage-timeout-seconds 180
+```
+
+The cycle writes `bounded-delivery-state.json` and per-stage receipts beneath
+the selected report directory. Any provider timeout/quota/mock response,
+unvalidated QA output, out-of-scope diff/finding, token limit, missing
+validation, or forbidden action becomes `attention-required`; it does not
+continue to a repair or GitHub action.

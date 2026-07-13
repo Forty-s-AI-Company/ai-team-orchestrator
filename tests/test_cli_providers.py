@@ -67,6 +67,19 @@ class CliProviderTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             apply_antigravity_routing([], "Gemini 3.5 Flash (Low)", "high", settings)
+
+    def test_antigravity_bounded_delivery_prompt_has_stage_and_no_write_capability(self) -> None:
+        prompt = _compact_prompt(
+            "Task: Update a documented behavior\nInstruction: Edit the approved path only",
+            1200,
+            challenge="challenge-1",
+            bounded_stage="qa",
+        )
+
+        self.assertIn("schema='ai-team-bounded-delivery/v1'", prompt)
+        self.assertIn("stage=qa", prompt)
+        self.assertIn("Forbidden: edit, shell", prompt)
+        self.assertIn("Challenge=challenge-1", prompt)
     def test_codex_trusted_write_requires_linked_worktree_marker(self) -> None:
         provider = CodexProvider(
             CodexSettings(

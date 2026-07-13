@@ -12,6 +12,7 @@ from ai_team.core.git_policy import evaluate_git_action
 from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action
 from ai_team.core.ci_monitor import monitor_pull_request, write_repair_completion_receipt
 from ai_team.core.delivery import DeliveryOptions, run_delivery_supervisor
+from ai_team.core.bounded_delivery import BoundedDeliveryError, BoundedDeliveryOptions, DeliveryLimits, run_bounded_delivery
 from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
@@ -553,11 +554,54 @@ def supervise(
     validation_log_hash: str | None,
     test_evidence_hash: str | None,
     delivery: bool,
+    bounded_delivery: bool,
+    task_contract: str | None,
+    max_iterations: int,
+    max_repair_attempts: int,
+    max_token_usage: int,
+    stage_timeout_seconds: int,
     role: str | None = None,
 ) -> None:
     settings = load_settings()
-    provider = build_provider(provider_name, settings, role)
     selected_report_dir = Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "supervisor"
+    if bounded_delivery:
+        if delivery:
+            raise WorkflowError("--bounded-delivery cannot be combined with legacy --delivery")
+        if provider_name != "auto" or role is not None:
+            raise WorkflowError("bounded delivery selects audited role routes internally; use --provider auto without --role")
+        if mode != "create-only":
+            raise WorkflowError("bounded delivery owns its stage modes; do not pass --mode run-agent")
+        if isolated_auto_commit or github_action or github_execute:
+            raise WorkflowError("bounded delivery never accepts legacy auto-commit or GitHub action flags")
+        if dry_run:
+            raise WorkflowError("bounded delivery requires explicit --execute")
+        if not once:
+            raise WorkflowError("bounded delivery v1 requires --once so each trusted task is explicitly bounded")
+        if not task_contract:
+            raise WorkflowError("bounded delivery requires --task-contract")
+        limits = DeliveryLimits(
+            max_iterations=max_iterations,
+            max_repair_attempts=max_repair_attempts,
+            max_token_usage=max_token_usage,
+            timeout_seconds=stage_timeout_seconds,
+        )
+        if min(limits.max_iterations, limits.max_repair_attempts, limits.max_token_usage, limits.timeout_seconds) < 1:
+            raise WorkflowError("bounded delivery limits must all be positive")
+        selected_state_path = Path(state_path).resolve() if state_path else selected_report_dir / "bounded-delivery-state.json"
+        result = run_bounded_delivery(
+            BoundedDeliveryOptions(
+                project_path=Path(project_path).resolve(),
+                task_contract_path=Path(task_contract).resolve(),
+                provider_for_role=lambda selected_role: build_provider("auto", settings, selected_role),
+                workspace_allowlist=workspace_allowlist(settings),
+                report_dir=selected_report_dir / "bounded-delivery",
+                state_path=selected_state_path,
+                limits=limits,
+            )
+        )
+        print(json.dumps(redact_secrets(result), indent=2, default=str))
+        return
+    provider = build_provider(provider_name, settings, role)
     if delivery:
         selected_state_path = Path(state_path).resolve() if state_path else selected_report_dir / "delivery-state.json"
         result = run_delivery_supervisor(
@@ -729,6 +773,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Discover and execute trusted product tasks in disposable worktrees",
     )
+    supervisor_parser.add_argument(
+        "--bounded-delivery",
+        action="store_true",
+        help="Run one explicit trusted task through the fail-closed multi-role delivery loop",
+    )
+    supervisor_parser.add_argument("--task-contract", help="Path to a schemaVersion=1 trusted task contract JSON file")
+    supervisor_parser.add_argument("--max-iterations", type=int, default=2)
+    supervisor_parser.add_argument("--max-repair-attempts", type=int, default=1)
+    supervisor_parser.add_argument("--max-token-usage", type=int, default=120000)
+    supervisor_parser.add_argument("--stage-timeout-seconds", type=int, default=180)
 
     return parser
 
@@ -831,9 +885,15 @@ def main() -> None:
                 args.validation_log_hash,
                 args.test_evidence_hash,
                 args.delivery,
+                args.bounded_delivery,
+                args.task_contract,
+                args.max_iterations,
+                args.max_repair_attempts,
+                args.max_token_usage,
+                args.stage_timeout_seconds,
                 args.role,
             )
-    except (ProjectConfigError, WorkflowError) as exc:
+    except (BoundedDeliveryError, ProjectConfigError, WorkflowError) as exc:
         print(f"ai-team error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
