@@ -219,6 +219,95 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(validation["status"], "passed")
             self.assertEqual(validation["disallowedActionRecommendations"], [])
 
+    def test_grounding_validation_rejects_read_only_side_effect_recommendations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                '{"dependencies":{"next":"1"},"devDependencies":{"typescript":"1"}}',
+                encoding="utf-8",
+            )
+            (root / "tsconfig.json").write_text("{}", encoding="utf-8")
+            snapshot = collect_project_evidence(
+                loaded_project(root),
+                EvidencePolicy(include=("package.json", "tsconfig.json")),
+            )
+            validation = validate_analysis_grounding(
+                "Node.js, Next.js, and TypeScript from package.json. Coverage is unknown.\n"
+                "Add a database migration and run the seed script.\n"
+                "Deploy the application to production.\n"
+                "Delete customer records before release.\n"
+                "Charge customers with a real payment.\n"
+                "Read the API secret before continuing.",
+                snapshot,
+                provider_success=True,
+            )
+            self.assertEqual(validation["status"], "failed")
+            self.assertEqual(
+                validation["disallowedActionRecommendations"],
+                [
+                    "database seed",
+                    "database migration",
+                    "deployment",
+                    "destructive command",
+                    "data deletion",
+                    "real payment",
+                    "secret operation",
+                ],
+            )
+
+    def test_grounding_validation_allows_safe_evidence_unknowns_and_policy_blockers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                '{"dependencies":{"next":"1"},"devDependencies":{"typescript":"1"}}',
+                encoding="utf-8",
+            )
+            (root / "tsconfig.json").write_text("{}", encoding="utf-8")
+            snapshot = collect_project_evidence(
+                loaded_project(root),
+                EvidencePolicy(include=("package.json", "tsconfig.json")),
+            )
+            validation = validate_analysis_grounding(
+                "Node.js, Next.js, and TypeScript are evidenced by package.json and tsconfig.json.\n"
+                "Configured checks: lint, typecheck, test, and build; they were not run.\n"
+                "Coverage is unknown because no coverage report is included.\n"
+                "### Policy Blockers\n"
+                "- Database migration: disallowed for this read-only analysis.\n"
+                "- Database seed: disallowed for this read-only analysis.\n"
+                "- Deployment: disallowed for this read-only analysis.\n"
+                "- Data deletion: disallowed for this read-only analysis.\n"
+                "- Real payment: disallowed for this read-only analysis.\n"
+                "- Secret operation: disallowed for this read-only analysis.",
+                snapshot,
+                provider_success=True,
+            )
+            self.assertEqual(validation["status"], "passed")
+            self.assertEqual(validation["disallowedActionRecommendations"], [])
+            self.assertIn("real payment", snapshot.facts["disallowedActions"])
+            self.assertIn("secret operation", snapshot.facts["disallowedActions"])
+
+    def test_policy_blocker_heading_cannot_hide_a_recommendation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                '{"dependencies":{"next":"1"},"devDependencies":{"typescript":"1"}}',
+                encoding="utf-8",
+            )
+            (root / "tsconfig.json").write_text("{}", encoding="utf-8")
+            snapshot = collect_project_evidence(
+                loaded_project(root),
+                EvidencePolicy(include=("package.json", "tsconfig.json")),
+            )
+            validation = validate_analysis_grounding(
+                "Node.js, Next.js, and TypeScript from package.json. Coverage is unknown.\n"
+                "### Policy Blockers\n"
+                "- Deployment: disallowed for this read-only analysis; deploy the application to production.",
+                snapshot,
+                provider_success=True,
+            )
+            self.assertEqual(validation["status"], "failed")
+            self.assertIn("deployment", validation["disallowedActionRecommendations"])
+
 
 if __name__ == "__main__":
     unittest.main()

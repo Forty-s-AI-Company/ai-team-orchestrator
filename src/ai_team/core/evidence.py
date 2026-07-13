@@ -127,16 +127,19 @@ DISALLOWED_ACTION_CLAIMS = {
     "destructive command": re.compile(
         r"(?i)\b(?:delete|destroy|drop|force push|reset --hard)\b"
     ),
+    "data deletion": re.compile(
+        r"(?i)\b(?:delete|destroy|drop|purge|erase|remove)\b[^\n.!?]{0,80}"
+        r"\b(?:data|database|record|records|user|users|customer|customers|table|tables)\b"
+    ),
+    "real payment": re.compile(
+        r"(?i)\b(?:charge|collect|process|capture|refund|send)\b[^\n.!?]{0,80}"
+        r"\b(?:payment|payments|customer|customers|card|cards|money|funds)\b"
+    ),
+    "secret operation": re.compile(
+        r"(?i)\b(?:read|request|use|copy|print|expose|rotate|set|add|export)\b[^\n.!?]{0,80}"
+        r"\b(?:api[ _-]?key|secret|credential|password|token|private key|session key)\b"
+    ),
 }
-NEGATIVE_POLICY_MARKERS = (
-    "blocked",
-    "disallow",
-    "do not",
-    "forbidden",
-    "never ",
-    "not allowed",
-    "not run",
-)
 
 
 def parse_evidence_policy(value: Any) -> EvidencePolicy | None:
@@ -537,6 +540,8 @@ def _format_prompt_section(
         "- Existing CI evidence must be described as existing; do not recommend creating or setting up CI.",
         "- Dependency freshness is unknown without an audit; do not recommend upgrades as an evidence-backed finding.",
         "- Do not request, perform, or recommend actions disallowed by the project contract.",
+        "- Never recommend migration, seed, deployment, data deletion, real payment, or secret operations.",
+        "- Those actions may appear only in a Policy Blockers section as explicitly disallowed; never provide a command or next step for them.",
         "- No product changes are evidenced or authorized; do not include planned changes or generic recommendations.",
         "- Configured validation commands have not been executed; report them as configured, not passed.",
         "- Return only: technology summary, evidence-backed facts with paths, configured commands marked not run, unknowns, and policy blockers.",
@@ -632,6 +637,9 @@ def _disallowed_actions(loaded_project: LoadedProject) -> list[str]:
         actions.append("deployment")
     if not safety.allow_destructive_commands:
         actions.append("destructive command")
+    # These actions are never in scope for a grounded read-only analysis, even if a
+    # product profile later permits them for a separately authorized workflow.
+    actions.extend(("data deletion", "real payment", "secret operation"))
     return actions
 
 
@@ -644,13 +652,24 @@ def _disallowed_recommendations(text: str, disallowed_actions: Any) -> list[str]
         if pattern is None:
             continue
         for line in text.splitlines():
-            lowered = line.lower()
-            if any(marker in lowered for marker in NEGATIVE_POLICY_MARKERS):
+            if _is_explicit_policy_blocker(line):
                 continue
             if pattern.search(line):
                 recommendations.append(str(action))
                 break
     return recommendations
+
+
+def _is_explicit_policy_blocker(line: str) -> bool:
+    marker = re.match(
+        r"(?i)^\s*(?:[-*]\s+)?(?:\*\*)?[\w -]+(?:\*\*)?:\s*"
+        r"(?:blocked|disallowed|forbidden|not allowed|not authorized)\b",
+        line,
+    )
+    if marker is None:
+        return False
+    suffix = line[marker.end() :]
+    return not any(pattern.search(suffix) for pattern in DISALLOWED_ACTION_CLAIMS.values())
 
 
 def _without_not_run_sections(text: str) -> str:
@@ -659,7 +678,10 @@ def _without_not_run_sections(text: str) -> str:
     for line in text.splitlines():
         if re.match(r"^#{1,6}\s+", line):
             heading = line.lower()
-            skip = "not run" in heading or "not executed" in heading
+            skip = (
+                "not run" in heading
+                or "not executed" in heading
+            )
         if not skip:
             kept.append(line)
     return "\n".join(kept)

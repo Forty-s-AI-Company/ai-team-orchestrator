@@ -233,7 +233,9 @@ def build_workflow_prompt(
         f"Workflow: {workflow.name}",
         f"Stages: {', '.join(workflow.stages)}",
         f"Dry run: {dry_run}",
-        "Forbidden actions: production deploy, real payment, destructive migration.",
+        "Read-only forbidden actions: migration, seed, deployment, data deletion, real payment, and secret operations.",
+        "Do not provide commands, next steps, or recommendations for forbidden actions. "
+        "They may only be reported as disallowed in a Policy Blockers section.",
         f"Safety allow_git_push: {safety.allow_git_push}",
         f"Safety allow_deploy: {safety.allow_deploy}",
         report_instruction,

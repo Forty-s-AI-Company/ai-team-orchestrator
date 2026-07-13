@@ -377,6 +377,10 @@ class WorkflowTests(unittest.TestCase):
                 "passed",
             )
             self.assertEqual(
+                payload["validationResult"]["providerExecution"]["status"],
+                "passed",
+            )
+            self.assertEqual(
                 payload["validationResult"]["analysisGrounding"]["status"],
                 "passed",
             )
