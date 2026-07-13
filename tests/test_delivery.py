@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ai_team.core.delivery import DeliveryOptions, TrustedTask, run_delivery_cycle
+from ai_team.core.delivery import DeliveryOptions, TrustedTask, run_delivery_cycle, run_delivery_supervisor
 from ai_team.cli import _resolve_codex_executable, build_parser
 from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
 
@@ -19,7 +20,19 @@ class DeliveryTests(unittest.TestCase):
 
     def test_codex_auto_native_falls_back_without_extension(self) -> None:
         with patch("ai_team.cli.Path.home", return_value=Path("Z:/missing-home")):
-            self.assertEqual(_resolve_codex_executable("auto-native"), "codex")
+            self.assertEqual(_resolve_codex_executable("auto-native"), "__codex_vscode_native_not_found__")
+
+    def test_codex_auto_native_uses_newest_vscode_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            old = home / ".vscode" / "extensions" / "openai.chatgpt-26.1.0" / "bin" / "windows-x86_64" / "codex.exe"
+            new = home / ".vscode" / "extensions" / "openai.chatgpt-26.9.0" / "bin" / "windows-x86_64" / "codex.exe"
+            old.parent.mkdir(parents=True)
+            new.parent.mkdir(parents=True)
+            old.write_text("old", encoding="utf-8")
+            new.write_text("new", encoding="utf-8")
+            with patch("ai_team.cli.Path.home", return_value=home):
+                self.assertEqual(_resolve_codex_executable("auto-native"), str(new))
 
     def test_trusted_task_runs_in_disposable_worktree_and_persists_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -60,6 +73,48 @@ class DeliveryTests(unittest.TestCase):
                 result = run_delivery_cycle(options, 1)
             self.assertEqual(result["status"], "attention-required")
             self.assertFalse(result["commitResult"]["committed"])
+
+    def test_stale_delivery_lock_is_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            _init_project(root)
+            state = Path(tmp) / "state.json"
+            lock = state.with_suffix(state.suffix + ".lock")
+            lock.write_text(json.dumps({"pid": 99999999, "createdAt": "stale"}), encoding="utf-8")
+            options = DeliveryOptions(
+                root,
+                _WritingProvider("docs/safe.md"),
+                [tmp],
+                Path(tmp) / "reports",
+                state,
+                Path(tmp) / "queue.json",
+                True,
+            )
+            with patch("ai_team.core.delivery.discover_trusted_tasks", return_value=[]):
+                result = run_delivery_supervisor(options)
+            self.assertEqual(result["last"]["status"], "idle")
+            self.assertFalse(lock.exists())
+
+    def test_active_delivery_lock_blocks_second_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            _init_project(root)
+            state = Path(tmp) / "state.json"
+            lock = state.with_suffix(state.suffix + ".lock")
+            lock.write_text(json.dumps({"pid": os.getpid(), "createdAt": "active"}), encoding="utf-8")
+            options = DeliveryOptions(
+                root,
+                _WritingProvider("docs/safe.md"),
+                [tmp],
+                Path(tmp) / "reports",
+                state,
+                Path(tmp) / "queue.json",
+                True,
+            )
+            with self.assertRaises(RuntimeError):
+                run_delivery_supervisor(options)
 
 
 class _WritingProvider(BaseProvider):

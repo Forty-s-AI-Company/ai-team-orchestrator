@@ -240,6 +240,9 @@ def _safe_env() -> dict[str, str]:
 
 
 def _resolve_executable(executable: str) -> str | None:
+    explicit = Path(executable)
+    if explicit.is_absolute() and explicit.exists():
+        return str(explicit)
     if os.name == "nt" and not Path(executable).suffix:
         for suffix in (".cmd", ".exe", ".bat", ".ps1"):
             candidate = shutil.which(f"{executable}{suffix}")

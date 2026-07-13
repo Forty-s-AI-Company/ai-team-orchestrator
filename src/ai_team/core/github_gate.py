@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ai_team.core.git_policy import GitPolicyDecision, evaluate_git_action
+from ai_team.core.git_policy import evaluate_git_action
 from ai_team.core.project_loader import LoadedProject
 
 

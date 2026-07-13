@@ -223,6 +223,21 @@ def _acquire_lock(path: Path) -> None:
     try:
         descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError as exc:
+        existing = _read_json(path)
+        pid = existing.get("pid")
+        if isinstance(pid, int) and not _pid_exists(pid):
+            path.unlink(missing_ok=True)
+            return _acquire_lock(path)
         raise RuntimeError(f"delivery supervisor already running: {path}") from exc
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         json.dump({"pid": os.getpid(), "createdAt": datetime.now(UTC).isoformat()}, handle)
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True

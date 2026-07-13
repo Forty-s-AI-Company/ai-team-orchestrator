@@ -3,11 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
-
 import yaml
 
-from ai_team.core.project_loader import LoadedProject, ProjectConfigError
+from ai_team.core.project_loader import LoadedProject
 from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult, RetryingProvider
 
 

@@ -23,12 +23,15 @@ handsfreecode:
   default_runtime_provider: "ollama"
 
 codex:
-  # Prefer a bundled native binary; avoids broken npm sandbox-helper installations on Windows.
+  # Use exactly one bundled native binary. Do not silently fall back to npm,
+  # Desktop, or other Codex distributions because their sandbox helpers differ.
   executable: "auto-native"
   status_args: ["--version"]
   quota_args: []
   run_args: ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]
-  write_run_args: ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check"]
+  # Trusted writes are allowed only after the isolated executor creates a
+  # disposable linked worktree and applies allowed_write_paths + validation gates.
+  write_run_args: ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]
   timeout_seconds: 45
   run_timeout_seconds: 180
   execution_enabled: true

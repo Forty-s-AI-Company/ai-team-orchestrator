@@ -283,7 +283,7 @@ def _resolve_codex_executable(configured: str) -> str:
         extension_root.glob("openai.chatgpt-*/bin/windows-x86_64/codex.exe"),
         reverse=True,
     )
-    return str(candidates[0]) if candidates else "codex"
+    return str(candidates[0]) if candidates else "__codex_vscode_native_not_found__"
 
 
 def build_antigravity_provider(settings: dict) -> AntigravityProvider:

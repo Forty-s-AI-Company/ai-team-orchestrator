@@ -21,7 +21,7 @@ from ai_team.providers.antigravity import _compact_prompt
 
 
 class CliProviderTests(unittest.TestCase):
-    def test_codex_workspace_write_requires_linked_worktree_marker(self) -> None:
+    def test_codex_trusted_write_requires_linked_worktree_marker(self) -> None:
         provider = CodexProvider(
             CodexSettings(
                 executable=sys.executable,

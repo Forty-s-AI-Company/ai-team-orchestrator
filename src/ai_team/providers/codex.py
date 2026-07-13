@@ -16,7 +16,7 @@ class CodexSettings:
         default_factory=lambda: ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]
     )
     write_run_args: list[str] = field(
-        default_factory=lambda: ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check"]
+        default_factory=lambda: ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]
     )
     timeout_seconds: float = 45
     run_timeout_seconds: float = 180
@@ -48,14 +48,16 @@ class CodexProvider(BaseProvider):
 
     def run(self, request: ProviderRequest) -> ProviderResult:
         write_enabled = request.metadata.get("writeRequired") is True
-        if write_enabled and ".git" not in {part.lower() for part in request.project_root.parts}:
-            # Linked worktrees use a .git file at their root; the executor checks it again.
+        if write_enabled:
+            # Codex danger-full-access is only allowed inside disposable linked
+            # worktrees. Primary repositories have a .git directory; linked
+            # worktrees have a .git file pointing back to the source repo.
             git_marker = request.project_root / ".git"
             if not git_marker.is_file():
                 return ProviderResult(
                     provider=self.name,
                     success=False,
-                    content="workspace-write requires a disposable linked worktree",
+                    content="trusted write requires a disposable linked worktree",
                 )
         cli_settings = self.settings.to_cli_settings(write_enabled=write_enabled)
         cli_settings = replace(cli_settings, run_args=[*cli_settings.run_args, "-"])
