@@ -131,13 +131,30 @@ class EvidenceTests(unittest.TestCase):
                 loaded_project(root),
                 EvidencePolicy(include=("package.json", "tsconfig.json", ".github/workflows/*.yml")),
             )
+            self.assertIn(
+                "Copy detected package name and version exactly",
+                snapshot.prompt_section,
+            )
             passed = validate_analysis_grounding(
                 "sample-app 1.2.3 uses Node.js, Next.js, and TypeScript from package.json. Coverage is unknown.",
                 snapshot,
                 provider_success=True,
             )
+            negated_inference = validate_analysis_grounding(
+                "sample-app 1.2.3 uses Node.js, Next.js, and TypeScript from package.json. "
+                "No additional dependency is inferred from project structure. Coverage is unknown.",
+                snapshot,
+                provider_success=True,
+            )
+            unsupported_inference = validate_analysis_grounding(
+                "sample-app 1.2.3 uses Node.js, Next.js, and TypeScript from package.json. "
+                "Prettier is inferred from project structure. Coverage is unknown.",
+                snapshot,
+                provider_success=True,
+            )
             failed = validate_analysis_grounding(
                 "sample-app 1.2.3 uses Node.js, Next.js, TypeScript, requirements.txt, and 30% test coverage. "
+                "Prettier is not in evidence, but inferred from project structure. "
                 "Set up CI, update all dependencies, and add a database seeding script.\n"
                 "### Planned Changes\nAdd more comprehensive tests and update README instructions to deploy to Vercel. "
                 "The CI workflow ensures the codebase remains clean and functional.",
@@ -145,12 +162,18 @@ class EvidenceTests(unittest.TestCase):
                 provider_success=True,
             )
             self.assertEqual(passed["status"], "passed")
+            self.assertEqual(negated_inference["status"], "passed")
+            self.assertIn(
+                "inferred project claim is not evidence-backed",
+                unsupported_inference["unsupportedClaims"],
+            )
             self.assertEqual(failed["status"], "failed")
             for expected in (
                 "requirements.txt",
                 "coverage percentage",
                 "CI setup contradicts the included workflow evidence",
                 "dependency update recommendation lacks freshness evidence",
+                "inferred project claim is not evidence-backed",
                 "planned changes are not authorized by analysis evidence",
                 "test expansion recommendation lacks coverage evidence",
                 "CI outcome claimed without execution evidence",
