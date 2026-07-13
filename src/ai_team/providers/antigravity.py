@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -77,17 +79,55 @@ class AntigravityProvider(BaseProvider):
 
         challenge = uuid4().hex
         probe = _select_repository_probe(request.project_root) if request.workflow == "provider-smoke" else None
+        if request.workflow == "provider-smoke" and probe is None:
+            return ProviderResult(
+                provider=self.name,
+                success=False,
+                error_type=ProviderErrorType.INVALID_RESPONSE,
+                content="provider-smoke requires a tracked, non-symlink manifest probe",
+                data={
+                    "runMode": request.run_mode,
+                    "providerNative": True,
+                    "antigravityNativePass": False,
+                    "repositorySmokePassed": False,
+                    "masqueradeAsProvider": False,
+                },
+            )
+        if probe:
+            native_tmp = "/tmp" if os.name != "nt" else None
+            with tempfile.TemporaryDirectory(prefix="ai-team-antigravity-smoke-", dir=native_tmp) as tmp:
+                smoke_root = Path(tmp)
+                destination = smoke_root / probe[0]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes((request.project_root / probe[0]).read_bytes())
+                return self._execute(request, diagnostics, remaining, challenge, probe, smoke_root)
+        return self._execute(request, diagnostics, remaining, challenge, probe, request.project_root)
+
+    def _execute(
+        self,
+        request: ProviderRequest,
+        diagnostics: dict[str, Any],
+        remaining: float,
+        challenge: str,
+        probe: tuple[str, str] | None,
+        workspace_root: Path,
+    ) -> ProviderResult:
         prompt = _compact_prompt(
             request.prompt,
             self.settings.prompt_max_chars,
             challenge=challenge,
             probe_path=probe[0] if probe else None,
         )
-        compact_request = replace(request, prompt=prompt, timeout_seconds=remaining)
+        compact_request = replace(
+            request,
+            prompt=prompt,
+            project_root=workspace_root,
+            timeout_seconds=remaining,
+        )
         cli_settings = self.settings.to_cli_settings()
         cli_settings = replace(
             cli_settings,
-            run_args=_bounded_run_args(cli_settings.run_args, request.project_root, remaining),
+            run_args=_bounded_run_args(cli_settings.run_args, workspace_root, remaining),
             run_timeout_seconds=min(cli_settings.run_timeout_seconds, remaining),
         )
         command_result = cli_run_result(
@@ -159,7 +199,13 @@ def _select_repository_probe(project_root: Path) -> tuple[str, str] | None:
     tracked = {line.strip() for line in result.stdout.splitlines() if line.strip()} if result.returncode == 0 else set()
     for candidate in candidates:
         path = project_root / candidate
-        if candidate in tracked and path.is_file():
+        if candidate not in tracked or path.is_symlink() or not path.is_file():
+            continue
+        try:
+            path.resolve().relative_to(project_root.resolve())
+        except ValueError:
+            continue
+        if path.is_file():
             return candidate, hashlib.sha256(path.read_bytes()).hexdigest()
     return None
 
