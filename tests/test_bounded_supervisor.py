@@ -102,6 +102,65 @@ class ContinuousBoundedSupervisorTests(unittest.TestCase):
             self.assertEqual(result["stopReason"], "architect-requires-product-decision")
             self.assertEqual(published, [])
 
+    def test_transient_provider_failure_waits_and_retries_same_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            contract_path = _write_contract(contracts / "001-task.json", "task")
+            task_sha = load_trusted_task_contract(contract_path)[1]
+            attempts: list[str] = []
+            sleeps: list[float] = []
+            waiting_states: list[dict[str, object]] = []
+            state_path = root / "state.json"
+
+            def delivery(_options):
+                attempts.append(task_sha)
+                if len(attempts) == 1:
+                    return {
+                        "status": "attention-required",
+                        "stopReason": "provider-quota-exhausted",
+                        "taskSha": task_sha,
+                    }
+                return {
+                    "status": "completed",
+                    "taskSha": task_sha,
+                    "commitSha": "commit-task",
+                }
+
+            def sleep_and_capture(seconds: float) -> None:
+                sleeps.append(seconds)
+                waiting_states.append(json.loads(state_path.read_text(encoding="utf-8")))
+
+            times = iter((0.0, 0.0, 61.0))
+            result = run_continuous_bounded_delivery(
+                ContinuousBoundedOptions(
+                    project_path=root,
+                    contract_dir=contracts,
+                    provider_for_role=lambda _role: _NoopProvider(),
+                    workspace_allowlist=[tmp],
+                    report_dir=root / "reports",
+                    state_path=state_path,
+                    once=False,
+                    interval_minutes=1,
+                    max_runtime_minutes=1,
+                    github_execute=True,
+                    auto_merge=True,
+                    delivery_runner=delivery,
+                    publisher=lambda _options, _entry, _result: {"success": True},
+                    sleeper=sleep_and_capture,
+                    monotonic=lambda: next(times),
+                )
+            )
+
+            self.assertEqual(attempts, [task_sha, task_sha])
+            self.assertEqual(sleeps, [60])
+            self.assertEqual(waiting_states[0]["status"], "waiting-provider")
+            self.assertEqual(waiting_states[0]["stopReason"], "provider-quota-exhausted")
+            self.assertEqual(waiting_states[0]["nextAction"], "retry-after-provider-reset")
+            self.assertEqual(result["status"], "completed")
+            self.assertIn(task_sha, result["completedTaskShas"])
+
     def test_delivery_exception_is_recorded_without_escaping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

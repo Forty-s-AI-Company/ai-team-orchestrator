@@ -24,7 +24,11 @@ from ai_team.core.project_loader import load_project
 from ai_team.providers.base import BaseProvider, redact_secrets
 
 
-RECOVERABLE_STOP_REASONS = {"provider-quota-exhausted", "provider-timeout"}
+RECOVERABLE_STOP_REASONS = {
+    "provider-network-error",
+    "provider-quota-exhausted",
+    "provider-timeout",
+}
 MAX_CONTRACTS = 256
 MAX_CONTRACT_BYTES = 64_000
 MAX_TOTAL_CONTRACT_BYTES = 1_000_000

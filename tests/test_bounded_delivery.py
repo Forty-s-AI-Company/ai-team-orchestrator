@@ -318,6 +318,34 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertEqual(result["stopReason"], "provider-timeout")
             self.assertTrue((Path(tmp) / "reports" / "01-pm.json").exists())
 
+    def test_provider_network_failure_keeps_a_retryable_stop_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+            result = run_bounded_delivery(
+                _options(
+                    Path(tmp),
+                    root,
+                    contract_path,
+                    lambda _role: _NetworkProvider(),
+                    _successful_engineering_attempt,
+                )
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], "provider-network-error")
+            receipt = json.loads(
+                (Path(tmp) / "reports" / "01-pm.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(receipt["providerSuccess"])
+            self.assertFalse(receipt["validationResult"]["success"])
+            self.assertEqual(receipt["validationResult"]["kind"], "provider-execution")
+            self.assertEqual(
+                receipt["validationResult"]["stopReason"],
+                "provider-network-error",
+            )
+            self.assertEqual(receipt["stopReason"], "provider-network-error")
+
     def test_token_budget_policy_failure_receipt_is_not_stage_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -641,6 +669,9 @@ class _StageProvider(BaseProvider):
 
     def run(self, request: ProviderRequest) -> ProviderResult:
         stage = request.metadata["boundedStage"]
+        expected_for_stage = "antigravity" if stage in {"pm", "architect", "qa"} else "codex"
+        if request.metadata.get("requiredProvider") != expected_for_stage:
+            raise AssertionError("bounded stage did not bind its required provider")
         payload: dict[str, object] = {
             "schema": "ai-team-bounded-delivery/v1",
             "stage": stage,
@@ -901,6 +932,19 @@ class _TimeoutProvider(BaseProvider):
 
     def run(self, request: ProviderRequest) -> ProviderResult:
         return ProviderResult(provider="antigravity", success=False, error_type=ProviderErrorType.TIMEOUT, content="timeout")
+
+
+class _NetworkProvider(BaseProvider):
+    def ready(self) -> bool:
+        return True
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        return ProviderResult(
+            provider="antigravity",
+            success=False,
+            error_type=ProviderErrorType.NETWORK,
+            content="network unavailable",
+        )
 
 
 class _WritingQaProvider(_StageProvider):
