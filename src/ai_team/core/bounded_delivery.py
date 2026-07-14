@@ -19,7 +19,9 @@ from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderRequ
 SCHEMA = "ai-team-bounded-delivery/v1"
 FORBIDDEN_PATTERNS = (
     r"\b(?:database\s+)?migrat(?:e|ion|ions)\b",
-    r"\bseeds?\b",
+    r"\b(?:database\s+seeds?|seed(?:ing)?\s+(?:the\s+)?(?:data|database)|"
+    r"(?:run|apply|execute|load|populate)\s+(?:the\s+)?(?:database\s+)?seeds?|"
+    r"(?:npm|pnpm|yarn)\s+run\s+[\w:-]*seed[\w:-]*|prisma\s+db\s+seed)\b",
     r"\b(?:production\s+)?deploy(?:ment|ing)?\b",
     r"\b(?:real\s+)?payments?\b",
     r"\b(?:read|write|expose|rotate|copy)\s+(?:a\s+)?(?:secret|credential|token|api[ _-]?key)\b",
