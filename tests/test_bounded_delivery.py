@@ -249,6 +249,36 @@ class BoundedDeliveryTests(unittest.TestCase):
             with self.assertRaises(BoundedDeliveryError):
                 load_trusted_task_contract(path)
 
+    def test_task_contract_rejects_database_seed_actions(self) -> None:
+        for instruction in (
+            "run database seed",
+            "seed the database",
+            "npm run db:seed",
+            "prisma db seed",
+        ):
+            with self.subTest(instruction=instruction), tempfile.TemporaryDirectory() as tmp:
+                path = _write_contract(Path(tmp), "docs/safe.md", instruction=instruction)
+                with self.assertRaises(BoundedDeliveryError):
+                    load_trusted_task_contract(path)
+
+    def test_architect_allows_cryptographic_seed_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(
+                Path(tmp),
+                "docs/safe.md",
+                instruction="Document deterministic cryptographic seed material for tests",
+            )
+
+            def provider(role: str) -> BaseProvider:
+                return _CryptographicSeedArchitectProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "completed", result)
+
     def test_task_contract_rejects_path_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_contract(Path(tmp), "../.env")
@@ -318,6 +348,21 @@ class _MockSuccessProvider(_StageProvider):
     def run(self, request: ProviderRequest) -> ProviderResult:
         result = super().run(request)
         return ProviderResult(provider="mock", success=True, content=result.content, data=result.data)
+
+
+class _CryptographicSeedArchitectProvider(_StageProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "architect":
+            return result
+        payload = json.loads(result.content)
+        payload["plan"] = ["Document deterministic cryptographic seed material used only by tests"]
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
+        )
 
 
 class _ArchitectWithoutCodexProvider(_StageProvider):
