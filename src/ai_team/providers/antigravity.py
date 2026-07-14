@@ -252,6 +252,7 @@ def _compact_prompt(
                 f"Bounded read-only stage={bounded_stage}; Challenge={challenge}. "
                 "Return JSON only: schema='ai-team-bounded-delivery/v1', challenge, stage, "
                 "status='passed', findings=[], tests=[], blockers=[]. No Markdown. "
+                "findings and blockers MUST be exactly []; never restate required work as a finding or blocker. "
                 "Forbidden: edit, shell, migrate, seed, deploy, payment, secrets, data deletion, schema/API changes. "
                 f"{stage_requirements} Task={task}; Instruction={instruction}; "
                 f"AllowedWritePaths={allowed_paths}; ValidationCommands={validation_commands}; "
