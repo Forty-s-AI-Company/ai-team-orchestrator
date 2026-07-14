@@ -65,6 +65,9 @@ antigravity:
   # the provider still enforces a hard 1,600-character cap.
   prompt_max_chars: 1600
   diagnostics_cache_ttl_seconds: 30
+  # All bounded Antigravity PM/architect/QA/review stages run with the repo
+  # read-only. The CLI may persist only ephemeral state under /tmp.
+  read_only_sandbox_executable: "/usr/bin/bwrap"
   # Exact account-visible names returned by `agy models` in WSL.
   allowed_models:
     - "Gemini 3.5 Flash (Low)"

@@ -19,7 +19,7 @@ from ai_team.providers import (
     WriteSmokeProvider,
 )
 from ai_team.providers.cli_common import CliProviderSettings, run_cli_command
-from ai_team.providers.antigravity import _compact_prompt
+from ai_team.providers.antigravity import _compact_prompt, _read_only_sandbox_settings
 from ai_team.providers.antigravity import _apply_routing_options as apply_antigravity_routing
 from ai_team.providers.codex import _apply_routing_options as apply_codex_routing
 from ai_team.providers.codex import _extract_token_usage
@@ -101,6 +101,71 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("stage=qa", prompt)
         self.assertIn("Forbidden: edit, shell", prompt)
         self.assertIn("Challenge=challenge-1", prompt)
+
+    def test_antigravity_bounded_stage_requires_read_only_filesystem_sandbox(self) -> None:
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "print('must-not-run')"],
+                execution_enabled=True,
+            )
+        )
+
+        result = provider.run(
+            ProviderRequest(
+                workflow="bounded-delivery-qa",
+                prompt="Task: inspect only",
+                project_root=Path.cwd(),
+                run_mode="run-agent",
+                metadata={"boundedStage": "qa", "writeAccess": False},
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
+        self.assertIn("read-only filesystem sandbox", result.content)
+
+    def test_antigravity_read_only_sandbox_mounts_root_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = Path(tmp) / "bwrap"
+            sandbox.write_text("test", encoding="utf-8")
+            sandbox.chmod(0o700)
+            settings = CliProviderSettings(
+                executable="/opt/agy",
+                run_args=["--mode", "plan", "--sandbox", "--print"],
+            )
+
+            wrapped = _read_only_sandbox_settings(settings, str(sandbox), Path("/workspace"))
+
+        self.assertIsNotNone(wrapped)
+        assert wrapped is not None
+        self.assertEqual(wrapped.executable, str(sandbox))
+        self.assertEqual(
+            wrapped.run_args,
+            [
+                "--die-with-parent",
+                "--new-session",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev-bind",
+                "/dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/tmp",
+                "--chdir",
+                "/workspace",
+                "/opt/agy",
+                "--mode",
+                "plan",
+                "--sandbox",
+                "--print",
+            ],
+        )
 
     def test_antigravity_bounded_qa_prompt_keeps_evidence_json_valid(self) -> None:
         evidence = json.dumps(
