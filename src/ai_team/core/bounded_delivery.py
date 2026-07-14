@@ -32,6 +32,7 @@ FORBIDDEN_PATTERNS = (
 )
 ROLE_BY_STAGE = {"pm": "product-manager", "architect": "architect", "engineer": "engineer", "qa": "delivery-qa", "review": "reviewer"}
 SECONDARY_PROVIDER_BY_STAGE = {"architect": "codex", "qa": "codex", "review": "antigravity"}
+RECEIPT_FILE_PATTERN = re.compile(r"^(\d+)-(pm|architect|engineer|qa|review)\.json$")
 
 
 class BoundedDeliveryError(ValueError):
@@ -122,18 +123,28 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
     project = load_project(options.project_path, allowlist=options.workspace_allowlist)
     _validate_contract_validation_commands(project, contract)
     prior = _read_json(options.state_path)
-    if prior.get("status") == "completed" and prior.get("taskSha") == task_sha:
-        return {"status": "already-completed", "taskSha": task_sha, "statePath": str(options.state_path)}
-    prior_receipts = prior.get("receipts") if isinstance(prior.get("receipts"), list) else []
     context: dict[str, Any] = {
         "task": asdict(contract),
         "taskSha": task_sha,
-        # Preserve prior redacted evidence when an attention-required task is
-        # deliberately retried; receipt names continue rather than overwrite.
-        "receipts": [item for item in prior_receipts if isinstance(item, str)],
+        "receipts": [],
         "tokenUsage": 0,
         "resumedFrom": prior.get("status"),
     }
+    try:
+        context["receipts"] = _recover_receipt_paths(
+            options.report_dir,
+            task_sha,
+            prior.get("receipts"),
+        )
+    except BoundedDeliveryError as exc:
+        return _stop(options, context, str(exc), "receipt-integrity")
+    if prior.get("status") == "completed" and prior.get("taskSha") == task_sha:
+        return {
+            "status": "already-completed",
+            "taskSha": task_sha,
+            "receipts": context["receipts"],
+            "statePath": str(options.state_path),
+        }
     _write_state(options, "running", "pm", context)
     try:
         pm = _run_stage(options, project.root, "pm", context, contract)
@@ -495,8 +506,54 @@ def _write_receipt(options: BoundedDeliveryOptions, context: dict[str, Any], sta
         "evidence": evidence,
         "secondaryReview": result.data.get("secondaryReview"),
     })
-    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, default=str)
+    except FileExistsError as exc:
+        raise BoundedDeliveryError("receipt-sequence-collision") from exc
     context["receipts"].append(str(path))
+
+
+def _recover_receipt_paths(report_dir: Path, task_sha: str, state_receipts: Any) -> list[str]:
+    if state_receipts is not None and (
+        not isinstance(state_receipts, list)
+        or not all(isinstance(item, str) and item for item in state_receipts)
+    ):
+        raise BoundedDeliveryError("receipt-state-invalid")
+    root = report_dir.resolve()
+    for item in state_receipts or []:
+        path = Path(item).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise BoundedDeliveryError("receipt-path-outside-report-dir") from exc
+        if not path.is_file():
+            raise BoundedDeliveryError("receipt-referenced-by-state-is-missing")
+    if not report_dir.exists():
+        return []
+    indexed: list[tuple[int, Path, str]] = []
+    for path in report_dir.glob("*.json"):
+        match = RECEIPT_FILE_PATTERN.fullmatch(path.name)
+        if match is None:
+            raise BoundedDeliveryError("receipt-file-name-invalid")
+        indexed.append((int(match.group(1)), path.resolve(), match.group(2)))
+    indexed.sort(key=lambda item: item[0])
+    if [item[0] for item in indexed] != list(range(1, len(indexed) + 1)):
+        raise BoundedDeliveryError("receipt-sequence-gap")
+    recovered: list[str] = []
+    for _index, path, stage in indexed:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise BoundedDeliveryError("receipt-file-invalid") from exc
+        if not isinstance(payload, dict) or payload.get("schemaVersion") != 1:
+            raise BoundedDeliveryError("receipt-file-invalid")
+        if payload.get("stage") != stage or payload.get("outerRunMode") != "bounded-delivery":
+            raise BoundedDeliveryError("receipt-file-invalid")
+        if payload.get("taskSha") != task_sha or payload.get("inputTaskSha") != task_sha:
+            raise BoundedDeliveryError("receipt-task-sha-mismatch")
+        recovered.append(str(path))
+    return recovered
 
 
 def _add_tokens(options: BoundedDeliveryOptions, context: dict[str, Any], result: ProviderResult) -> bool:

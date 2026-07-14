@@ -526,6 +526,59 @@ class BoundedDeliveryTests(unittest.TestCase):
             second = run_bounded_delivery(options)
             self.assertEqual(second["receipts"], [str(Path(tmp) / "reports" / "01-pm.json"), str(Path(tmp) / "reports" / "02-pm.json")])
 
+    def test_restart_recovers_receipt_written_after_the_last_state_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+            options = _options(
+                Path(tmp),
+                root,
+                contract_path,
+                lambda _role: _TimeoutProvider(),
+                _successful_engineering_attempt,
+            )
+            first = run_bounded_delivery(options)
+            self.assertEqual(first["status"], "attention-required")
+            orphan_path = Path(tmp) / "reports" / "02-pm.json"
+            orphan_payload = json.loads((Path(tmp) / "reports" / "01-pm.json").read_text(encoding="utf-8"))
+            orphan_payload["generatedAt"] = "interrupted-but-complete-receipt"
+            orphan_path.write_text(json.dumps(orphan_payload), encoding="utf-8")
+            orphan_before = orphan_path.read_bytes()
+
+            second = run_bounded_delivery(options)
+
+            self.assertEqual(second["status"], "attention-required")
+            self.assertEqual(
+                [Path(path).name for path in second["receipts"]],
+                ["01-pm.json", "02-pm.json", "03-pm.json"],
+            )
+            self.assertEqual(orphan_path.read_bytes(), orphan_before)
+
+    def test_restart_fails_closed_when_an_existing_receipt_belongs_to_another_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+            options = _options(
+                Path(tmp),
+                root,
+                contract_path,
+                lambda _role: _TimeoutProvider(),
+                _successful_engineering_attempt,
+            )
+            first = run_bounded_delivery(options)
+            self.assertEqual(first["status"], "attention-required")
+            receipt_path = Path(tmp) / "reports" / "01-pm.json"
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            payload["taskSha"] = "0" * 64
+            receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            second = run_bounded_delivery(options)
+
+            self.assertEqual(second["status"], "attention-required")
+            self.assertEqual(second["stopReason"], "receipt-task-sha-mismatch")
+            self.assertEqual(json.loads(options.state_path.read_text(encoding="utf-8"))["stage"], "receipt-integrity")
+            self.assertFalse((Path(tmp) / "reports" / "02-pm.json").exists())
+
     def test_task_contract_rejects_prohibited_actions_before_a_provider_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_contract(Path(tmp), "docs/safe.md", instruction="run a database migration")
