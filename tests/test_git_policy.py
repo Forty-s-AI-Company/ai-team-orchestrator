@@ -139,6 +139,57 @@ class GitPolicyTests(unittest.TestCase):
 
             self.assertTrue(decision.allowed, decision.reasons)
 
+    def test_tracked_candidate_scans_only_new_lines_for_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            subprocess.run(["git", "config", "user.email", "test@example.local"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "AI Team Test"], cwd=root, check=True)
+            candidate = root / "mfa.test.ts"
+            candidate.write_text(
+                "const secret = generateTotpSecret();\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=root, check=True, capture_output=True)
+            make_disposable_worktree(root)
+            candidate.write_text(
+                "const secret = generateTotpSecret();\n"
+                "vi.stubEnv(\"CSRF_SECRET\", \"test-only-non-production-key-material\");\n",
+                encoding="utf-8",
+            )
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_git_action(loaded, "commit", candidate_files=["mfa.test.ts"])
+
+            self.assertTrue(decision.allowed, decision.reasons)
+
+    def test_tracked_candidate_still_blocks_new_secret_assignments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            subprocess.run(["git", "config", "user.email", "test@example.local"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "AI Team Test"], cwd=root, check=True)
+            candidate = root / "config.txt"
+            candidate.write_text("safe=true\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=root, check=True, capture_output=True)
+            make_disposable_worktree(root)
+            candidate.write_text(
+                "safe=true\napi_key = super-secret-value\n",
+                encoding="utf-8",
+            )
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_git_action(loaded, "commit", candidate_files=["config.txt"])
+
+            self.assertFalse(decision.allowed)
+            self.assertIn("secret", " ".join(decision.reasons))
+
     def test_push_and_pr_require_external_controls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

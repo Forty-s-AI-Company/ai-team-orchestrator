@@ -146,9 +146,14 @@ def inspect_candidate_files(project_root: Path, candidate_files: list[str | Path
         if _is_ignored(project_root, relative):
             reasons.append(f"ignored file is blocked: {relative}")
             continue
-        if target.exists() and target.is_file() and _contains_secret(target):
-            reasons.append(f"candidate appears to contain a secret: {relative}")
-            continue
+        if target.exists() and target.is_file():
+            secret_check = _contains_candidate_secret(project_root, relative, target)
+            if secret_check is None:
+                reasons.append(f"candidate secret scan failed: {relative}")
+                continue
+            if secret_check:
+                reasons.append(f"candidate appears to contain a secret: {relative}")
+                continue
         inspected.append(str(relative))
     return {
         "blocked": bool(reasons),
@@ -169,9 +174,34 @@ def _is_ignored(project_root: Path, relative: Path) -> bool:
     return result.returncode == 0
 
 
-def _contains_secret(path: Path) -> bool:
-    try:
-        data = path.read_bytes()[:1_000_000]
-    except OSError:
-        return False
+def _contains_candidate_secret(project_root: Path, relative: Path, path: Path) -> bool | None:
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", str(relative)],
+        cwd=project_root,
+        check=False,
+        capture_output=True,
+        timeout=10,
+    )
+    if tracked.returncode == 0:
+        diff = subprocess.run(
+            ["git", "diff", "HEAD", "--no-ext-diff", "--unified=0", "--", str(relative)],
+            cwd=project_root,
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+        if diff.returncode != 0:
+            return None
+        data = b"\n".join(
+            line[1:]
+            for line in diff.stdout.splitlines()
+            if line.startswith(b"+") and not line.startswith(b"+++")
+        )[:1_000_000]
+    elif tracked.returncode == 1:
+        try:
+            data = path.read_bytes()[:1_000_000]
+        except OSError:
+            return None
+    else:
+        return None
     return any(pattern.search(data) for pattern in SECRET_PATTERNS)
