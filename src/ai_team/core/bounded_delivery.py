@@ -158,9 +158,9 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             if not _add_tokens(options, context, attempt.provider_result) and failure is None:
                 failure = ("token-budget-exhausted", "engineer", "policy-validation")
             _record_engineering_receipt(options, context, attempt, iteration, failure)
-            if failure is not None:
-                reason, stage, _kind = failure
-                return _stop(options, context, reason, stage)
+            # Retain the disposable worktree and validation evidence even when
+            # this attempt fails. A bounded repair can then reuse the exact
+            # worktree, while an attention-required state remains actionable.
             context.update({
                 "worktreePath": str(attempt.worktree_path),
                 "commitSha": attempt.commit_sha,
@@ -169,6 +169,15 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 "runReceipt": str(attempt.run_receipt) if attempt.run_receipt else None,
                 "executorReceipt": str(attempt.executor_receipt) if attempt.executor_receipt else None,
             })
+            if failure is not None:
+                reason, stage, _kind = failure
+                if _is_repairable_validation_failure(failure, attempt, tuple(context["planAllowedWritePaths"])):
+                    if len(repairs) >= options.limits.max_repair_attempts:
+                        return _stop(options, context, "max-repair-attempts-reached", "validation")
+                    repairs.append(_validation_repair_evidence(attempt))
+                    context["repairs"] = repairs
+                    continue
+                return _stop(options, context, reason, stage)
 
             qa = _run_stage(options, attempt.worktree_path, "qa", context, contract)
             review = _run_stage(options, attempt.worktree_path, "review", context, contract)
@@ -380,6 +389,10 @@ def _engineering_failure(
 ) -> tuple[str, str, str] | None:
     if not _native_success(attempt.provider_result, "codex"):
         return _provider_stop_reason(attempt.provider_result), "engineer", "provider-execution"
+    # Scope is a hard policy boundary. Check it before considering a failed
+    # validation repair so out-of-scope writes can never enter the repair loop.
+    if not _paths_within(attempt.changed_files, allowed_write_paths):
+        return "engineering-diff-outside-allowed-paths", "engineer", "policy-validation"
     if not attempt.validation.get("success"):
         kind = attempt.validation.get("kind")
         reason = attempt.validation.get("stopReason")
@@ -389,9 +402,50 @@ def _engineering_failure(
         return "deterministic-validation-failed", "validation", "deterministic-validation"
     if not attempt.commit_sha:
         return "engineering-commit-missing", "engineer", "commit-validation"
-    if not _paths_within(attempt.changed_files, allowed_write_paths):
-        return "engineering-diff-outside-allowed-paths", "engineer", "policy-validation"
     return None
+
+
+def _is_repairable_validation_failure(
+    failure: tuple[str, str, str],
+    attempt: EngineeringAttempt,
+    allowed_write_paths: tuple[str, ...],
+) -> bool:
+    _reason, stage, kind = failure
+    return (
+        stage == "validation"
+        and kind == "deterministic-validation"
+        and bool(attempt.changed_files)
+        and _paths_within(attempt.changed_files, allowed_write_paths)
+    )
+
+
+def _validation_repair_evidence(attempt: EngineeringAttempt) -> dict[str, Any]:
+    failed_commands: list[dict[str, Any]] = []
+    commands = attempt.validation.get("commands")
+    if isinstance(commands, list):
+        for item in commands:
+            if not isinstance(item, dict) or item.get("returnCode") == 0:
+                continue
+            failed_commands.append({
+                "command": str(redact_secrets(item.get("command", "")))[:500],
+                "returnCode": item.get("returnCode"),
+                # Keep the useful tail (compiler and test summaries usually
+                # appear last), but never pass unbounded output back to a model.
+                "stdout": str(redact_secrets(item.get("stdout", "")))[-2000:],
+                "stderr": str(redact_secrets(item.get("stderr", "")))[-2000:],
+            })
+            if len(failed_commands) >= 4:
+                break
+    evidence = {
+        "kind": "deterministic-validation",
+        "changedFiles": attempt.changed_files,
+        "failedCommands": failed_commands,
+    }
+    return {
+        "kind": "deterministic-validation",
+        "findingSha": _sha(evidence),
+        "evidence": evidence,
+    }
 
 
 def _record_engineering_receipt(
