@@ -12,7 +12,10 @@ from ai_team.core.project_loader import LoadedProject
 SECRET_PATTERNS = [
     re.compile(rb"sk-[A-Za-z0-9_\-]{10,}"),
     re.compile(rb"(?i)Bearer\s+[A-Za-z0-9_\-.]+"),
-    re.compile(rb"(?i)(api[_-]?key|token|secret|password|hash[_-]?key|hash[_-]?iv)\s*[:=]\s*([^\s,;]+)"),
+    re.compile(
+        rb"(?i)(api[_-]?key|token|secret|password|hash[_-]?key|hash[_-]?iv)\s*[:=]\s*"
+        rb"(?!(?:string|number|boolean|unknown|never|any|object|bigint|symbol)\b)([^\s,;]+)"
+    ),
 ]
 
 RUNTIME_ARTIFACT_MARKERS = {
