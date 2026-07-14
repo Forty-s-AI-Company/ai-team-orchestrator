@@ -75,8 +75,6 @@ antigravity:
     - "Gemini 3.5 Flash (High)"
     - "Gemini 3.1 Pro (Low)"
     - "Gemini 3.1 Pro (High)"
-    - "Claude Sonnet 4.6 (Thinking)"
-    - "Claude Opus 4.6 (Thinking)"
     - "GPT-OSS 120B (Medium)"
   allowed_reasoning_efforts: ["low", "medium", "high", "thinking"]
 
@@ -123,14 +121,11 @@ routing:
         provider: codex
         model: "gpt-5.6-sol"
         reasoning_effort: xhigh
-      fallbacks:
-        - provider: antigravity
-          model: "Claude Sonnet 4.6 (Thinking)"
-          reasoning_effort: thinking
+      fallbacks: []
       secondary:
         provider: antigravity
-        model: "Claude Sonnet 4.6 (Thinking)"
-        reasoning_effort: thinking
+        model: "Gemini 3.1 Pro (High)"
+        reasoning_effort: high
       allow_write: false
 
     qa-engineer:
@@ -142,14 +137,17 @@ routing:
       allow_write: false
       allow_read_only_agent: true
 
-    # Bounded delivery QA is intentionally separate from the lightweight
-    # local project analyst: it requires a provider-native Antigravity review.
+    # Bounded delivery QA requires two independent provider-native reviews.
     delivery-qa:
       primary:
         provider: antigravity
-        model: "Claude Sonnet 4.6 (Thinking)"
-        reasoning_effort: thinking
+        model: "Gemini 3.1 Pro (High)"
+        reasoning_effort: high
       fallbacks: []
+      secondary:
+        provider: codex
+        model: "gpt-5.6-sol"
+        reasoning_effort: xhigh
       allow_write: false
 
     project-analyst:

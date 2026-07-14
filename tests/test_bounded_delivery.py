@@ -128,6 +128,39 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertEqual(result["stopReason"], "architect-codex-read-only-review-failed")
             self.assertTrue((Path(tmp) / "reports" / "02-architect.json").exists())
 
+    def test_qa_requires_a_structured_codex_second_opinion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _QaWithoutCodexProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], "qa-codex-read-only-review-failed")
+            qa_receipt = json.loads((Path(tmp) / "reports" / "04-qa.json").read_text())
+            self.assertFalse(qa_receipt["validationResult"]["success"])
+
+    def test_secondary_qa_findings_enter_the_repair_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _QaSecondaryFindingProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], "max-repair-attempts-reached")
+            self.assertEqual(len(result["repairs"]), 1)
+
     def test_retry_preserves_prior_receipts_after_an_attention_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -180,12 +213,17 @@ class _StageProvider(BaseProvider):
             })
         expected_provider = "antigravity" if self.role in {"product-manager", "architect", "delivery-qa"} else "codex"
         data: dict[str, object] = {"tokenUsage": 10, "selectedModel": "fake-model", "reasoningEffort": "high"}
-        if stage == "architect":
+        secondary_provider = {
+            "architect": "codex",
+            "qa": "codex",
+            "review": "antigravity",
+        }.get(stage)
+        if secondary_provider is not None:
             data["secondaryReview"] = {
-                "provider": "codex",
+                "provider": secondary_provider,
                 "success": True,
                 "content": json.dumps({
-                    "schema": "ai-team-bounded-delivery/v1", "stage": "architect", "status": "passed",
+                    "schema": "ai-team-bounded-delivery/v1", "stage": stage, "status": "passed",
                     "findings": [], "tests": ["independent review"], "blockers": [],
                 }),
             }
@@ -207,6 +245,45 @@ class _ArchitectWithoutCodexProvider(_StageProvider):
         if request.metadata["boundedStage"] != "architect":
             return result
         return ProviderResult(provider=result.provider, success=True, content=result.content, data={**result.data, "secondaryReview": None})
+
+
+class _QaWithoutCodexProvider(_StageProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "qa":
+            return result
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=result.content,
+            data={**result.data, "secondaryReview": None},
+        )
+
+
+class _QaSecondaryFindingProvider(_StageProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "qa":
+            return result
+        secondary = {
+            **result.data["secondaryReview"],
+            "content": json.dumps(
+                {
+                    "schema": "ai-team-bounded-delivery/v1",
+                    "stage": "qa",
+                    "status": "passed",
+                    "findings": [{"path": "docs/safe.md", "message": "secondary QA finding"}],
+                    "tests": ["independent review"],
+                    "blockers": [],
+                }
+            ),
+        }
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=result.content,
+            data={**result.data, "secondaryReview": secondary},
+        )
 
 
 class _TimeoutProvider(BaseProvider):

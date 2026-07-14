@@ -29,6 +29,7 @@ FORBIDDEN_PATTERNS = (
     r"\b(?:prisma\s+db\s+push|drizzle(?:-kit)?\s+push|git\s+push|gh\s+(?:pr|api))\b",
 )
 ROLE_BY_STAGE = {"pm": "product-manager", "architect": "architect", "engineer": "engineer", "qa": "delivery-qa", "review": "reviewer"}
+SECONDARY_PROVIDER_BY_STAGE = {"architect": "codex", "qa": "codex", "review": "antigravity"}
 
 
 class BoundedDeliveryError(ValueError):
@@ -216,13 +217,53 @@ def _run_stage(options: BoundedDeliveryOptions, root: Path, stage: str, context:
     if payload.get("status") != "passed" or not isinstance(payload.get("findings"), list):
         _write_receipt(options, context, stage, result, {"validationError": f"{stage} did not provide a passed, structured result"})
         raise BoundedDeliveryError(f"{stage} did not provide a passed, structured result")
+    try:
+        _reject_forbidden(json.dumps(payload, ensure_ascii=False), f"{stage} output")
+        expected_secondary = SECONDARY_PROVIDER_BY_STAGE.get(stage)
+        secondary_payload: dict[str, Any] | None = None
+        if expected_secondary is not None:
+            failure_prefix = f"{stage}-{expected_secondary}-read-only-review"
+            secondary = result.data.get("secondaryReview")
+            if (
+                not isinstance(secondary, dict)
+                or secondary.get("success") is not True
+                or secondary.get("provider") != expected_secondary
+            ):
+                raise BoundedDeliveryError(f"{failure_prefix}-failed")
+            secondary_payload = _validate_secondary_review(
+                secondary,
+                stage,
+                expected_secondary,
+            )
+        if secondary_payload is not None:
+            if secondary_payload["blockers"]:
+                raise BoundedDeliveryError(
+                    f"{stage}-{expected_secondary}-read-only-review-has-blockers"
+                )
+            if stage == "architect" and secondary_payload["findings"]:
+                raise BoundedDeliveryError(
+                    "architect-codex-read-only-review-has-findings"
+                )
+            if stage in {"qa", "review"}:
+                payload = {
+                    **payload,
+                    "findings": [*payload["findings"], *secondary_payload["findings"]],
+                    "tests": [*payload.get("tests", []), *secondary_payload["tests"]],
+                }
+    except BoundedDeliveryError as exc:
+        _write_receipt(
+            options,
+            context,
+            stage,
+            result,
+            {
+                "validationError": str(exc),
+                "validation": {"success": False, "kind": "secondary-provider-output"},
+                "primaryResult": payload,
+            },
+        )
+        raise
     _write_receipt(options, context, stage, result, payload)
-    _reject_forbidden(json.dumps(payload, ensure_ascii=False), f"{stage} output")
-    if stage == "architect":
-        secondary = result.data.get("secondaryReview")
-        if not isinstance(secondary, dict) or secondary.get("success") is not True or secondary.get("provider") != "codex":
-            raise BoundedDeliveryError("architect-codex-read-only-review-failed")
-        _validate_secondary_review(secondary, stage)
     _add_tokens(options, context, result)
     return payload
 
@@ -403,19 +444,33 @@ def _validate_allowed_write_paths(paths: tuple[str, ...]) -> None:
             raise BoundedDeliveryError("allowedWritePaths contains a sensitive path")
 
 
-def _validate_secondary_review(secondary: dict[str, Any], stage: str) -> None:
+def _validate_secondary_review(
+    secondary: dict[str, Any],
+    stage: str,
+    provider: str,
+) -> dict[str, Any]:
+    failure_prefix = f"{stage}-{provider}-read-only-review"
     content = secondary.get("content")
     if not isinstance(content, str):
-        raise BoundedDeliveryError("architect-codex-read-only-review-content-missing")
+        raise BoundedDeliveryError(f"{failure_prefix}-content-missing")
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise BoundedDeliveryError("architect-codex-read-only-review-is-not-structured") from exc
+        raise BoundedDeliveryError(f"{failure_prefix}-is-not-structured") from exc
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA or payload.get("stage") != stage:
-        raise BoundedDeliveryError("architect-codex-read-only-review-schema-invalid")
-    if payload.get("status") != "passed" or not isinstance(payload.get("findings"), list):
-        raise BoundedDeliveryError("architect-codex-read-only-review-not-approved")
-    _reject_forbidden(json.dumps(payload, ensure_ascii=False), "architect Codex review")
+        raise BoundedDeliveryError(f"{failure_prefix}-schema-invalid")
+    if (
+        payload.get("status") != "passed"
+        or not isinstance(payload.get("findings"), list)
+        or not isinstance(payload.get("tests"), list)
+        or not isinstance(payload.get("blockers"), list)
+    ):
+        raise BoundedDeliveryError(f"{failure_prefix}-not-approved")
+    _reject_forbidden(
+        json.dumps(payload, ensure_ascii=False),
+        f"{stage} {provider} review",
+    )
+    return payload
 
 
 def _findings(payload: dict[str, Any]) -> list[dict[str, str]]:

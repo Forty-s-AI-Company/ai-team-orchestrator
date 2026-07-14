@@ -102,6 +102,18 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("Forbidden: edit, shell", prompt)
         self.assertIn("Challenge=challenge-1", prompt)
 
+    def test_antigravity_bounded_review_uses_delivery_schema(self) -> None:
+        prompt = _compact_prompt(
+            "Task: Review a bounded diff\nInstruction: Inspect only",
+            1200,
+            challenge="challenge-review",
+            bounded_stage="review",
+        )
+
+        self.assertIn("schema='ai-team-bounded-delivery/v1'", prompt)
+        self.assertIn("stage=review", prompt)
+        self.assertIn("evidence-backed diff findings", prompt)
+
     def test_antigravity_bounded_stage_requires_read_only_filesystem_sandbox(self) -> None:
         provider = AntigravityProvider(
             AntigravitySettings(
