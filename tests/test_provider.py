@@ -196,6 +196,25 @@ class ProviderTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.attempts, 3)
 
+    def test_rate_limit_is_returned_without_immediate_retries(self) -> None:
+        provider = RetryingProvider(
+            MockProvider(fail_times=5, error_type=ProviderErrorType.RATE_LIMIT),
+            max_retries=2,
+            backoff_seconds=0,
+        )
+
+        result = provider.run(
+            ProviderRequest(
+                workflow="bounded-delivery-engineer",
+                prompt="hello",
+                project_root=Path.cwd(),
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.RATE_LIMIT)
+        self.assertEqual(result.attempts, 1)
+
     def test_secret_redaction(self) -> None:
         sample = "SESSION_API_KEY" + "=supersecret " + "Bearer " + "abc.def.ghi " + "sk-" + "test123456789"
         redacted = redact_secrets(sample)
