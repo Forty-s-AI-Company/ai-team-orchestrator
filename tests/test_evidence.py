@@ -132,7 +132,15 @@ class EvidenceTests(unittest.TestCase):
                 EvidencePolicy(include=("package.json", "tsconfig.json", ".github/workflows/*.yml")),
             )
             self.assertIn(
-                "Copy detected package name and version exactly",
+                "copy the required package name and version exactly",
+                snapshot.prompt_section,
+            )
+            self.assertIn(
+                'Required package metadata: {"name": "sample-app", "version": "1.2.3"}',
+                snapshot.prompt_section,
+            )
+            self.assertIn(
+                'Detected technology version specifications: {"Next.js": "1", "Node.js": null, "TypeScript": "1"}',
                 snapshot.prompt_section,
             )
             passed = validate_analysis_grounding(
@@ -152,6 +160,19 @@ class EvidenceTests(unittest.TestCase):
                 snapshot,
                 provider_success=True,
             )
+            unsupported_version = validate_analysis_grounding(
+                "sample-app 1.2.3 uses Node.js, Next.js, and TypeScript from package.json. "
+                "Node.js: Version 16.2.10. Next.js: Version 1. TypeScript: Version 1. "
+                "Coverage is unknown.",
+                snapshot,
+                provider_success=True,
+            )
+            unsupported_ranged_version = validate_analysis_grounding(
+                "sample-app 1.2.3 uses Node.js, Next.js, and TypeScript from package.json. "
+                "Next.js: Version 1. TypeScript: Version ^6. Coverage is unknown.",
+                snapshot,
+                provider_success=True,
+            )
             failed = validate_analysis_grounding(
                 "sample-app 1.2.3 uses Node.js, Next.js, TypeScript, requirements.txt, and 30% test coverage. "
                 "Prettier is not in evidence, but inferred from project structure. "
@@ -166,6 +187,22 @@ class EvidenceTests(unittest.TestCase):
             self.assertIn(
                 "inferred project claim is not evidence-backed",
                 unsupported_inference["unsupportedClaims"],
+            )
+            self.assertIn(
+                "Node.js version claim lacks matching evidence",
+                unsupported_version["unsupportedClaims"],
+            )
+            self.assertNotIn(
+                "Next.js version claim lacks matching evidence",
+                unsupported_version["unsupportedClaims"],
+            )
+            self.assertNotIn(
+                "TypeScript version claim lacks matching evidence",
+                unsupported_version["unsupportedClaims"],
+            )
+            self.assertIn(
+                "TypeScript version claim lacks matching evidence",
+                unsupported_ranged_version["unsupportedClaims"],
             )
             self.assertEqual(failed["status"], "failed")
             for expected in (
@@ -194,6 +231,21 @@ class EvidenceTests(unittest.TestCase):
                 missing_package["missingExpectedFacts"],
                 ["packageName", "packageVersion"],
             )
+
+    def test_technology_version_facts_reject_unsafe_package_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                '{"dependencies":{"next":"https://user:credential@example.invalid/next.tgz"},'
+                '"devDependencies":{"typescript":"^5"}}',
+                encoding="utf-8",
+            )
+            snapshot = collect_project_evidence(
+                loaded_project(root),
+                EvidencePolicy(include=("package.json",)),
+            )
+            self.assertIsNone(snapshot.facts["technologyVersionSpecifications"]["Next.js"])
+            self.assertEqual(snapshot.facts["technologyVersionSpecifications"]["TypeScript"], "^5")
 
     def test_policy_blockers_and_not_run_commands_are_not_recommendations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
