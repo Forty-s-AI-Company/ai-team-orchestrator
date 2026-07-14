@@ -78,6 +78,52 @@ class BoundedDeliveryTests(unittest.TestCase):
                 stop_reason=reason,
             )
 
+    def test_primary_stage_blockers_are_never_stage_success(self) -> None:
+        receipt_number = {"pm": 1, "architect": 2, "qa": 4, "review": 5}
+        for stage in receipt_number:
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                root = _init_project(Path(tmp) / "project")
+                contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+                def provider(role: str) -> BaseProvider:
+                    return _PrimaryStageBlockerProvider(role, stage)
+
+                result = run_bounded_delivery(
+                    _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+                )
+
+                reason = f"{stage} returned blockers"
+                self.assertEqual(result["status"], "attention-required")
+                self.assertEqual(result["stopReason"], reason)
+                self._assert_failed_stage_receipt(
+                    Path(tmp) / "reports" / f"{receipt_number[stage]:02d}-{stage}.json",
+                    kind="structured-output",
+                    stop_reason=reason,
+                )
+
+    def test_pm_and_architect_findings_are_never_stage_success(self) -> None:
+        receipt_number = {"pm": 1, "architect": 2}
+        for stage in receipt_number:
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                root = _init_project(Path(tmp) / "project")
+                contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+                def provider(role: str) -> BaseProvider:
+                    return _PrimaryStageFindingProvider(role, stage)
+
+                result = run_bounded_delivery(
+                    _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+                )
+
+                reason = f"{stage} returned findings"
+                self.assertEqual(result["status"], "attention-required")
+                self.assertEqual(result["stopReason"], reason)
+                self._assert_failed_stage_receipt(
+                    Path(tmp) / "reports" / f"{receipt_number[stage]:02d}-{stage}.json",
+                    kind="structured-output",
+                    stop_reason=reason,
+                )
+
     def test_out_of_scope_qa_finding_stops_without_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -521,6 +567,44 @@ class _ForbiddenStageOutputProvider(_StageProvider):
             return result
         payload = json.loads(result.content)
         payload["tests"] = ["run production deployment"]
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
+        )
+
+
+class _PrimaryStageBlockerProvider(_StageProvider):
+    def __init__(self, role: str, stage: str) -> None:
+        super().__init__(role)
+        self.stage = stage
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != self.stage:
+            return result
+        payload = json.loads(result.content)
+        payload["blockers"] = ["unresolved blocker"]
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
+        )
+
+
+class _PrimaryStageFindingProvider(_StageProvider):
+    def __init__(self, role: str, stage: str) -> None:
+        super().__init__(role)
+        self.stage = stage
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != self.stage:
+            return result
+        payload = json.loads(result.content)
+        payload["findings"] = ["unresolved finding"]
         return ProviderResult(
             provider=result.provider,
             success=True,
