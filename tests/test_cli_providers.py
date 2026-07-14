@@ -50,6 +50,27 @@ class CliProviderTests(unittest.TestCase):
 
         self.assertEqual(_extract_token_usage(result), 7044)
 
+    def test_codex_success_content_excludes_native_stderr_diagnostics(self) -> None:
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=[
+                    "-c",
+                    "import sys; print('{\"schema\":\"example/v1\"}'); "
+                    "sys.stderr.write('native progress\\ntokens used\\n42\\n')",
+                ],
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.content, '{"schema":"example/v1"}')
+        self.assertIn("native progress", result.data["command"]["stderr"])
+        self.assertEqual(result.data["tokenUsage"], 42)
+
     def test_antigravity_routing_replaces_only_allowlisted_model(self) -> None:
         settings = AntigravitySettings(allowed_models=("Gemini 3.1 Pro (High)",))
 
