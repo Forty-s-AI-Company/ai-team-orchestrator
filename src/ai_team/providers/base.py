@@ -154,6 +154,7 @@ class RetryingProvider(BaseProvider):
                 )
             if last_result.error_type in {
                 ProviderErrorType.AUTH,
+                ProviderErrorType.RATE_LIMIT,
                 ProviderErrorType.TIMEOUT,
                 ProviderErrorType.EXTERNAL_REQUIRED,
                 ProviderErrorType.INVALID_RESPONSE,

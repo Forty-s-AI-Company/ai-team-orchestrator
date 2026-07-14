@@ -607,6 +607,11 @@ interval. Invalid contracts, unsafe findings, other provider failures, failed CI
 publication evidence mismatches, or dirty primary state stop fail closed with
 an `attention-required` state.
 
+Quota responses are returned after the first provider-native attempt. They are
+not retried immediately inside the same stage; the continuous supervisor owns
+the timed retry so a quota window cannot trigger repeated agent runs and builds
+before its configured interval elapses.
+
 Retries recover only dependency-ordered stage checkpoints whose provider,
 structured validation, task SHA, secondary review, token usage, commit, and
 receipt evidence still agree. A completed Engineer checkpoint additionally
