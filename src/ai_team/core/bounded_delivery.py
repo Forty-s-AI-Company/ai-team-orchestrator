@@ -151,15 +151,16 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             attempt = (options.engineering_executor or _default_engineering_executor(options))(
                 contract, instruction, engineer, iteration
             )
-            _record_engineering_receipt(options, context, attempt, iteration)
-            if not _native_success(attempt.provider_result, "codex"):
-                return _stop(options, context, _provider_stop_reason(attempt.provider_result), "engineer")
-            if not attempt.validation.get("success"):
-                return _stop(options, context, "deterministic-validation-failed", "validation")
-            if not attempt.commit_sha:
-                return _stop(options, context, "engineering-commit-missing", "engineer")
-            if not _paths_within(attempt.changed_files, tuple(context["planAllowedWritePaths"])):
-                return _stop(options, context, "engineering-diff-outside-allowed-paths", "engineer")
+            failure = _engineering_failure(
+                attempt,
+                tuple(context["planAllowedWritePaths"]),
+            )
+            if not _add_tokens(options, context, attempt.provider_result) and failure is None:
+                failure = ("token-budget-exhausted", "engineer", "policy-validation")
+            _record_engineering_receipt(options, context, attempt, iteration, failure)
+            if failure is not None:
+                reason, stage, _kind = failure
+                return _stop(options, context, reason, stage)
             context.update({
                 "worktreePath": str(attempt.worktree_path),
                 "commitSha": attempt.commit_sha,
@@ -299,8 +300,17 @@ def _run_stage(
             _validation_failure("secondary-provider-output", str(exc), primaryResult=payload),
         )
         raise
+    if not _add_tokens(options, context, result):
+        reason = "token-budget-exhausted"
+        _write_receipt(
+            options,
+            context,
+            stage,
+            result,
+            _validation_failure("policy-validation", reason, primaryResult=payload),
+        )
+        raise BoundedDeliveryError(reason)
     _write_receipt(options, context, stage, result, payload)
-    _add_tokens(options, context, result)
     return payload
 
 
@@ -358,13 +368,46 @@ def _stage_prompt(stage: str, context: dict[str, Any]) -> str:
     ))
 
 
-def _record_engineering_receipt(options: BoundedDeliveryOptions, context: dict[str, Any], attempt: EngineeringAttempt, iteration: int) -> None:
-    _write_receipt(options, context, "engineer", attempt.provider_result, {
+def _engineering_failure(
+    attempt: EngineeringAttempt,
+    allowed_write_paths: tuple[str, ...],
+) -> tuple[str, str, str] | None:
+    if not _native_success(attempt.provider_result, "codex"):
+        return _provider_stop_reason(attempt.provider_result), "engineer", "provider-execution"
+    if not attempt.validation.get("success"):
+        return "deterministic-validation-failed", "validation", "deterministic-validation"
+    if not attempt.commit_sha:
+        return "engineering-commit-missing", "engineer", "commit-validation"
+    if not _paths_within(attempt.changed_files, allowed_write_paths):
+        return "engineering-diff-outside-allowed-paths", "engineer", "policy-validation"
+    return None
+
+
+def _record_engineering_receipt(
+    options: BoundedDeliveryOptions,
+    context: dict[str, Any],
+    attempt: EngineeringAttempt,
+    iteration: int,
+    failure: tuple[str, str, str] | None,
+) -> None:
+    evidence: dict[str, Any] = {
         "iteration": iteration, "changedFiles": attempt.changed_files, "validation": attempt.validation,
         "commitSha": attempt.commit_sha, "runReceipt": str(attempt.run_receipt) if attempt.run_receipt else None,
         "executorReceipt": str(attempt.executor_receipt) if attempt.executor_receipt else None,
-    })
-    _add_tokens(options, context, attempt.provider_result)
+    }
+    if failure is not None:
+        reason, _stage, kind = failure
+        evidence.update({
+            "validationError": reason,
+            "stopReason": reason,
+            "validation": {
+                **attempt.validation,
+                "success": False,
+                "kind": kind,
+                "stopReason": reason,
+            },
+        })
+    _write_receipt(options, context, "engineer", attempt.provider_result, evidence)
 
 
 def _write_receipt(options: BoundedDeliveryOptions, context: dict[str, Any], stage: str, result: ProviderResult, evidence: dict[str, Any]) -> None:
@@ -391,11 +434,10 @@ def _write_receipt(options: BoundedDeliveryOptions, context: dict[str, Any], sta
     context["receipts"].append(str(path))
 
 
-def _add_tokens(options: BoundedDeliveryOptions, context: dict[str, Any], result: ProviderResult) -> None:
+def _add_tokens(options: BoundedDeliveryOptions, context: dict[str, Any], result: ProviderResult) -> bool:
     tokens = result.data.get("tokenUsage", 0)
     context["tokenUsage"] += tokens if isinstance(tokens, int) and tokens >= 0 else 0
-    if context["tokenUsage"] > options.limits.max_token_usage:
-        raise BoundedDeliveryError("token-budget-exhausted")
+    return context["tokenUsage"] <= options.limits.max_token_usage
 
 
 def _complete(options: BoundedDeliveryOptions, context: dict[str, Any]) -> dict[str, Any]:
