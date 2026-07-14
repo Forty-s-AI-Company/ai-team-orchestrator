@@ -81,25 +81,28 @@ def run_in_disposable_worktree(
         if loaded.is_branch_protected():
             raise ValueError("disposable worktree resolved to a protected branch")
 
-        result = Orchestrator(provider=provider, max_retries=2).run(
-            loaded,
-            workflow_name=workflow_name,
-            dry_run=dry_run,
-            run_mode=run_mode,
-            task_instruction=task_instruction,
-        )
-        changed_files = list_changed_files(loaded.root)
-        file_check = inspect_candidate_files(loaded.root, changed_files)
-        scope_check = inspect_write_scope(changed_files, allowed_write_paths)
-        git_policy = evaluate_git_action(loaded, "commit", candidate_files=changed_files).as_dict()
-        git_policy["changedFiles"] = changed_files
-        git_policy["fileCheck"] = file_check
-        git_policy["scopeCheck"] = scope_check
-        if not scope_check["allowed"]:
-            git_policy["allowed"] = False
-            git_policy.setdefault("reasons", []).extend(scope_check["reasons"])
         dependency_link = prepare_dependency_link(loaded.root, source.root)
         try:
+            # The write provider must see the same controlled dependency tree
+            # used by deterministic validation. This is also what makes local
+            # framework documentation available before a Next.js edit.
+            result = Orchestrator(provider=provider, max_retries=2).run(
+                loaded,
+                workflow_name=workflow_name,
+                dry_run=dry_run,
+                run_mode=run_mode,
+                task_instruction=task_instruction,
+            )
+            changed_files = list_changed_files(loaded.root)
+            file_check = inspect_candidate_files(loaded.root, changed_files)
+            scope_check = inspect_write_scope(changed_files, allowed_write_paths)
+            git_policy = evaluate_git_action(loaded, "commit", candidate_files=changed_files).as_dict()
+            git_policy["changedFiles"] = changed_files
+            git_policy["fileCheck"] = file_check
+            git_policy["scopeCheck"] = scope_check
+            if not scope_check["allowed"]:
+                git_policy["allowed"] = False
+                git_policy.setdefault("reasons", []).extend(scope_check["reasons"])
             validation_result = run_validation_commands(
                 loaded.root,
                 validation_commands or [],
@@ -239,8 +242,18 @@ def inspect_write_scope(changed_files: list[str], allowed_write_paths: list[str]
 def prepare_dependency_link(worktree_root: Path, source_root: Path) -> Path | None:
     source_modules = source_root / "node_modules"
     target_modules = worktree_root / "node_modules"
-    if not source_modules.is_dir() or target_modules.exists():
+    if not source_modules.is_dir():
         return None
+    if target_modules.is_symlink():
+        raise ValueError("disposable worktree dependency path must not be a pre-existing symlink")
+    if target_modules.exists() and not target_modules.is_dir():
+        raise ValueError("disposable worktree dependency path must be a directory")
+    if target_modules.is_dir():
+        # A provider self-check can create an incomplete cache-only node_modules
+        # directory. Merge the trusted source dependencies into a private tree
+        # so its mere existence cannot suppress dependency preparation.
+        shutil.copytree(source_modules, target_modules, symlinks=True, dirs_exist_ok=True)
+        return target_modules
     if os.name == "nt":
         result = subprocess.run(
             ["cmd", "/c", "mklink", "/J", str(target_modules), str(source_modules)],
@@ -318,24 +331,50 @@ def run_validation_commands(
         executable = shutil.which(args[0])
         if executable:
             args[0] = executable
-        completed = subprocess.run(
-            args,
-            cwd=project_root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=900,
-            env=_validation_env(dependency_root),
-        )
-        results.append({
-            "command": command,
-            "returnCode": completed.returncode,
-            "stdout": completed.stdout[-4000:],
-            "stderr": completed.stderr[-4000:],
-        })
-        if completed.returncode != 0:
+        try:
+            completed = subprocess.run(
+                args,
+                cwd=project_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=900,
+                env=_validation_env(dependency_root),
+            )
+            result = {
+                "command": command,
+                "returnCode": completed.returncode,
+                "stdout": completed.stdout[-4000:],
+                "stderr": completed.stderr[-4000:],
+            }
+        except FileNotFoundError as exc:
+            result = {
+                "command": command,
+                "returnCode": 127,
+                "stdout": "",
+                "stderr": str(exc),
+            }
+        except subprocess.TimeoutExpired as exc:
+            result = {
+                "command": command,
+                "returnCode": 124,
+                "stdout": str(exc.stdout or "")[-4000:],
+                "stderr": str(exc.stderr or exc)[-4000:],
+            }
+        results.append(result)
+        if result["returnCode"] != 0:
             break
     payload = {"success": all(item["returnCode"] == 0 for item in results), "commands": results}
+    if any(item["returnCode"] == 127 for item in results):
+        payload.update({
+            "kind": "execution-environment",
+            "stopReason": "validation-command-unavailable",
+        })
+    elif any(item["returnCode"] == 124 for item in results):
+        payload.update({
+            "kind": "execution-environment",
+            "stopReason": "validation-command-timeout",
+        })
     payload["hash"] = hashlib.sha256(
         json.dumps(redact_secrets(payload), sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
