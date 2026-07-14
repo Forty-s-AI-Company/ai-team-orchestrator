@@ -36,6 +36,10 @@ class BoundedDeliveryError(ValueError):
     """Raised when a task contract or a stage result is unsafe."""
 
 
+class PolicyValidationError(BoundedDeliveryError):
+    """Raised when otherwise structured stage output violates delivery policy."""
+
+
 @dataclass(frozen=True)
 class TrustedTaskContract:
     id: str
@@ -130,14 +134,11 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
     }
     _write_state(options, "running", "pm", context)
     try:
-        pm = _run_stage(options, project.root, "pm", context)
+        pm = _run_stage(options, project.root, "pm", context, contract)
         acceptance = _required_strings(pm, "acceptanceCriteria")
         context["acceptanceCriteria"] = acceptance
-        architect = _run_stage(options, project.root, "architect", context)
+        architect = _run_stage(options, project.root, "architect", context, contract)
         plan = _required_strings(architect, "plan")
-        if architect.get("schemaOrApiChange") is not False:
-            return _stop(options, context, "architect-requires-product-decision", "architect")
-        _validate_plan_scope(architect, contract)
         context["plan"] = plan
         context["planAllowedWritePaths"] = _required_strings(architect, "allowedWritePaths")
 
@@ -164,8 +165,8 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 "validation": attempt.validation,
             })
 
-            qa = _run_stage(options, attempt.worktree_path, "qa", context)
-            review = _run_stage(options, attempt.worktree_path, "review", context)
+            qa = _run_stage(options, attempt.worktree_path, "qa", context, contract)
+            review = _run_stage(options, attempt.worktree_path, "review", context, contract)
             findings = _findings(qa) + _findings(review)
             if not findings:
                 return _complete(options, context)
@@ -180,7 +181,13 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
         return _stop(options, context, str(exc), "policy-or-provider")
 
 
-def _run_stage(options: BoundedDeliveryOptions, root: Path, stage: str, context: dict[str, Any]) -> dict[str, Any]:
+def _run_stage(
+    options: BoundedDeliveryOptions,
+    root: Path,
+    stage: str,
+    context: dict[str, Any],
+    contract: TrustedTaskContract,
+) -> dict[str, Any]:
     provider = options.provider_for_role(ROLE_BY_STAGE[stage])
     request = ProviderRequest(
         workflow=f"bounded-delivery-{stage}", project_root=root, run_mode="run-agent",
@@ -194,31 +201,53 @@ def _run_stage(options: BoundedDeliveryOptions, root: Path, stage: str, context:
     before = _read_only_git_fingerprint(root)
     result = provider.run(request)
     if _read_only_git_fingerprint(root) != before:
+        reason = "read-only-stage-modified-worktree"
         _write_receipt(
             options,
             context,
             stage,
             result,
-            {"validationError": "read-only-stage-modified-worktree"},
+            _validation_failure("read-only-integrity", reason),
         )
-        raise BoundedDeliveryError("read-only-stage-modified-worktree")
+        raise BoundedDeliveryError(reason)
     expected = "antigravity" if stage in {"pm", "architect", "qa"} else "codex"
     if not _native_success(result, expected):
-        _write_receipt(options, context, stage, result, {"validationError": _provider_stop_reason(result)})
-        raise BoundedDeliveryError(_provider_stop_reason(result))
+        reason = _provider_stop_reason(result)
+        _write_receipt(options, context, stage, result, _validation_failure("provider-execution", reason))
+        raise BoundedDeliveryError(reason)
     try:
         payload = json.loads(result.content)
     except json.JSONDecodeError as exc:
-        _write_receipt(options, context, stage, result, {"validationError": f"{stage} returned non-JSON content"})
-        raise BoundedDeliveryError(f"{stage} returned non-JSON content") from exc
-    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA or payload.get("stage") != stage:
-        _write_receipt(options, context, stage, result, {"validationError": f"{stage} returned an invalid bounded-delivery schema"})
-        raise BoundedDeliveryError(f"{stage} returned an invalid bounded-delivery schema")
-    if payload.get("status") != "passed" or not isinstance(payload.get("findings"), list):
-        _write_receipt(options, context, stage, result, {"validationError": f"{stage} did not provide a passed, structured result"})
-        raise BoundedDeliveryError(f"{stage} did not provide a passed, structured result")
+        reason = f"{stage} returned non-JSON content"
+        _write_receipt(options, context, stage, result, _validation_failure("structured-output", reason))
+        raise BoundedDeliveryError(reason) from exc
+    try:
+        _validate_stage_structure(stage, payload)
+    except BoundedDeliveryError as exc:
+        _write_receipt(
+            options,
+            context,
+            stage,
+            result,
+            _validation_failure("structured-output", str(exc)),
+        )
+        raise
     try:
         _reject_forbidden(json.dumps(payload, ensure_ascii=False), f"{stage} output")
+        if stage == "architect":
+            if payload.get("schemaOrApiChange") is not False:
+                raise PolicyValidationError("architect-requires-product-decision")
+            _validate_plan_scope(payload, contract)
+    except PolicyValidationError as exc:
+        _write_receipt(
+            options,
+            context,
+            stage,
+            result,
+            _validation_failure("policy-validation", str(exc), primaryResult=payload),
+        )
+        raise
+    try:
         expected_secondary = SECONDARY_PROVIDER_BY_STAGE.get(stage)
         secondary_payload: dict[str, Any] | None = None
         if expected_secondary is not None:
@@ -250,17 +279,22 @@ def _run_stage(options: BoundedDeliveryOptions, root: Path, stage: str, context:
                     "findings": [*payload["findings"], *secondary_payload["findings"]],
                     "tests": [*payload.get("tests", []), *secondary_payload["tests"]],
                 }
+    except PolicyValidationError as exc:
+        _write_receipt(
+            options,
+            context,
+            stage,
+            result,
+            _validation_failure("policy-validation", str(exc), primaryResult=payload),
+        )
+        raise
     except BoundedDeliveryError as exc:
         _write_receipt(
             options,
             context,
             stage,
             result,
-            {
-                "validationError": str(exc),
-                "validation": {"success": False, "kind": "secondary-provider-output"},
-                "primaryResult": payload,
-            },
+            _validation_failure("secondary-provider-output", str(exc), primaryResult=payload),
         )
         raise
     _write_receipt(options, context, stage, result, payload)
@@ -335,7 +369,8 @@ def _write_receipt(options: BoundedDeliveryOptions, context: dict[str, Any], sta
         "provider": result.provider, "selectedModel": result.data.get("selectedModel"),
         "reasoningEffort": result.data.get("reasoningEffort"), "tokenUsage": result.data.get("tokenUsage", 0),
         "providerSuccess": result.success, "errorType": result.error_type,
-        "validationResult": evidence.get("validation", {"success": result.success, "kind": "provider-output"}),
+        "validationResult": _receipt_validation(result, evidence),
+        "stopReason": evidence.get("stopReason") or evidence.get("validationError"),
         "findingSha": _sha(evidence.get("findings", [])) if isinstance(evidence.get("findings"), list) else None,
         # Bind every post-engineering receipt to the exact commit it reviewed.
         # Engineering supplies the SHA in its own evidence; QA/review inherit
@@ -417,9 +452,9 @@ def _required_strings(payload: dict[str, Any], key: str) -> list[str]:
 
 def _validate_plan_scope(payload: dict[str, Any], contract: TrustedTaskContract) -> None:
     if not _paths_within(_required_strings(payload, "allowedWritePaths"), contract.allowed_write_paths):
-        raise BoundedDeliveryError("architect plan expands allowed write paths")
+        raise PolicyValidationError("architect plan expands allowed write paths")
     if not set(_required_strings(payload, "validationCommands")).issubset(set(contract.validation_commands)):
-        raise BoundedDeliveryError("architect plan expands validation commands")
+        raise PolicyValidationError("architect plan expands validation commands")
 
 
 def _validate_contract_validation_commands(project: Any, contract: TrustedTaskContract) -> None:
@@ -470,6 +505,7 @@ def _validate_secondary_review(
         or not isinstance(payload.get("blockers"), list)
     ):
         raise BoundedDeliveryError(f"{failure_prefix}-not-approved")
+    _findings(payload)
     _reject_forbidden(
         json.dumps(payload, ensure_ascii=False),
         f"{stage} {provider} review",
@@ -505,7 +541,47 @@ def _engineering_instruction(context: dict[str, Any], repairs: list[dict[str, An
 def _reject_forbidden(value: str, label: str) -> None:
     lowered = value.lower()
     if any(re.search(pattern, lowered) for pattern in FORBIDDEN_PATTERNS):
-        raise BoundedDeliveryError(f"{label} contains a prohibited action or product-contract change")
+        raise PolicyValidationError(f"{label} contains a prohibited action or product-contract change")
+
+
+def _validate_stage_structure(stage: str, payload: Any) -> None:
+    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA or payload.get("stage") != stage:
+        raise BoundedDeliveryError(f"{stage} returned an invalid bounded-delivery schema")
+    if (
+        payload.get("status") != "passed"
+        or not isinstance(payload.get("findings"), list)
+        or not isinstance(payload.get("tests"), list)
+        or not isinstance(payload.get("blockers"), list)
+    ):
+        raise BoundedDeliveryError(f"{stage} did not provide a passed, structured result")
+    if stage == "pm":
+        _required_strings(payload, "acceptanceCriteria")
+    elif stage == "architect":
+        _required_strings(payload, "plan")
+        _required_strings(payload, "allowedWritePaths")
+        _required_strings(payload, "validationCommands")
+    elif stage in {"qa", "review"}:
+        _findings(payload)
+
+
+def _validation_failure(kind: str, stop_reason: str, **evidence: Any) -> dict[str, Any]:
+    return {
+        **evidence,
+        "validationError": stop_reason,
+        "stopReason": stop_reason,
+        "validation": {"success": False, "kind": kind, "stopReason": stop_reason},
+    }
+
+
+def _receipt_validation(result: ProviderResult, evidence: dict[str, Any]) -> dict[str, Any]:
+    value = evidence.get("validation")
+    validation = dict(value) if isinstance(value, dict) else {"success": result.success, "kind": "provider-output"}
+    stop_reason = evidence.get("stopReason") or evidence.get("validationError")
+    if isinstance(stop_reason, str) and stop_reason:
+        validation["success"] = False
+        validation.setdefault("kind", "stage-validation")
+        validation["stopReason"] = stop_reason
+    return validation
 
 
 def _string_list(value: Any, label: str) -> list[str]:
