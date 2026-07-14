@@ -114,18 +114,27 @@ def run_in_disposable_worktree(
             remove_dependency_link(dependency_link)
         effective_validation_hash = validation_log_hash or validation_result["hash"]
         effective_test_hash = test_evidence_hash or validation_result["hash"]
-        commit_result = maybe_commit_changed_files(
-            loaded,
-            changed_files=changed_files,
-            git_policy=git_policy,
-            enabled=(
-                auto_commit
-                and result.provider_result.success
-                and bool(changed_files)
-                and validation_result["success"]
-            ),
-            commit_message=commit_message or default_commit_message(workflow_name),
-        )
+        try:
+            commit_result = maybe_commit_changed_files(
+                loaded,
+                changed_files=changed_files,
+                git_policy=git_policy,
+                enabled=(
+                    auto_commit
+                    and result.provider_result.success
+                    and bool(changed_files)
+                    and validation_result["success"]
+                ),
+                commit_message=commit_message or default_commit_message(workflow_name),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            # Fail closed even if a future Git call in the commit path was not
+            # converted to an explicit operation result yet.
+            commit_result = _git_failure_result(
+                stop_reason="git-subprocess-failed",
+                operation="unknown",
+                error=exc,
+            )
         # Bounded delivery consumes this attested result rather than inferring
         # validation success from a commit alone.
         commit_result = {**commit_result, "validation": validation_result}
@@ -364,9 +373,24 @@ def maybe_commit_changed_files(
             "committed": False,
             "reason": "git policy denied commit",
             "policyReasons": git_policy.get("reasons", []),
+            "validationResult": {
+                "success": False,
+                "kind": "policy-validation",
+                "stopReason": "git-policy-denied",
+            },
         }
 
-    _run_git(loaded_project.root, ["add", "--", *changed_files])
+    identity_failure = _validate_git_identity(loaded_project.root)
+    if identity_failure is not None:
+        return identity_failure
+
+    try:
+        add_result = _run_git_attempt(loaded_project.root, ["add", "--", *changed_files])
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _git_failure_result("git-add-failed", "add", error=exc)
+    if add_result.returncode != 0:
+        return _git_failure_result("git-add-failed", "add", completed=add_result)
+
     staged_files = list_staged_files(loaded_project.root)
     staged_policy = evaluate_git_action(loaded_project, "commit", candidate_files=staged_files).as_dict()
     if not staged_policy.get("allowed"):
@@ -377,9 +401,25 @@ def maybe_commit_changed_files(
             "reason": "staged policy denied commit",
             "policyReasons": staged_policy.get("reasons", []),
             "stagedFiles": staged_files,
+            "validationResult": {
+                "success": False,
+                "kind": "policy-validation",
+                "stopReason": "staged-git-policy-denied",
+            },
         }
 
-    _run_git(loaded_project.root, ["commit", "-m", commit_message])
+    try:
+        commit = _run_git_attempt(loaded_project.root, ["commit", "-m", commit_message])
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _git_failure_result("git-commit-failed", "commit", error=exc, staged_files=staged_files)
+    if commit.returncode != 0:
+        return _git_failure_result(
+            "git-commit-failed",
+            "commit",
+            completed=commit,
+            staged_files=staged_files,
+        )
+
     commit_sha = _run_git(loaded_project.root, ["rev-parse", "HEAD"]).stdout.strip()
     loaded_project.commit_sha = commit_sha
     return {
@@ -388,7 +428,76 @@ def maybe_commit_changed_files(
         "commitSha": commit_sha,
         "message": commit_message,
         "stagedFiles": staged_files,
+        "validationResult": {
+            "success": True,
+            "kind": "git-commit",
+            "stopReason": None,
+        },
     }
+
+
+def _validate_git_identity(project_root: Path) -> dict[str, Any] | None:
+    missing: list[str] = []
+    for key in ("user.name", "user.email"):
+        try:
+            result = _run_git_attempt(project_root, ["config", "--get", key])
+        except (OSError, subprocess.SubprocessError) as exc:
+            return _git_failure_result("git-identity-check-failed", "identity", error=exc)
+        if result.returncode != 0 or not result.stdout.strip():
+            missing.append(key)
+    if missing:
+        return _git_failure_result(
+            "git-identity-missing",
+            "identity",
+            missing_fields=missing,
+        )
+    return None
+
+
+def _git_failure_result(
+    stop_reason: str,
+    operation: str,
+    *,
+    completed: subprocess.CompletedProcess[str] | None = None,
+    error: BaseException | None = None,
+    missing_fields: list[str] | None = None,
+    staged_files: list[str] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "attempted": True,
+        "committed": False,
+        "reason": stop_reason,
+        "stopReason": stop_reason,
+        "gitOperation": operation,
+        "validationResult": {
+            "success": False,
+            "kind": "git-commit",
+            "stopReason": stop_reason,
+        },
+    }
+    if completed is not None:
+        payload.update({
+            "returnCode": completed.returncode,
+            "stdout": _redacted_git_output(completed.stdout),
+            "stderr": _redacted_git_output(completed.stderr),
+        })
+    if error is not None:
+        error_stdout = getattr(error, "stdout", None)
+        if error_stdout:
+            payload["stdout"] = _redacted_git_output(error_stdout)
+        payload["stderr"] = _redacted_git_output(getattr(error, "stderr", None) or error)
+    if missing_fields:
+        payload["missingIdentityFields"] = missing_fields
+    if staged_files:
+        payload["stagedFiles"] = staged_files
+    return redact_secrets(payload)
+
+
+def _redacted_git_output(value: object, limit: int = 4000) -> str:
+    # Redact before truncation so a long value cannot move its identifying key
+    # outside the retained tail and bypass pattern-based redaction.
+    redacted = redact_secrets("" if value is None else str(value))
+    return str(redacted)[-limit:]
 
 
 def list_staged_files(project_root: Path) -> list[str]:
@@ -449,6 +558,11 @@ def write_executor_receipt(
     receipt_dir.mkdir(parents=True, exist_ok=True)
     generated_at = datetime.now(UTC).isoformat()
     path = receipt_dir / f"{generated_at.replace(':', '').replace('+', 'Z').replace('.', '')}-isolated-{uuid4().hex[:8]}.json"
+    executor_validation = _executor_validation_result(
+        provider_success=result.provider_result.success,
+        command_validation=validation_result,
+        commit_result=commit_result,
+    )
     payload = {
         "schemaVersion": 1,
         "generatedAt": generated_at,
@@ -467,6 +581,9 @@ def write_executor_receipt(
         "commitResult": commit_result,
         "githubResult": github_result,
         "keepWorktree": keep_worktree,
+        "providerSuccess": result.provider_result.success,
+        "validationResult": executor_validation,
+        "stopReason": executor_validation.get("stopReason"),
         "providerValidationResult": {
             "success": result.provider_result.success,
             "errorType": result.provider_result.error_type,
@@ -478,11 +595,46 @@ def write_executor_receipt(
     return path
 
 
+def _executor_validation_result(
+    *,
+    provider_success: bool,
+    command_validation: dict[str, Any],
+    commit_result: dict[str, Any],
+) -> dict[str, Any]:
+    if not provider_success:
+        return {
+            "success": False,
+            "kind": "provider-execution",
+            "stopReason": "provider-native-execution-failed",
+        }
+    if not command_validation.get("success"):
+        return {
+            "success": False,
+            "kind": "deterministic-validation",
+            "stopReason": "deterministic-validation-failed",
+        }
+    commit_validation = commit_result.get("validationResult")
+    if isinstance(commit_validation, dict):
+        return dict(commit_validation)
+    return {"success": True, "kind": "executor", "stopReason": None}
+
+
 def _run_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
         cwd=cwd,
         check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _run_git_attempt(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=False,
         capture_output=True,
         text=True,
         timeout=30,

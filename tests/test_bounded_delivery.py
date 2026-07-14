@@ -188,6 +188,38 @@ class BoundedDeliveryTests(unittest.TestCase):
                 stop_reason=reason,
             )
 
+    def test_provider_success_with_git_commit_failure_is_not_engineer_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def failed_commit(contract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
+                attempt = _successful_engineering_attempt(contract, instruction, provider, iteration)
+                return EngineeringAttempt(
+                    provider_result=attempt.provider_result,
+                    worktree_path=attempt.worktree_path,
+                    changed_files=attempt.changed_files,
+                    validation={
+                        **attempt.validation,
+                        "success": False,
+                        "kind": "git-commit",
+                        "stopReason": "git-commit-failed",
+                    },
+                    commit_sha=None,
+                )
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, _provider_for_role, failed_commit)
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], "git-commit-failed")
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "03-engineer.json",
+                kind="git-commit",
+                stop_reason="git-commit-failed",
+            )
+
     def test_provider_timeout_is_a_fail_closed_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
