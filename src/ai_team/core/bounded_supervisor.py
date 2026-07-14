@@ -187,7 +187,8 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 )
                 _write_json(options.state_path, state)
                 return state
-            effective_result = _read_json(task_state) if result.get("status") == "already-completed" else result
+            task_checkpoint = _read_json(task_state)
+            effective_result = task_checkpoint if result.get("status") == "already-completed" else result
             status = str(effective_result.get("status") or result.get("status") or "attention-required")
             if (
                 status in {"completed", "already-completed"}
@@ -213,7 +214,7 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                     _next_provider_quota_backoff(
                         prior,
                         selected,
-                        str(effective_result.get("stage") or "unknown"),
+                        str(effective_result.get("stage") or task_checkpoint.get("stage") or "unknown"),
                         options.interval_minutes * 60,
                         options.wall_clock(),
                     )
