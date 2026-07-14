@@ -38,8 +38,12 @@ class BoundedDeliveryTests(unittest.TestCase):
             engineer_receipt = json.loads(receipts[2].read_text(encoding="utf-8"))
             self.assertTrue(engineer_receipt["writeAccess"])
             self.assertEqual(engineer_receipt["commitSha"], "fake-commit")
+            qa_receipt = json.loads(receipts[3].read_text(encoding="utf-8"))
+            review_receipt = json.loads(receipts[4].read_text(encoding="utf-8"))
+            self.assertEqual(qa_receipt["commitSha"], "fake-commit")
+            self.assertEqual(review_receipt["commitSha"], "fake-commit")
             self.assertNotIn("super-secret-value", receipts[0].read_text(encoding="utf-8"))
-            qa_prompt_evidence = json.loads(receipts[3].read_text(encoding="utf-8"))["evidence"]
+            qa_prompt_evidence = qa_receipt["evidence"]
             self.assertEqual(qa_prompt_evidence["stage"], "qa")
             self.assertEqual(run_bounded_delivery(options)["status"], "already-completed")
 

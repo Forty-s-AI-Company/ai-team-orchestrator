@@ -337,7 +337,11 @@ def _write_receipt(options: BoundedDeliveryOptions, context: dict[str, Any], sta
         "providerSuccess": result.success, "errorType": result.error_type,
         "validationResult": evidence.get("validation", {"success": result.success, "kind": "provider-output"}),
         "findingSha": _sha(evidence.get("findings", [])) if isinstance(evidence.get("findings"), list) else None,
-        "commitSha": evidence.get("commitSha"), "evidence": evidence,
+        # Bind every post-engineering receipt to the exact commit it reviewed.
+        # Engineering supplies the SHA in its own evidence; QA/review inherit
+        # the already verified SHA from the bounded-delivery context.
+        "commitSha": evidence.get("commitSha") or context.get("commitSha"),
+        "evidence": evidence,
         "secondaryReview": result.data.get("secondaryReview"),
     })
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
