@@ -444,6 +444,51 @@ class CliProviderTests(unittest.TestCase):
         self.assertTrue(result.data["responseValidated"])
         self.assertTrue(result.data["antigravityNativePass"])
 
+    def test_antigravity_accepts_one_valid_json_inside_text_envelope(self) -> None:
+        script = (
+            "import json,re,sys; p=sys.argv[-1]; c=re.search(r'Challenge=([0-9a-f]+)',p).group(1); "
+            "v={'schema':'ai-team-antigravity/v1','challenge':c,'status':'ok',"
+            "'findings':[],'tests':[{'id':'qa'}],'blockers':[]}; "
+            "print('Evidence analysis follows.'); print('```json'); print(json.dumps(v)); print('```')"
+        )
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", script],
+                execution_enabled=True,
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertTrue(result.success, result.content)
+        self.assertEqual(json.loads(result.content)["tests"], [{"id": "qa"}])
+        self.assertNotIn("Evidence analysis", result.content)
+
+    def test_antigravity_rejects_ambiguous_valid_json_envelope(self) -> None:
+        script = (
+            "import json,re,sys; p=sys.argv[-1]; c=re.search(r'Challenge=([0-9a-f]+)',p).group(1); "
+            "v={'schema':'ai-team-antigravity/v1','challenge':c,'status':'ok',"
+            "'findings':[],'tests':[],'blockers':[]}; print(json.dumps(v)); print(json.dumps(v))"
+        )
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", script],
+                execution_enabled=True,
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
+        self.assertFalse(result.data["responseValidated"])
+
     def test_antigravity_repository_smoke_validates_probe_hash(self) -> None:
         script = (
             "import hashlib,json,pathlib,re,sys; p=sys.argv[-1]; c=re.search(r'Challenge=([0-9a-f]+)',p).group(1); "
