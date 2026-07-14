@@ -122,6 +122,23 @@ class GitPolicyTests(unittest.TestCase):
             self.assertFalse(decision.allowed)
             self.assertIn("secret", " ".join(decision.reasons))
 
+    def test_typescript_secret_named_type_annotation_is_not_a_secret_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            make_disposable_worktree(root)
+            (root / "component.tsx").write_text(
+                "type Props = { csrfToken: string; apiKey?: string; };\n",
+                encoding="utf-8",
+            )
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_git_action(loaded, "commit", candidate_files=["component.tsx"])
+
+            self.assertTrue(decision.allowed, decision.reasons)
+
     def test_push_and_pr_require_external_controls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
