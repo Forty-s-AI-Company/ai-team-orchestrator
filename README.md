@@ -541,20 +541,23 @@ receipt and secret-scan evidence, and an approved GitHub review.
 
 ### Bounded autonomous delivery
 
-`--bounded-delivery` is a separate, fail-closed single-task cycle. It never
-discovers product requirements itself: an operator supplies a versioned JSON
-task contract that cites either a GitHub issue or another trusted source. The
+`--bounded-delivery` is a separate fail-closed delivery path. It never
+discovers product requirements itself: an operator supplies versioned JSON task
+contracts that cite either a GitHub issue or another trusted source. Every
 contract must declare the exact approved write paths and must use exactly the
 project contract's `lint`, `typecheck`, `test`, and `build` commands.
 
-The cycle runs PM (Antigravity), Architect (Antigravity plus mandatory
+The role and repair cycle runs PM (Antigravity), Architect (Antigravity plus mandatory
 read-only Codex second opinion), Codex Engineer in a disposable worktree,
 deterministic validation plus `git diff --check`, Antigravity delivery QA, and
 Codex review (with optional Antigravity second opinion). It records a redacted
-receipt per stage and never invokes push, PR, merge, migration, seed, deploy,
-payment, secret, destructive-data, schema/API-contract, or force-push actions.
+receipt per stage and never itself invokes GitHub publication, migration, seed,
+deploy, payment, secret, destructive-data, schema/API-contract, or force-push
+actions. The continuous supervisor may publish only after that cycle completes
+with deterministic evidence and all GitHub gates pass.
 
-Start with exactly one cycle. `--execute` and `--once` are both mandatory:
+Start with exactly one cycle. `--execute` and `--once` select the single-task
+form:
 
 ```bash
 cat > /tmp/trusted-task.json <<'JSON'
@@ -580,3 +583,33 @@ the selected report directory. Any provider timeout/quota/mock response,
 unvalidated QA output, out-of-scope diff/finding, token limit, missing
 validation, or forbidden action becomes `attention-required`; it does not
 continue to a repair or GitHub action.
+
+After the single-task form has been verified, omit `--once` and provide an
+ordered contract directory to start the resumable continuous form:
+
+```bash
+ai-team supervise /home/eden/projects/CelebrateDeal \
+  --provider auto --bounded-delivery \
+  --task-contract-dir /home/eden/.local/share/ai-team/CelebrateDeal/contracts \
+  --execute --github-execute --auto-merge \
+  --allow-unreviewed-development-merge \
+  --interval-minutes 15 --max-iterations 3 --max-repair-attempts 2 \
+  --max-token-usage 180000 --stage-timeout-seconds 300
+```
+
+The supervisor processes `*.json` contracts in filename order, records each
+completed task SHA, and watches the directory for new work without rerunning an
+unchanged contract. Each successful task must retain its bounded-delivery
+receipt and deterministic validation hash before the GitHub executor may push,
+open a PR, wait for CI, merge, and fast-forward the clean primary worktree.
+Provider quota exhaustion and timeouts are retried after the configured
+interval. Invalid contracts, unsafe findings, other provider failures, failed CI,
+publication evidence mismatches, or dirty primary state stop fail closed with
+an `attention-required` state.
+
+The optional review waiver is intentionally narrow: it is accepted only when
+the project contract declares `project.stage: development`. Omitting
+`--allow-unreviewed-development-merge` preserves the existing approved-review
+gate. Continuous bounded delivery requires both `--github-execute` and
+`--auto-merge`; it refuses to run indefinitely while leaving completed changes
+unpublished or unverifiable.

@@ -166,6 +166,8 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 "commitSha": attempt.commit_sha,
                 "changedFiles": attempt.changed_files,
                 "validation": attempt.validation,
+                "runReceipt": str(attempt.run_receipt) if attempt.run_receipt else None,
+                "executorReceipt": str(attempt.executor_receipt) if attempt.executor_receipt else None,
             })
 
             qa = _run_stage(options, attempt.worktree_path, "qa", context, contract)

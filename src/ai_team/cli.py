@@ -13,6 +13,7 @@ from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_
 from ai_team.core.ci_monitor import monitor_pull_request, write_repair_completion_receipt
 from ai_team.core.delivery import DeliveryOptions, run_delivery_supervisor
 from ai_team.core.bounded_delivery import BoundedDeliveryError, BoundedDeliveryOptions, DeliveryLimits, run_bounded_delivery
+from ai_team.core.bounded_supervisor import ContinuousBoundedOptions, run_continuous_bounded_delivery
 from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
@@ -561,10 +562,15 @@ def supervise(
     delivery: bool,
     bounded_delivery: bool,
     task_contract: str | None,
+    task_contract_dir: str | None,
     max_iterations: int,
     max_repair_attempts: int,
     max_token_usage: int,
     stage_timeout_seconds: int,
+    auto_merge: bool,
+    allow_unreviewed_development_merge: bool,
+    ci_wait_seconds: int,
+    ci_poll_seconds: int,
     role: str | None = None,
 ) -> None:
     settings = load_settings()
@@ -576,14 +582,10 @@ def supervise(
             raise WorkflowError("bounded delivery selects audited role routes internally; use --provider auto without --role")
         if mode != "create-only":
             raise WorkflowError("bounded delivery owns its stage modes; do not pass --mode run-agent")
-        if isolated_auto_commit or github_action or github_execute:
+        if isolated_auto_commit or github_action:
             raise WorkflowError("bounded delivery never accepts legacy auto-commit or GitHub action flags")
         if dry_run:
             raise WorkflowError("bounded delivery requires explicit --execute")
-        if not once:
-            raise WorkflowError("bounded delivery v1 requires --once so each trusted task is explicitly bounded")
-        if not task_contract:
-            raise WorkflowError("bounded delivery requires --task-contract")
         limits = DeliveryLimits(
             max_iterations=max_iterations,
             max_repair_attempts=max_repair_attempts,
@@ -592,6 +594,46 @@ def supervise(
         )
         if min(limits.max_iterations, limits.max_repair_attempts, limits.max_token_usage, limits.timeout_seconds) < 1:
             raise WorkflowError("bounded delivery limits must all be positive")
+        if not once:
+            if task_contract:
+                raise WorkflowError("continuous bounded delivery uses --task-contract-dir, not --task-contract")
+            if not task_contract_dir:
+                raise WorkflowError("continuous bounded delivery requires --task-contract-dir")
+            selected_state_path = (
+                Path(state_path).resolve()
+                if state_path
+                else selected_report_dir / "continuous-bounded-delivery-state.json"
+            )
+            try:
+                result = run_continuous_bounded_delivery(
+                    ContinuousBoundedOptions(
+                        project_path=Path(project_path).resolve(),
+                        contract_dir=Path(task_contract_dir).resolve(),
+                        provider_for_role=lambda selected_role: build_provider("auto", settings, selected_role),
+                        workspace_allowlist=workspace_allowlist(settings),
+                        report_dir=selected_report_dir / "continuous-bounded-delivery",
+                        state_path=selected_state_path,
+                        limits=limits,
+                        once=False,
+                        interval_minutes=interval_minutes,
+                        max_runtime_minutes=max_runtime_minutes,
+                        github_execute=github_execute,
+                        auto_merge=auto_merge,
+                        allow_unreviewed_development_merge=allow_unreviewed_development_merge,
+                        ci_wait_seconds=ci_wait_seconds,
+                        ci_poll_seconds=ci_poll_seconds,
+                    )
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise WorkflowError(str(redact_secrets(str(exc)))) from None
+            print(json.dumps(redact_secrets(result), indent=2, default=str))
+            return
+        if task_contract_dir:
+            raise WorkflowError("one-shot bounded delivery accepts --task-contract only")
+        if not task_contract:
+            raise WorkflowError("bounded delivery requires --task-contract")
+        if github_execute or auto_merge or allow_unreviewed_development_merge:
+            raise WorkflowError("one-shot bounded delivery leaves GitHub publication to its caller")
         selected_state_path = Path(state_path).resolve() if state_path else selected_report_dir / "bounded-delivery-state.json"
         result = run_bounded_delivery(
             BoundedDeliveryOptions(
@@ -781,13 +823,25 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_parser.add_argument(
         "--bounded-delivery",
         action="store_true",
-        help="Run one explicit trusted task through the fail-closed multi-role delivery loop",
+        help="Run explicit trusted tasks through the fail-closed multi-role delivery loop",
     )
     supervisor_parser.add_argument("--task-contract", help="Path to a schemaVersion=1 trusted task contract JSON file")
+    supervisor_parser.add_argument(
+        "--task-contract-dir",
+        help="Directory of ordered schemaVersion=1 trusted task contracts for continuous bounded delivery",
+    )
     supervisor_parser.add_argument("--max-iterations", type=int, default=2)
     supervisor_parser.add_argument("--max-repair-attempts", type=int, default=1)
     supervisor_parser.add_argument("--max-token-usage", type=int, default=120000)
     supervisor_parser.add_argument("--stage-timeout-seconds", type=int, default=180)
+    supervisor_parser.add_argument("--auto-merge", action="store_true")
+    supervisor_parser.add_argument(
+        "--allow-unreviewed-development-merge",
+        action="store_true",
+        help="Allow CI-green merges without a human review only when project.stage=development",
+    )
+    supervisor_parser.add_argument("--ci-wait-seconds", type=int, default=900)
+    supervisor_parser.add_argument("--ci-poll-seconds", type=int, default=10)
 
     return parser
 
@@ -892,10 +946,15 @@ def main() -> None:
                 args.delivery,
                 args.bounded_delivery,
                 args.task_contract,
+                args.task_contract_dir,
                 args.max_iterations,
                 args.max_repair_attempts,
                 args.max_token_usage,
                 args.stage_timeout_seconds,
+                args.auto_merge,
+                args.allow_unreviewed_development_merge,
+                args.ci_wait_seconds,
+                args.ci_poll_seconds,
                 args.role,
             )
     except (BoundedDeliveryError, ProjectConfigError, WorkflowError) as exc:

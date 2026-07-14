@@ -27,6 +27,24 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(args.max_iterations, 2)
         self.assertEqual(args.max_repair_attempts, 1)
 
+    def test_continuous_bounded_delivery_flags_are_parsed(self) -> None:
+        args = build_parser().parse_args([
+            "supervise",
+            "project",
+            "--bounded-delivery",
+            "--task-contract-dir",
+            "contracts",
+            "--execute",
+            "--github-execute",
+            "--auto-merge",
+            "--allow-unreviewed-development-merge",
+        ])
+        self.assertFalse(args.once)
+        self.assertEqual(args.task_contract_dir, "contracts")
+        self.assertTrue(args.github_execute)
+        self.assertTrue(args.auto_merge)
+        self.assertTrue(args.allow_unreviewed_development_merge)
+
     def test_codex_auto_native_falls_back_without_extension(self) -> None:
         with patch("ai_team.cli.Path.home", return_value=Path("Z:/missing-home")):
             self.assertEqual(_resolve_codex_executable("auto-native"), "__codex_vscode_native_not_found__")

@@ -48,6 +48,7 @@ class GitHubExecutionOptions:
     pr_identifier: str | None = None
     merge_method: str = "squash"
     delete_branch: bool = False
+    require_approved_review: bool = True
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,12 @@ def execute_github_action(
     test_hash = options.test_evidence_hash
     preflight_reasons = _preflight_reasons(action, validation_hash, receipt_hash, secret_scan["hash"], test_hash)
     preflight_reasons.extend(_receipt_reasons(loaded_project, options.receipt_path))
+    if (
+        action == "merge"
+        and not options.require_approved_review
+        and loaded_project.profile.project.stage != "development"
+    ):
+        preflight_reasons.append("unreviewed merge is permitted only for development-stage projects")
     decision = evaluate_github_action(
         loaded_project,
         action,
@@ -189,7 +196,11 @@ def execute_github_action(
             60,
         )
         commands = [_command_dict(view_result)]
-        reasons = _merge_gate_reasons(view_result, loaded_project.commit_sha)
+        reasons = _merge_gate_reasons(
+            view_result,
+            loaded_project.commit_sha,
+            require_approved_review=options.require_approved_review,
+        )
         return GitHubExecutionResult(
             action=action,
             dry_run=True,
@@ -280,7 +291,11 @@ def execute_github_action(
         60,
     )
     commands.append(_command_dict(view_result))
-    merge_gate_reasons = _merge_gate_reasons(view_result, loaded_project.commit_sha)
+    merge_gate_reasons = _merge_gate_reasons(
+        view_result,
+        loaded_project.commit_sha,
+        require_approved_review=options.require_approved_review,
+    )
     if merge_gate_reasons:
         return GitHubExecutionResult(
             action=action,
@@ -541,7 +556,12 @@ def _extract_pr_url(stdout: str) -> str | None:
     return None
 
 
-def _merge_gate_reasons(result: subprocess.CompletedProcess[str], expected_commit_sha: str | None) -> list[str]:
+def _merge_gate_reasons(
+    result: subprocess.CompletedProcess[str],
+    expected_commit_sha: str | None,
+    *,
+    require_approved_review: bool = True,
+) -> list[str]:
     if result.returncode != 0:
         return ["gh pr view failed before merge"]
     try:
@@ -551,7 +571,7 @@ def _merge_gate_reasons(result: subprocess.CompletedProcess[str], expected_commi
     reasons: list[str] = []
     if payload.get("isDraft") is True:
         reasons.append("merge blocked because PR is draft")
-    if payload.get("reviewDecision") != "APPROVED":
+    if require_approved_review and payload.get("reviewDecision") != "APPROVED":
         reasons.append("merge requires approved review decision")
     if payload.get("mergeStateStatus") != "CLEAN":
         reasons.append("merge requires clean branch protection status")

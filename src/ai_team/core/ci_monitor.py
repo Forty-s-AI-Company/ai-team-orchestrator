@@ -98,19 +98,32 @@ def monitor_pull_request(
     poll_seconds: int = 10,
     runner: CommandRunner | None = None,
     sleeper: Callable[[float], None] = time.sleep,
+    require_approved_review: bool = True,
 ) -> CiMonitorResult:
     runner = runner or _run_command
     deadline = time.monotonic() + max(0, wait_seconds)
     transitions: list[dict[str, Any]] = []
     try:
-        snapshot = _fetch_snapshot(project_root, repository, pr_identifier, runner)
+        snapshot = _fetch_snapshot(
+            project_root,
+            repository,
+            pr_identifier,
+            runner,
+            require_approved_review=require_approved_review,
+        )
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         snapshot = _query_error_snapshot(str(exc))
     transitions.append({"observedAt": datetime.now(UTC).isoformat(), "status": snapshot["status"]})
     while snapshot["status"] == "pending" and time.monotonic() < deadline:
         sleeper(max(1, poll_seconds))
         try:
-            snapshot = _fetch_snapshot(project_root, repository, pr_identifier, runner)
+            snapshot = _fetch_snapshot(
+                project_root,
+                repository,
+                pr_identifier,
+                runner,
+                require_approved_review=require_approved_review,
+            )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             snapshot = _query_error_snapshot(str(exc))
         transitions.append({"observedAt": datetime.now(UTC).isoformat(), "status": snapshot["status"]})
@@ -145,6 +158,8 @@ def _fetch_snapshot(
     repository: str,
     pr_identifier: str,
     runner: CommandRunner,
+    *,
+    require_approved_review: bool = True,
 ) -> dict[str, Any]:
     result = runner(
         [
@@ -185,7 +200,7 @@ def _fetch_snapshot(
         status == "passed"
         and payload.get("state") == "OPEN"
         and payload.get("isDraft") is False
-        and payload.get("reviewDecision") == "APPROVED"
+        and (not require_approved_review or payload.get("reviewDecision") == "APPROVED")
         and payload.get("mergeStateStatus") == "CLEAN"
     )
     blockers: list[str] = []
@@ -195,7 +210,7 @@ def _fetch_snapshot(
         blockers.append("required checks are still pending")
     if failed:
         blockers.append("one or more checks failed")
-    if payload.get("reviewDecision") != "APPROVED":
+    if require_approved_review and payload.get("reviewDecision") != "APPROVED":
         blockers.append("approved review is required")
     if payload.get("mergeStateStatus") != "CLEAN":
         blockers.append("branch protection state is not clean")
