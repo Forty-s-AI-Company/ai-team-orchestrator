@@ -108,6 +108,39 @@ class BoundedDeliveryTests(unittest.TestCase):
             result = run_bounded_delivery(_options(Path(tmp), root, contract_path, _provider_for_role, outside_plan))
             self.assertEqual(result["status"], "attention-required")
             self.assertEqual(result["stopReason"], "engineering-diff-outside-allowed-paths")
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "03-engineer.json",
+                kind="policy-validation",
+                stop_reason="engineering-diff-outside-allowed-paths",
+            )
+
+    def test_engineering_commit_missing_receipt_is_not_stage_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def missing_commit(contract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
+                attempt = _successful_engineering_attempt(contract, instruction, provider, iteration)
+                return EngineeringAttempt(
+                    provider_result=attempt.provider_result,
+                    worktree_path=attempt.worktree_path,
+                    changed_files=attempt.changed_files,
+                    validation=attempt.validation,
+                    commit_sha=None,
+                )
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, _provider_for_role, missing_commit)
+            )
+
+            reason = "engineering-commit-missing"
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], reason)
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "03-engineer.json",
+                kind="commit-validation",
+                stop_reason=reason,
+            )
 
     def test_provider_timeout_is_a_fail_closed_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,6 +152,30 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertEqual(result["status"], "attention-required")
             self.assertEqual(result["stopReason"], "provider-timeout")
             self.assertTrue((Path(tmp) / "reports" / "01-pm.json").exists())
+
+    def test_token_budget_policy_failure_receipt_is_not_stage_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+            options = _options(
+                Path(tmp),
+                root,
+                contract_path,
+                _provider_for_role,
+                _successful_engineering_attempt,
+                max_token_usage=5,
+            )
+
+            result = run_bounded_delivery(options)
+
+            reason = "token-budget-exhausted"
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], reason)
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "01-pm.json",
+                kind="policy-validation",
+                stop_reason=reason,
+            )
 
     def test_read_only_stage_worktree_write_is_a_fail_closed_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -611,7 +668,15 @@ def _successful_engineering_attempt(contract, instruction: str, provider: BasePr
     )
 
 
-def _options(base: Path, root: Path, contract_path: Path, provider_for_role, engineering_executor) -> BoundedDeliveryOptions:
+def _options(
+    base: Path,
+    root: Path,
+    contract_path: Path,
+    provider_for_role,
+    engineering_executor,
+    *,
+    max_token_usage: int = 1000,
+) -> BoundedDeliveryOptions:
     def execute_in_project(contract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
         attempt = engineering_executor(contract, instruction, provider, iteration)
         return EngineeringAttempt(
@@ -631,7 +696,12 @@ def _options(base: Path, root: Path, contract_path: Path, provider_for_role, eng
         workspace_allowlist=[str(base)],
         report_dir=base / "reports",
         state_path=base / "state.json",
-        limits=DeliveryLimits(max_iterations=2, max_repair_attempts=1, max_token_usage=1000, timeout_seconds=30),
+        limits=DeliveryLimits(
+            max_iterations=2,
+            max_repair_attempts=1,
+            max_token_usage=max_token_usage,
+            timeout_seconds=30,
+        ),
         engineering_executor=execute_in_project,
     )
 
