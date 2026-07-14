@@ -188,6 +188,14 @@ class RoleRouterProvider(BaseProvider):
 
     def run(self, request: ProviderRequest) -> ProviderResult:
         write_required = request.metadata.get("writeRequired") is True
+        required_provider = request.metadata.get("requiredProvider")
+        if required_provider is not None and (
+            not isinstance(required_provider, str)
+            or required_provider != self.profile.primary.provider
+        ):
+            return self._policy_failure(
+                "required provider must match the role profile primary route"
+            )
         if request.run_mode == "read-only-agent" and (
             not self.profile.allow_read_only_agent
             or self.profile.primary.provider != "handsfreecode"
@@ -200,7 +208,11 @@ class RoleRouterProvider(BaseProvider):
         if write_required and not self.profile.allow_write:
             return self._policy_failure("selected role is not permitted to execute write workflows")
 
-        targets = (self.profile.primary,) if write_required else (
+        # Bounded delivery binds each audited role to one provider identity.
+        # Preserve that provider's transient failure so the continuous
+        # supervisor can classify and retry it instead of spending tokens on a
+        # fallback that the stage provider gate must reject anyway.
+        targets = (self.profile.primary,) if write_required or required_provider is not None else (
             self.profile.primary,
             *self.profile.fallbacks,
         )

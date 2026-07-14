@@ -165,6 +165,38 @@ class RouterProviderTests(unittest.TestCase):
         self.assertTrue(result.data["fallbackUsed"])
         self.assertEqual(antigravity.requests[0].metadata["requestedModel"], "Gemini 3.5 Flash (High)")
 
+    def test_role_router_required_provider_preserves_primary_quota_failure(self) -> None:
+        antigravity = _StaticProvider(
+            "antigravity",
+            ready=True,
+            result=_result("antigravity", False, ProviderErrorType.RATE_LIMIT),
+        )
+        codex = _RecordingProvider("codex", _result("codex", True))
+        router = RoleRouterProvider(
+            RoleRoutingProfile(
+                role="product-manager",
+                primary=RouteTarget("antigravity", "Gemini 3.5 Flash (High)", "high"),
+                fallbacks=(RouteTarget("codex", "gpt-5.6-terra", "medium"),),
+            ),
+            {"antigravity": antigravity, "codex": codex},
+        )
+
+        result = router.run(
+            ProviderRequest(
+                workflow="bounded-delivery-pm",
+                prompt="read only",
+                project_root=Path.cwd(),
+                metadata={"writeRequired": False, "requiredProvider": "antigravity"},
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.provider, "antigravity")
+        self.assertEqual(result.error_type, ProviderErrorType.RATE_LIMIT)
+        self.assertFalse(result.data["fallbackUsed"])
+        self.assertEqual(len(result.data["routeAttempts"]), 1)
+        self.assertEqual(codex.requests, [])
+
     def test_role_router_fails_closed_on_invalid_response(self) -> None:
         fallback = _RecordingProvider("handsfreecode", _result("handsfreecode", True))
         router = RoleRouterProvider(

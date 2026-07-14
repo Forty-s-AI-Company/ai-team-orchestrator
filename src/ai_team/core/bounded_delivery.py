@@ -214,6 +214,7 @@ def _run_stage(
     contract: TrustedTaskContract,
 ) -> dict[str, Any]:
     provider = options.provider_for_role(ROLE_BY_STAGE[stage])
+    expected = "antigravity" if stage in {"pm", "architect", "qa"} else "codex"
     request = ProviderRequest(
         workflow=f"bounded-delivery-{stage}", project_root=root, run_mode="run-agent",
         timeout_seconds=options.limits.timeout_seconds,
@@ -221,6 +222,7 @@ def _run_stage(
         metadata={
             "role": ROLE_BY_STAGE[stage], "writeRequired": False, "writeAccess": False,
             "taskSha": context["taskSha"], "boundedStage": stage,
+            "requiredProvider": expected,
         },
     )
     before = _read_only_git_fingerprint(root)
@@ -235,7 +237,6 @@ def _run_stage(
             _validation_failure("read-only-integrity", reason),
         )
         raise BoundedDeliveryError(reason)
-    expected = "antigravity" if stage in {"pm", "architect", "qa"} else "codex"
     if not _native_success(result, expected):
         reason = _provider_stop_reason(result)
         _write_receipt(options, context, stage, result, _validation_failure("provider-execution", reason))
@@ -589,6 +590,8 @@ def _provider_stop_reason(result: ProviderResult) -> str:
         return "provider-quota-exhausted"
     if result.error_type == ProviderErrorType.TIMEOUT:
         return "provider-timeout"
+    if result.error_type == ProviderErrorType.NETWORK:
+        return "provider-network-error"
     return "provider-native-execution-failed"
 
 
