@@ -379,39 +379,21 @@ def _validate_response(
     }
     if not result.success:
         return replace(result, data=base_data)
-    try:
-        payload = json.loads(result.content)
-    except json.JSONDecodeError:
-        return ProviderResult(
-            provider=result.provider,
-            success=False,
-            error_type=ProviderErrorType.INVALID_RESPONSE,
-            content=result.content,
-            attempts=result.attempts,
-            data=base_data,
-        )
-    valid = isinstance(payload, dict) and payload.get("challenge") == challenge
     bounded_stage = request.metadata.get("boundedStage")
     if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa"}:
         expected_schema = "ai-team-bounded-delivery/v1"
     else:
         expected_schema = "ai-team-repository-smoke/v1" if request.workflow == "provider-smoke" else "ai-team-antigravity/v1"
-    valid = valid and payload.get("schema") == expected_schema
-    valid = valid and all(isinstance(payload.get(key), list) for key in ("findings", "tests", "blockers"))
-    repository_smoke_passed = False
-    if valid and request.workflow == "provider-smoke":
-        probe_payload = payload.get("probe")
-        repository_smoke_passed = bool(
-            probe
-            and isinstance(probe_payload, dict)
-            and probe_payload.get("path") == probe[0]
-            and probe_payload.get("sha256") == probe[1]
+    matches = [
+        payload
+        for payload in _json_object_candidates(result.content)
+        if _payload_is_valid(
+            payload, request, challenge, expected_schema, bounded_stage, probe
         )
-        valid = repository_smoke_passed
-    elif valid:
-        valid = isinstance(payload.get("status"), str)
-        if expected_schema == "ai-team-bounded-delivery/v1":
-            valid = valid and payload.get("stage") == bounded_stage
+    ]
+    valid = len(matches) == 1
+    payload = matches[0] if valid else None
+    repository_smoke_passed = bool(valid and request.workflow == "provider-smoke")
     data = {
         **base_data,
         "responseValidated": valid,
@@ -423,10 +405,63 @@ def _validate_response(
         provider=result.provider,
         success=valid,
         error_type=None if valid else ProviderErrorType.INVALID_RESPONSE,
-        content=result.content,
+        content=(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if valid
+            else result.content
+        ),
         attempts=result.attempts,
         data=data,
     )
+
+
+def _json_object_candidates(content: str) -> list[dict[str, Any]]:
+    """Extract bounded JSON candidates while rejecting ambiguous envelopes."""
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, dict):
+        return [value]
+    if len(content) > 100_000 or content.count("{") > 256:
+        return []
+    decoder = json.JSONDecoder()
+    candidates: list[dict[str, Any]] = []
+    for index, character in enumerate(content):
+        if character != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(content, index)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            candidates.append(candidate)
+    return candidates
+
+
+def _payload_is_valid(
+    payload: dict[str, Any],
+    request: ProviderRequest,
+    challenge: str,
+    expected_schema: str,
+    bounded_stage: Any,
+    probe: tuple[str, str] | None,
+) -> bool:
+    valid = payload.get("challenge") == challenge and payload.get("schema") == expected_schema
+    valid = valid and all(isinstance(payload.get(key), list) for key in ("findings", "tests", "blockers"))
+    if not valid:
+        return False
+    if request.workflow == "provider-smoke":
+        probe_payload = payload.get("probe")
+        return bool(
+            probe
+            and isinstance(probe_payload, dict)
+            and probe_payload.get("path") == probe[0]
+            and probe_payload.get("sha256") == probe[1]
+        )
+    if not isinstance(payload.get("status"), str):
+        return False
+    return expected_schema != "ai-team-bounded-delivery/v1" or payload.get("stage") == bounded_stage
 
 
 def _timeout_result(request: ProviderRequest, diagnostics: dict[str, Any], message: str) -> ProviderResult:
