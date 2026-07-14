@@ -200,6 +200,145 @@ class IsolatedExecutorTests(unittest.TestCase):
             )
             self.assertEqual(log.stdout.strip(), "chore(ai-team): test safe change")
 
+    def test_auto_commit_missing_git_identity_fails_closed_with_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+            subprocess.run(["git", "config", "--unset-all", "user.name"], cwd=root, check=True)
+            subprocess.run(["git", "config", "--unset-all", "user.email"], cwd=root, check=True)
+
+            with patch.dict(
+                os.environ,
+                {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull},
+                clear=False,
+            ):
+                result = run_in_disposable_worktree(
+                    source_project_path=root,
+                    provider=_WritingProvider("notes/change.md", "safe change\n"),
+                    workflow_name="bug-fix-loop",
+                    workspace_allowlist=[tmp],
+                    receipt_dir=Path(tmp) / "receipts",
+                    worktree_parent=Path(tmp),
+                    keep_worktree=True,
+                    auto_commit=True,
+                )
+
+            self._assert_git_failure_receipt(result, "git-identity-missing")
+            self.assertEqual(
+                result.commit_result["missingIdentityFields"],
+                ["user.name", "user.email"],
+            )
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable Git hook fixture")
+    def test_auto_commit_hook_rejection_fails_closed_and_redacts_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+            hook = root / ".git" / "hooks" / "pre-commit"
+            sensitive_line = "api_" + "key = hook-" + "secret-value"
+            hook.write_text(
+                f"#!/bin/sh\necho '{sensitive_line}' >&2\nexit 1\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o700)
+
+            result = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=_WritingProvider("notes/change.md", "safe change\n"),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                auto_commit=True,
+            )
+
+            self._assert_git_failure_receipt(result, "git-commit-failed")
+            receipt_text = result.executor_receipt.read_text(encoding="utf-8")
+            self.assertNotIn("hook-secret-value", receipt_text)
+            self.assertIn("<redacted>", receipt_text)
+
+    def test_auto_commit_git_add_failure_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+
+            def fail_add(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+                if args and args[0] == "add":
+                    return subprocess.CompletedProcess(
+                        ["git", *args],
+                        128,
+                        "",
+                        "api_" + "key = " + ("z" * 4100),
+                    )
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=cwd,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+
+            with patch("ai_team.core.isolated_executor._run_git_attempt", side_effect=fail_add):
+                result = run_in_disposable_worktree(
+                    source_project_path=root,
+                    provider=_WritingProvider("notes/change.md", "safe change\n"),
+                    workflow_name="bug-fix-loop",
+                    workspace_allowlist=[tmp],
+                    receipt_dir=Path(tmp) / "receipts",
+                    worktree_parent=Path(tmp),
+                    keep_worktree=True,
+                    auto_commit=True,
+                )
+
+            self._assert_git_failure_receipt(result, "git-add-failed")
+            receipt_text = result.executor_receipt.read_text(encoding="utf-8")
+            self.assertNotIn("z" * 100, receipt_text)
+            self.assertIn("<redacted>", receipt_text)
+
+    def test_auto_commit_git_commit_failure_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+
+            def fail_commit(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+                if args and args[0] == "commit":
+                    return subprocess.CompletedProcess(
+                        ["git", *args],
+                        1,
+                        "",
+                        "synthetic commit failure",
+                    )
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=cwd,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+
+            with patch("ai_team.core.isolated_executor._run_git_attempt", side_effect=fail_commit):
+                result = run_in_disposable_worktree(
+                    source_project_path=root,
+                    provider=_WritingProvider("notes/change.md", "safe change\n"),
+                    workflow_name="bug-fix-loop",
+                    workspace_allowlist=[tmp],
+                    receipt_dir=Path(tmp) / "receipts",
+                    worktree_parent=Path(tmp),
+                    keep_worktree=True,
+                    auto_commit=True,
+                )
+
+            self._assert_git_failure_receipt(result, "git-commit-failed")
+            self.assertEqual(result.commit_result["returnCode"], 1)
+            self.assertEqual(result.commit_result["gitOperation"], "commit")
+
     def test_repair_can_reuse_the_same_disposable_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -684,6 +823,21 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertFalse(result.success)
             self.assertIn("head SHA", " ".join(result.reasons))
             self.assertIn("pending", " ".join(result.reasons))
+
+    def _assert_git_failure_receipt(self, result, stop_reason: str) -> None:
+        self.assertTrue(result.workflow_result.provider_result.success)
+        self.assertTrue(result.run_receipt.exists())
+        self.assertTrue(result.executor_receipt.exists())
+        self.assertFalse(result.commit_result["committed"])
+        self.assertEqual(result.commit_result["stopReason"], stop_reason)
+        self.assertFalse(result.commit_result["validationResult"]["success"])
+        self.assertEqual(result.commit_result["validationResult"]["kind"], "git-commit")
+        payload = json.loads(result.executor_receipt.read_text(encoding="utf-8"))
+        self.assertTrue(payload["providerSuccess"])
+        self.assertFalse(payload["validationResult"]["success"])
+        self.assertEqual(payload["validationResult"]["kind"], "git-commit")
+        self.assertEqual(payload["validationResult"]["stopReason"], stop_reason)
+        self.assertEqual(payload["stopReason"], stop_reason)
 
 
 class _WritingProvider(BaseProvider):

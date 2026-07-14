@@ -330,6 +330,9 @@ def _default_engineering_executor(options: BoundedDeliveryOptions) -> Callable[[
         )
         reusable_worktree = result.worktree_path
         validation = result.commit_result.get("validation") or {"success": False}
+        commit_validation = result.commit_result.get("validationResult")
+        if isinstance(commit_validation, dict) and commit_validation.get("success") is False:
+            validation = {**validation, **commit_validation}
         return EngineeringAttempt(
             provider_result=result.workflow_result.provider_result, worktree_path=result.worktree_path,
             changed_files=list(result.git_policy.get("changedFiles") or []), validation=validation,
@@ -376,6 +379,11 @@ def _engineering_failure(
     if not _native_success(attempt.provider_result, "codex"):
         return _provider_stop_reason(attempt.provider_result), "engineer", "provider-execution"
     if not attempt.validation.get("success"):
+        kind = attempt.validation.get("kind")
+        reason = attempt.validation.get("stopReason")
+        if isinstance(kind, str) and isinstance(reason, str):
+            stage = "engineer" if kind in {"git-commit", "policy-validation"} else "validation"
+            return reason, stage, kind
         return "deterministic-validation-failed", "validation", "deterministic-validation"
     if not attempt.commit_sha:
         return "engineering-commit-missing", "engineer", "commit-validation"
