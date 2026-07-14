@@ -7,7 +7,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,6 +32,7 @@ RECOVERABLE_STOP_REASONS = {
 MAX_CONTRACTS = 256
 MAX_CONTRACT_BYTES = 64_000
 MAX_TOTAL_CONTRACT_BYTES = 1_000_000
+MAX_PROVIDER_QUOTA_BACKOFF_SECONDS = 6 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class ContinuousBoundedOptions:
     publisher: Callable[["ContinuousBoundedOptions", ContractEntry, dict[str, Any]], dict[str, Any]] | None = None
     sleeper: Callable[[float], None] = time.sleep
     monotonic: Callable[[], float] = time.monotonic
+    wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
 
 def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[str, Any]:
@@ -124,6 +126,29 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 options.sleeper(options.interval_minutes * 60)
                 continue
 
+            remaining_backoff = _provider_backoff_remaining(
+                prior,
+                selected,
+                options.wall_clock(),
+            )
+            if remaining_backoff > 0:
+                state = _supervisor_state(
+                    prior,
+                    cycles,
+                    "waiting-provider",
+                    completed,
+                    queue_size=_pending_count(entries, completed),
+                    current=selected,
+                    stop_reason="provider-quota-exhausted",
+                    next_action="retry-after-provider-reset",
+                    provider_backoff=prior.get("providerBackoff"),
+                )
+                _write_json(options.state_path, state)
+                if _must_stop(options, started):
+                    return state
+                options.sleeper(remaining_backoff)
+                continue
+
             task_dir = options.report_dir / "tasks" / f"{_slug(selected.contract.id)}-{selected.task_sha[:12]}"
             task_state = task_dir / "state.json"
             running = _supervisor_state(
@@ -184,6 +209,17 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
             if status not in {"completed", "already-completed"}:
                 reason = str(effective_result.get("stopReason") or "bounded-delivery-failed")
                 waiting = reason in RECOVERABLE_STOP_REASONS
+                provider_backoff = (
+                    _next_provider_quota_backoff(
+                        prior,
+                        selected,
+                        str(effective_result.get("stage") or "unknown"),
+                        options.interval_minutes * 60,
+                        options.wall_clock(),
+                    )
+                    if reason == "provider-quota-exhausted"
+                    else None
+                )
                 state = _supervisor_state(
                     running,
                     cycles,
@@ -194,11 +230,16 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                     stop_reason=reason,
                     next_action="retry-after-provider-reset" if waiting else "manual-review-required",
                     delivery_result=effective_result,
+                    provider_backoff=provider_backoff,
                 )
                 _write_json(options.state_path, state)
                 if not waiting or _must_stop(options, started):
                     return state
-                options.sleeper(options.interval_minutes * 60)
+                options.sleeper(
+                    int(provider_backoff["delaySeconds"])
+                    if provider_backoff
+                    else options.interval_minutes * 60
+                )
                 continue
 
             publication: dict[str, Any] | None = None
@@ -436,6 +477,7 @@ def _supervisor_state(
     delivery_result: dict[str, Any] | None = None,
     publication: dict[str, Any] | None = None,
     diagnostic: str | None = None,
+    provider_backoff: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "schemaVersion": 1,
@@ -459,7 +501,64 @@ def _supervisor_state(
         "delivery": _result_summary(delivery_result),
         "publication": publication,
         "diagnostic": diagnostic,
+        "providerBackoff": provider_backoff,
     }
+
+
+def _next_provider_quota_backoff(
+    prior: dict[str, Any],
+    current: ContractEntry,
+    stage: str,
+    base_delay_seconds: int,
+    now: datetime,
+) -> dict[str, Any]:
+    previous = prior.get("providerBackoff")
+    consecutive_failures = 1
+    if (
+        isinstance(previous, dict)
+        and previous.get("taskSha") == current.task_sha
+        and previous.get("stage") == stage
+        and previous.get("stopReason") == "provider-quota-exhausted"
+    ):
+        previous_count = previous.get("consecutiveFailures")
+        if isinstance(previous_count, int) and not isinstance(previous_count, bool):
+            consecutive_failures = previous_count + 1
+    exponent = min(consecutive_failures - 1, 20)
+    maximum = max(base_delay_seconds, MAX_PROVIDER_QUOTA_BACKOFF_SECONDS)
+    delay_seconds = min(base_delay_seconds * (2**exponent), maximum)
+    retry_at = _as_utc(now) + timedelta(seconds=delay_seconds)
+    return {
+        "taskSha": current.task_sha,
+        "stage": stage,
+        "stopReason": "provider-quota-exhausted",
+        "consecutiveFailures": consecutive_failures,
+        "delaySeconds": delay_seconds,
+        "nextRetryAt": retry_at.isoformat(),
+    }
+
+
+def _provider_backoff_remaining(
+    prior: dict[str, Any],
+    current: ContractEntry,
+    now: datetime,
+) -> int:
+    if (
+        prior.get("status") != "waiting-provider"
+        or prior.get("stopReason") != "provider-quota-exhausted"
+    ):
+        return 0
+    backoff = prior.get("providerBackoff")
+    if not isinstance(backoff, dict) or backoff.get("taskSha") != current.task_sha:
+        return 0
+    retry_at = datetime.fromisoformat(str(backoff["nextRetryAt"]))
+    remaining = (retry_at - _as_utc(now)).total_seconds()
+    return max(0, int(remaining + 0.999999))
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        raise ValueError("wall clock must be timezone-aware")
+    return value.astimezone(UTC)
 
 
 def _result_summary(result: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -588,7 +687,50 @@ def _read_supervisor_state(path: Path) -> dict[str, Any]:
         raise ValueError("continuous bounded delivery state is unreadable or invalid") from exc
     if not isinstance(value, dict):
         raise ValueError("continuous bounded delivery state must be a JSON object")
+    _validate_provider_backoff(value.get("providerBackoff"))
     return value
+
+
+def _validate_provider_backoff(value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("continuous bounded delivery provider backoff must be an object")
+    required = {
+        "taskSha",
+        "stage",
+        "stopReason",
+        "consecutiveFailures",
+        "delaySeconds",
+        "nextRetryAt",
+    }
+    if set(value) != required:
+        raise ValueError("continuous bounded delivery provider backoff has invalid fields")
+    task_sha = value.get("taskSha")
+    if not (
+        isinstance(task_sha, str)
+        and len(task_sha) == 64
+        and all(character in "0123456789abcdef" for character in task_sha)
+    ):
+        raise ValueError("continuous bounded delivery provider backoff task SHA is invalid")
+    if value.get("stopReason") != "provider-quota-exhausted":
+        raise ValueError("continuous bounded delivery provider backoff reason is invalid")
+    stage = value.get("stage")
+    if not (
+        isinstance(stage, str)
+        and 1 <= len(stage) <= 64
+        and all(character.isalnum() or character in "-_" for character in stage)
+    ):
+        raise ValueError("continuous bounded delivery provider backoff stage is invalid")
+    for field in ("consecutiveFailures", "delaySeconds"):
+        item = value.get(field)
+        if not isinstance(item, int) or isinstance(item, bool) or item < 1:
+            raise ValueError(f"continuous bounded delivery provider backoff {field} is invalid")
+    try:
+        retry_at = datetime.fromisoformat(str(value.get("nextRetryAt")))
+        _as_utc(retry_at)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("continuous bounded delivery provider backoff retry time is invalid") from exc
 
 
 def _state_error_path(path: Path) -> Path:
