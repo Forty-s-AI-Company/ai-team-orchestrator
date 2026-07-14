@@ -13,6 +13,7 @@ from ai_team.core.github_gate import evaluate_github_action
 from ai_team.core.isolated_executor import (
     prepare_dependency_link,
     remove_dependency_link,
+    run_validation_commands,
     run_in_disposable_worktree,
 )
 from ai_team.core.project_loader import load_project
@@ -109,6 +110,82 @@ class IsolatedExecutorTests(unittest.TestCase):
 
             remove_dependency_link(prepared)
             self.assertFalse(prepared.exists())
+
+    def test_partial_dependency_cache_cannot_suppress_next_dependency_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            worktree = root / "worktree"
+            source_binary = source / "node_modules" / ".bin" / "eslint"
+            source_binary.parent.mkdir(parents=True)
+            source_binary.write_text("eslint\n", encoding="utf-8")
+            cache = worktree / "node_modules" / ".vite" / "cache"
+            cache.mkdir(parents=True)
+            (worktree / "package.json").write_text(
+                json.dumps({"dependencies": {"next": "16.2.10"}}),
+                encoding="utf-8",
+            )
+
+            prepared = prepare_dependency_link(worktree, source)
+
+            self.assertEqual(prepared, worktree / "node_modules")
+            self.assertEqual((prepared / ".bin" / "eslint").read_text(encoding="utf-8"), "eslint\n")
+            self.assertTrue(cache.exists())
+            remove_dependency_link(prepared)
+            self.assertFalse(prepared.exists())
+
+    def test_provider_sees_controlled_dependencies_before_it_runs(self) -> None:
+        class DependencyAwareProvider(BaseProvider):
+            saw_dependencies = False
+
+            def ready(self) -> bool:
+                return True
+
+            def run(self, request: ProviderRequest) -> ProviderResult:
+                self.saw_dependencies = (request.project_root / "node_modules" / ".bin" / "eslint").is_file()
+                return ProviderResult(provider="mock", success=True, content="dependency inspection complete")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+            (root / ".gitignore").write_text("reports/\nlogs/\nnode_modules/\n", encoding="utf-8")
+            (root / "package.json").write_text(
+                json.dumps({"dependencies": {"next": "16.2.10"}}),
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", ".gitignore", "package.json"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "add package manifest"], cwd=root, check=True, capture_output=True)
+            eslint = root / "node_modules" / ".bin" / "eslint"
+            eslint.parent.mkdir(parents=True)
+            eslint.write_text("eslint\n", encoding="utf-8")
+            provider = DependencyAwareProvider()
+
+            result = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=provider,
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+            )
+
+            self.assertTrue(provider.saw_dependencies)
+            self.assertFalse((result.worktree_path / "node_modules").exists())
+
+    def test_validation_command_unavailable_is_fail_closed_environment_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_validation_commands(
+                Path(tmp),
+                ["definitely-not-an-ai-team-command --version"],
+                require_nonempty=True,
+            )
+
+            self.assertFalse(result["success"])
+            self.assertEqual(result["kind"], "execution-environment")
+            self.assertEqual(result["stopReason"], "validation-command-unavailable")
+            self.assertEqual(result["commands"][0]["returnCode"], 127)
 
     def test_non_next_dependencies_keep_lightweight_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
