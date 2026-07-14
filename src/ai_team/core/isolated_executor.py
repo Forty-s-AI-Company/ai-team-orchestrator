@@ -104,7 +104,11 @@ def run_in_disposable_worktree(
                 loaded.root,
                 validation_commands or [],
                 require_nonempty=require_validation,
-                dependency_root=source.root,
+                dependency_root=(
+                    loaded.root
+                    if (loaded.root / "node_modules").exists()
+                    else source.root
+                ),
             )
         finally:
             remove_dependency_link(dependency_link)
@@ -237,8 +241,36 @@ def prepare_dependency_link(worktree_root: Path, source_root: Path) -> Path | No
             timeout=30,
         )
         return target_modules if result.returncode == 0 and target_modules.exists() else None
+    if _requires_local_dependency_tree(worktree_root):
+        try:
+            # Next.js Turbopack rejects a top-level node_modules symlink that
+            # resolves outside the project root. A private validation copy also
+            # prevents generators such as Prisma from mutating primary deps.
+            shutil.copytree(source_modules, target_modules, symlinks=True)
+        except Exception:
+            if target_modules.exists():
+                shutil.rmtree(target_modules)
+            raise
+        return target_modules
     target_modules.symlink_to(source_modules, target_is_directory=True)
     return target_modules
+
+
+def _requires_local_dependency_tree(project_root: Path) -> bool:
+    manifest = project_root / "package.json"
+    if not manifest.is_file() or manifest.is_symlink():
+        return False
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    dependencies = {
+        **(payload.get("dependencies") if isinstance(payload.get("dependencies"), dict) else {}),
+        **(payload.get("devDependencies") if isinstance(payload.get("devDependencies"), dict) else {}),
+    }
+    return "next" in dependencies
 
 
 def remove_dependency_link(link: Path | None) -> None:
@@ -247,7 +279,9 @@ def remove_dependency_link(link: Path | None) -> None:
     if link.is_symlink():
         link.unlink()
     else:
-        os.rmdir(link)
+        # The path is returned only when this module created it. On POSIX this
+        # may be a private dependency copy; on Windows it may be a junction.
+        shutil.rmtree(link)
 
 
 def run_validation_commands(
