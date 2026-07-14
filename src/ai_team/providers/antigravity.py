@@ -195,9 +195,11 @@ def _compact_prompt(
     if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa"}:
         task = values.get("task", "unknown")[:120]
         instruction = values.get("instruction", "unknown")[:280]
-        allowed_paths = values.get("allowed write paths", "[]")[:220]
-        validation_commands = values.get("validation commands", "[]")[:280]
-        implementation_evidence = values.get("implementation evidence", "{}")[:220]
+        allowed_paths = _compact_json_array(values.get("allowed write paths", "[]"), max_chars=220)
+        validation_commands = _compact_json_array(values.get("validation commands", "[]"), max_chars=280)
+        implementation_evidence = _compact_implementation_evidence(
+            values.get("implementation evidence", "{}")
+        )
         stage_requirements = {
             "pm": "Include a non-empty acceptanceCriteria string array.",
             "architect": (
@@ -238,6 +240,44 @@ def _compact_prompt(
         return normalized
     suffix = " [truncated]"
     return f"{normalized[: limit - len(suffix)].rstrip()}{suffix}"
+
+
+def _compact_json_array(raw: str, *, max_chars: int) -> str:
+    """Return a bounded JSON array without leaving a truncated JSON fragment."""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return "[]"
+    if not isinstance(value, list):
+        return "[]"
+    items = [item[:160] for item in value if isinstance(item, str)]
+    while items:
+        encoded = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded) <= max_chars:
+            return encoded
+        items.pop()
+    return "[]"
+
+
+def _compact_implementation_evidence(raw: str) -> str:
+    """Expose only the bounded facts a read-only QA stage needs to verify."""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    changed_files = value.get("changedFiles")
+    repairs = value.get("repairs")
+    validation = value.get("validation")
+    commit_sha = value.get("commitSha")
+    summary = {
+        "changedFileCount": len(changed_files) if isinstance(changed_files, list) else 0,
+        "commitSha": commit_sha[:12] if isinstance(commit_sha, str) else None,
+        "validationSuccess": validation.get("success") is True if isinstance(validation, dict) else False,
+        "repairCount": len(repairs) if isinstance(repairs, list) else 0,
+    }
+    return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
 
 
 def _select_repository_probe(project_root: Path) -> tuple[str, str] | None:
