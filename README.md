@@ -607,6 +607,16 @@ interval. Invalid contracts, unsafe findings, other provider failures, failed CI
 publication evidence mismatches, or dirty primary state stop fail closed with
 an `attention-required` state.
 
+Retries recover only dependency-ordered stage checkpoints whose provider,
+structured validation, task SHA, secondary review, token usage, commit, and
+receipt evidence still agree. A completed Engineer checkpoint additionally
+requires the same clean disposable worktree at the attested commit; a partial
+Engineer retry may reuse a dirty worktree only when every changed path remains
+inside the trusted task scope. Missing, modified, cross-repository, or
+out-of-scope recovery state stops fail closed instead of rerunning later stages
+against unverified code. Token usage and bounded repair evidence remain
+cumulative across process restarts.
+
 The optional review waiver is intentionally narrow: it is accepted only when
 the project contract declares `project.stage: development`. Omitting
 `--allow-unreviewed-development-merge` preserves the existing approved-review
