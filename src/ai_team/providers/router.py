@@ -6,6 +6,9 @@ from typing import Any
 from .base import BaseProvider, ProviderErrorType, ProviderRequest, ProviderResult, redact_secrets
 
 
+MAX_SECONDARY_CONTENT_CHARS = 16_000
+
+
 @dataclass(frozen=True)
 class ProviderRouteAttempt:
     provider: str
@@ -298,18 +301,27 @@ class RoleRouterProvider(BaseProvider):
             target,
         )
         result = provider.run(review_request)
+        content = str(redact_secrets(result.content))
+        content_truncated = len(content) > MAX_SECONDARY_CONTENT_CHARS
+        if content_truncated:
+            content = content[:MAX_SECONDARY_CONTENT_CHARS]
         return redact_secrets(
             {
                 **target.as_dict(),
-                "success": result.success,
-                "errorType": result.error_type,
+                "success": result.success and not content_truncated,
+                "errorType": (
+                    ProviderErrorType.INVALID_RESPONSE
+                    if content_truncated
+                    else result.error_type
+                ),
                 "runtimeProvider": result.data.get("runtimeProvider"),
                 "tokenUsage": result.data.get("tokenUsage", 0),
                 "tokenUsageReported": result.data.get(
                     "tokenUsageReported",
                     "tokenUsage" in result.data,
                 ),
-                "content": result.content[:2000],
+                "content": content,
+                "contentTruncated": content_truncated,
             }
         )
 

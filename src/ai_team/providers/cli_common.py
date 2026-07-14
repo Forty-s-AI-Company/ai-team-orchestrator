@@ -178,6 +178,7 @@ def cli_run_result(
     request: ProviderRequest,
     prompt_arg_mode: str = "append",
     diagnostics_override: dict[str, Any] | None = None,
+    stdout_only_content: bool = False,
 ) -> ProviderResult:
     diagnostics = diagnostics_override or build_diagnostics(provider_name, settings)
     blocked = result_from_diagnostics(provider_name, diagnostics, request)
@@ -216,11 +217,12 @@ def cli_run_result(
     )
     error_type = _error_type_from_command(result)
     success = result.return_code == 0 and error_type is None
+    content = result.stdout.strip() if stdout_only_content and success else result.combined.strip()
     return ProviderResult(
         provider=provider_name,
         success=success,
         error_type=error_type,
-        content=f"{result.stdout}\n{result.stderr}".strip(),
+        content=content,
         data={
             "runMode": request.run_mode,
             "diagnostics": diagnostics,

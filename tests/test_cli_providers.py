@@ -71,6 +71,26 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("native progress", result.data["command"]["stderr"])
         self.assertEqual(result.data["tokenUsage"], 42)
 
+    def test_codex_structured_content_is_not_limited_by_command_evidence(self) -> None:
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=[
+                    "-c",
+                    "import json; print(json.dumps({'schema':'example/v1','payload':'x'*5000}))",
+                ],
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertTrue(result.success)
+        self.assertGreater(len(result.content), 5000)
+        self.assertEqual(json.loads(result.content)["schema"], "example/v1")
+        self.assertEqual(len(result.data["command"]["stdout"]), 4000)
+
     def test_antigravity_routing_replaces_only_allowlisted_model(self) -> None:
         settings = AntigravitySettings(allowed_models=("Gemini 3.1 Pro (High)",))
 

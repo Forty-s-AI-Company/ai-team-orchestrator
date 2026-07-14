@@ -97,6 +97,7 @@ class CodexProvider(BaseProvider):
             cli_settings,
             request,
             prompt_arg_mode="stdin",
+            stdout_only_content=True,
         )
         return _with_routing_metadata(result, request)
 
@@ -134,6 +135,7 @@ class CodexProvider(BaseProvider):
                 cli_settings,
                 smoke_request,
                 prompt_arg_mode="stdin",
+                stdout_only_content=True,
             )
         validated = _validate_smoke_response(result, challenge)
         return _with_routing_metadata(validated, request)
@@ -151,16 +153,14 @@ def _validate_smoke_response(result: ProviderResult, challenge: str) -> Provider
     if not result.success:
         return replace(result, data=data)
 
-    command = result.data.get("command") if isinstance(result.data, dict) else None
-    stdout = command.get("stdout", "") if isinstance(command, dict) else ""
     try:
-        payload = json.loads(str(stdout).strip())
+        payload = json.loads(result.content.strip())
     except json.JSONDecodeError:
         return ProviderResult(
             provider="codex",
             success=False,
             error_type=ProviderErrorType.INVALID_RESPONSE,
-            content=str(stdout),
+            content=result.content,
             attempts=result.attempts,
             data=data,
         )
@@ -176,7 +176,7 @@ def _validate_smoke_response(result: ProviderResult, challenge: str) -> Provider
         provider="codex",
         success=valid,
         error_type=None if valid else ProviderErrorType.INVALID_RESPONSE,
-        content=json.dumps(payload, separators=(",", ":")) if isinstance(payload, dict) else str(stdout),
+        content=json.dumps(payload, separators=(",", ":")) if isinstance(payload, dict) else result.content,
         attempts=result.attempts,
         data={
             **data,
@@ -210,15 +210,12 @@ def _apply_routing_options(
 
 def _with_routing_metadata(result: ProviderResult, request: ProviderRequest) -> ProviderResult:
     token_usage = _extract_token_usage(result)
-    command = result.data.get("command") if isinstance(result.data, dict) else None
-    stdout = command.get("stdout") if isinstance(command, dict) else None
     # Codex writes native progress and token diagnostics to stderr. Keep those
-    # details in the redacted command evidence, but expose only the generated
-    # stdout as provider content so structured consumers can validate it.
-    content = stdout.strip() if result.success and isinstance(stdout, str) and stdout.strip() else result.content
+    # details in the bounded command evidence. cli_run_result already exposes
+    # the complete generated stdout separately, so structured consumers are not
+    # forced to parse a diagnostic string or a truncated evidence field.
     return replace(
         result,
-        content=content,
         data={
             **result.data,
             "requestedModel": request.metadata.get("requestedModel"),

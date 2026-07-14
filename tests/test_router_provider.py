@@ -263,6 +263,63 @@ class RouterProviderTests(unittest.TestCase):
         self.assertFalse(reviewer.requests[0].metadata["writeRequired"])
         self.assertFalse(reviewer.requests[0].metadata["writeAccess"])
 
+    def test_secondary_review_preserves_structured_content_beyond_old_limit(self) -> None:
+        structured = '{"schema":"example/v1","payload":"' + ("x" * 3000) + '"}'
+        reviewer = _RecordingProvider(
+            "codex",
+            ProviderResult(provider="codex", success=True, content=structured),
+        )
+        router = RoleRouterProvider(
+            RoleRoutingProfile(
+                role="architect",
+                primary=RouteTarget("antigravity", "Gemini 3.1 Pro (High)", "high"),
+                secondary=RouteTarget("codex", "gpt-5.6-sol", "high"),
+            ),
+            {
+                "antigravity": _StaticProvider(
+                    "antigravity",
+                    ready=True,
+                    result=_result("antigravity", True),
+                ),
+                "codex": reviewer,
+            },
+        )
+
+        result = router.run(_request())
+
+        secondary = result.data["secondaryReview"]
+        self.assertTrue(secondary["success"])
+        self.assertFalse(secondary["contentTruncated"])
+        self.assertEqual(secondary["content"], structured)
+
+    def test_secondary_review_fails_closed_when_content_exceeds_bound(self) -> None:
+        reviewer = _RecordingProvider(
+            "codex",
+            ProviderResult(provider="codex", success=True, content="x" * 16_001),
+        )
+        router = RoleRouterProvider(
+            RoleRoutingProfile(
+                role="architect",
+                primary=RouteTarget("antigravity", "Gemini 3.1 Pro (High)", "high"),
+                secondary=RouteTarget("codex", "gpt-5.6-sol", "high"),
+            ),
+            {
+                "antigravity": _StaticProvider(
+                    "antigravity",
+                    ready=True,
+                    result=_result("antigravity", True),
+                ),
+                "codex": reviewer,
+            },
+        )
+
+        result = router.run(_request())
+
+        secondary = result.data["secondaryReview"]
+        self.assertFalse(secondary["success"])
+        self.assertTrue(secondary["contentTruncated"])
+        self.assertEqual(secondary["errorType"], ProviderErrorType.INVALID_RESPONSE)
+
 
 class _StaticProvider(BaseProvider):
     def __init__(self, name: str, ready: bool, result: ProviderResult | None) -> None:
