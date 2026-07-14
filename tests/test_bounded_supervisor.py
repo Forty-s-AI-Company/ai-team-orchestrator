@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -113,6 +114,7 @@ class ContinuousBoundedSupervisorTests(unittest.TestCase):
             sleeps: list[float] = []
             waiting_states: list[dict[str, object]] = []
             state_path = root / "state.json"
+            now = [datetime(2026, 7, 15, tzinfo=UTC)]
 
             def delivery(_options):
                 attempts.append(task_sha)
@@ -131,6 +133,7 @@ class ContinuousBoundedSupervisorTests(unittest.TestCase):
             def sleep_and_capture(seconds: float) -> None:
                 sleeps.append(seconds)
                 waiting_states.append(json.loads(state_path.read_text(encoding="utf-8")))
+                now[0] += timedelta(seconds=seconds)
 
             times = iter((0.0, 0.0, 61.0))
             result = run_continuous_bounded_delivery(
@@ -150,6 +153,7 @@ class ContinuousBoundedSupervisorTests(unittest.TestCase):
                     publisher=lambda _options, _entry, _result: {"success": True},
                     sleeper=sleep_and_capture,
                     monotonic=lambda: next(times),
+                    wall_clock=lambda: now[0],
                 )
             )
 
@@ -158,8 +162,181 @@ class ContinuousBoundedSupervisorTests(unittest.TestCase):
             self.assertEqual(waiting_states[0]["status"], "waiting-provider")
             self.assertEqual(waiting_states[0]["stopReason"], "provider-quota-exhausted")
             self.assertEqual(waiting_states[0]["nextAction"], "retry-after-provider-reset")
+            self.assertEqual(
+                waiting_states[0]["providerBackoff"],
+                {
+                    "taskSha": task_sha,
+                    "stage": "unknown",
+                    "stopReason": "provider-quota-exhausted",
+                    "consecutiveFailures": 1,
+                    "delaySeconds": 60,
+                    "nextRetryAt": "2026-07-15T00:01:00+00:00",
+                },
+            )
             self.assertEqual(result["status"], "completed")
             self.assertIn(task_sha, result["completedTaskShas"])
+
+    def test_repeated_quota_failures_use_persisted_exponential_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            contract_path = _write_contract(contracts / "001-task.json", "task")
+            task_sha = load_trusted_task_contract(contract_path)[1]
+            attempts = 0
+            sleeps: list[float] = []
+            now = [datetime(2026, 7, 15, tzinfo=UTC)]
+
+            def delivery(_options):
+                nonlocal attempts
+                attempts += 1
+                if attempts <= 3:
+                    return {
+                        "status": "attention-required",
+                        "stopReason": "provider-quota-exhausted",
+                        "taskSha": task_sha,
+                    }
+                return {
+                    "status": "completed",
+                    "taskSha": task_sha,
+                    "commitSha": "commit-task",
+                }
+
+            def sleep_and_advance(seconds: float) -> None:
+                sleeps.append(seconds)
+                now[0] += timedelta(seconds=seconds)
+
+            times = iter((0.0, 0.0, 0.0, 0.0, 61.0))
+            result = run_continuous_bounded_delivery(
+                ContinuousBoundedOptions(
+                    project_path=root,
+                    contract_dir=contracts,
+                    provider_for_role=lambda _role: _NoopProvider(),
+                    workspace_allowlist=[tmp],
+                    report_dir=root / "reports",
+                    state_path=root / "state.json",
+                    once=False,
+                    interval_minutes=1,
+                    max_runtime_minutes=1,
+                    github_execute=True,
+                    auto_merge=True,
+                    delivery_runner=delivery,
+                    publisher=lambda _options, _entry, _result: {"success": True},
+                    sleeper=sleep_and_advance,
+                    monotonic=lambda: next(times),
+                    wall_clock=lambda: now[0],
+                )
+            )
+
+            self.assertEqual(attempts, 4)
+            self.assertEqual(sleeps, [60, 120, 240])
+            self.assertEqual(result["status"], "completed")
+
+    def test_restart_honors_persisted_quota_backoff_before_provider_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            contract_path = _write_contract(contracts / "001-task.json", "task")
+            task_sha = load_trusted_task_contract(contract_path)[1]
+            now = datetime(2026, 7, 15, tzinfo=UTC)
+            state_path = root / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "revision": 4,
+                        "status": "waiting-provider",
+                        "stopReason": "provider-quota-exhausted",
+                        "completedTaskShas": [],
+                        "currentTask": {"taskSha": task_sha},
+                        "providerBackoff": {
+                            "taskSha": task_sha,
+                            "stage": "engineer",
+                            "stopReason": "provider-quota-exhausted",
+                            "consecutiveFailures": 2,
+                            "delaySeconds": 120,
+                            "nextRetryAt": (now + timedelta(seconds=120)).isoformat(),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_continuous_bounded_delivery(
+                ContinuousBoundedOptions(
+                    project_path=root,
+                    contract_dir=contracts,
+                    provider_for_role=lambda _role: _NoopProvider(),
+                    workspace_allowlist=[tmp],
+                    report_dir=root / "reports",
+                    state_path=state_path,
+                    once=True,
+                    delivery_runner=lambda _options: self.fail("provider ran before persisted retry time"),
+                    sleeper=lambda _seconds: self.fail("--once must not sleep for persisted quota backoff"),
+                    wall_clock=lambda: now,
+                )
+            )
+
+            self.assertEqual(result["status"], "waiting-provider")
+            self.assertEqual(result["providerBackoff"]["consecutiveFailures"], 2)
+            self.assertEqual(result["providerBackoff"]["delaySeconds"], 120)
+
+    def test_quota_backoff_resets_when_delivery_advances_to_another_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            contract_path = _write_contract(contracts / "001-task.json", "task")
+            task_sha = load_trusted_task_contract(contract_path)[1]
+            attempts = 0
+            sleeps: list[float] = []
+            now = [datetime(2026, 7, 15, tzinfo=UTC)]
+
+            def delivery(_options):
+                nonlocal attempts
+                attempts += 1
+                if attempts <= 3:
+                    return {
+                        "status": "attention-required",
+                        "stage": "engineer" if attempts <= 2 else "qa",
+                        "stopReason": "provider-quota-exhausted",
+                        "taskSha": task_sha,
+                    }
+                return {
+                    "status": "completed",
+                    "taskSha": task_sha,
+                    "commitSha": "commit-task",
+                }
+
+            def sleep_and_advance(seconds: float) -> None:
+                sleeps.append(seconds)
+                now[0] += timedelta(seconds=seconds)
+
+            times = iter((0.0, 0.0, 0.0, 0.0, 61.0))
+            result = run_continuous_bounded_delivery(
+                ContinuousBoundedOptions(
+                    project_path=root,
+                    contract_dir=contracts,
+                    provider_for_role=lambda _role: _NoopProvider(),
+                    workspace_allowlist=[tmp],
+                    report_dir=root / "reports",
+                    state_path=root / "state.json",
+                    once=False,
+                    interval_minutes=1,
+                    max_runtime_minutes=1,
+                    github_execute=True,
+                    auto_merge=True,
+                    delivery_runner=delivery,
+                    publisher=lambda _options, _entry, _result: {"success": True},
+                    sleeper=sleep_and_advance,
+                    monotonic=lambda: next(times),
+                    wall_clock=lambda: now[0],
+                )
+            )
+
+            self.assertEqual(attempts, 4)
+            self.assertEqual(sleeps, [60, 120, 60])
+            self.assertEqual(result["status"], "completed")
 
     def test_delivery_exception_is_recorded_without_escaping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -303,6 +480,47 @@ class ContinuousBoundedSupervisorTests(unittest.TestCase):
             self.assertEqual(result["status"], "attention-required")
             self.assertEqual(result["stopReason"], "supervisor-state-invalid")
             self.assertEqual(state_path.read_text(encoding="utf-8"), "{corrupt")
+            self.assertTrue((root / "state.json.error.json").is_file())
+
+    def test_invalid_persisted_provider_backoff_is_preserved_and_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            _write_contract(contracts / "001-task.json", "task")
+            state_path = root / "state.json"
+            original = json.dumps(
+                {
+                    "revision": 3,
+                    "completedTaskShas": [],
+                    "providerBackoff": {
+                        "taskSha": "not-a-sha",
+                        "stage": "engineer",
+                        "stopReason": "provider-quota-exhausted",
+                        "consecutiveFailures": 1,
+                        "delaySeconds": 60,
+                        "nextRetryAt": "2026-07-15T00:01:00+00:00",
+                    },
+                }
+            )
+            state_path.write_text(original, encoding="utf-8")
+
+            result = run_continuous_bounded_delivery(
+                ContinuousBoundedOptions(
+                    project_path=root,
+                    contract_dir=contracts,
+                    provider_for_role=lambda _role: _NoopProvider(),
+                    workspace_allowlist=[tmp],
+                    report_dir=root / "reports",
+                    state_path=state_path,
+                    once=True,
+                    delivery_runner=lambda _options: self.fail("invalid backoff state must not run work"),
+                )
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], "supervisor-state-invalid")
+            self.assertEqual(state_path.read_text(encoding="utf-8"), original)
             self.assertTrue((root / "state.json.error.json").is_file())
 
     def test_state_redacts_publication_secrets(self) -> None:

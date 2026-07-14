@@ -602,8 +602,12 @@ completed task SHA, and watches the directory for new work without rerunning an
 unchanged contract. Each successful task must retain its bounded-delivery
 receipt and deterministic validation hash before the GitHub executor may push,
 open a PR, wait for CI, merge, and fast-forward the clean primary worktree.
-Provider quota exhaustion and timeouts are retried after the configured
-interval. Invalid contracts, unsafe findings, other provider failures, failed CI,
+Provider timeouts and network failures are retried after the configured
+interval. Repeated quota exhaustion uses a persisted exponential backoff that
+starts at the configured interval and caps at six hours (or the configured
+interval when it is longer). The next retry time and consecutive failure count
+remain in supervisor state, so restarting the process cannot bypass the wait.
+Invalid contracts, unsafe findings, other provider failures, failed CI,
 publication evidence mismatches, or dirty primary state stop fail closed with
 an `attention-required` state.
 
