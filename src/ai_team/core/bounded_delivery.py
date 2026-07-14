@@ -11,7 +11,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from ai_team.core.isolated_executor import IsolatedRunResult, run_in_disposable_worktree
+from ai_team.core.isolated_executor import (
+    IsolatedRunResult,
+    list_changed_files,
+    run_in_disposable_worktree,
+)
 from ai_team.core.project_loader import load_project
 from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderRequest, ProviderResult, redact_secrets
 
@@ -149,21 +153,94 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             "receipts": context["receipts"],
             "statePath": str(options.state_path),
         }
+    try:
+        receipt_payloads = _load_receipt_payloads(context["receipts"])
+        context["tokenUsage"] = _recovered_token_usage(receipt_payloads)
+        checkpoints = _recover_stage_checkpoints(receipt_payloads, contract)
+    except BoundedDeliveryError as exc:
+        return _stop(options, context, str(exc), "receipt-integrity")
+    if context["tokenUsage"] > options.limits.max_token_usage:
+        return _stop(options, context, "token-budget-exhausted", "policy-or-provider")
     _write_state(options, "running", "pm", context)
     try:
-        pm = _run_stage(options, project.root, "pm", context, contract)
+        pm_checkpoint = checkpoints.get("pm")
+        pm = pm_checkpoint["evidence"] if pm_checkpoint else _run_stage(
+            options, project.root, "pm", context, contract
+        )
         acceptance = _required_strings(pm, "acceptanceCriteria")
         context["acceptanceCriteria"] = acceptance
-        architect = _run_stage(options, project.root, "architect", context, contract)
+        architect_checkpoint = checkpoints.get("architect")
+        architect = architect_checkpoint["evidence"] if architect_checkpoint else _run_stage(
+            options, project.root, "architect", context, contract
+        )
         plan = _required_strings(architect, "plan")
         context["plan"] = plan
         context["planAllowedWritePaths"] = _required_strings(architect, "allowedWritePaths")
 
-        repairs: list[dict[str, Any]] = []
+        repairs = _recover_repairs(prior, task_sha, tuple(context["planAllowedWritePaths"]))
+        if repairs:
+            context["repairs"] = repairs
+
+        resumed_engineer = checkpoints.get("engineer")
+        reusable_worktree: Path | None = None
+        if resumed_engineer is not None:
+            evidence = resumed_engineer["evidence"]
+            reusable_worktree = _validated_resume_worktree(
+                options,
+                prior,
+                task_sha=task_sha,
+                allowed_write_paths=tuple(context["planAllowedWritePaths"]),
+                expected_commit=evidence["commitSha"],
+                expected_changed_files=evidence["changedFiles"],
+                expected_run_receipt=evidence.get("runReceipt"),
+                expected_executor_receipt=evidence.get("executorReceipt"),
+                allow_dirty=False,
+            )
+            context.update({
+                "worktreePath": str(reusable_worktree),
+                "commitSha": evidence["commitSha"],
+                "changedFiles": evidence["changedFiles"],
+                "validation": evidence["validation"],
+                "runReceipt": evidence.get("runReceipt"),
+                "executorReceipt": evidence.get("executorReceipt"),
+            })
+            qa_checkpoint = checkpoints.get("qa")
+            qa = qa_checkpoint["evidence"] if qa_checkpoint else _run_stage(
+                options, reusable_worktree, "qa", context, contract
+            )
+            review_checkpoint = checkpoints.get("review") if qa_checkpoint else None
+            review = review_checkpoint["evidence"] if review_checkpoint else _run_stage(
+                options, reusable_worktree, "review", context, contract
+            )
+            findings = _findings(qa) + _findings(review)
+            if not findings:
+                return _complete(options, context)
+            if not _findings_are_attributable(findings, tuple(context["planAllowedWritePaths"])):
+                return _stop(options, context, "unattributed-or-out-of-scope-finding", "qa-review")
+            if len(repairs) >= options.limits.max_repair_attempts:
+                return _stop(options, context, "max-repair-attempts-reached", "qa-review")
+            repairs.append({"findingSha": _sha(findings), "findings": findings})
+            context["repairs"] = repairs
+        elif options.engineering_executor is None and prior.get("taskSha") == task_sha and prior.get("worktreePath"):
+            reusable_worktree = _validated_resume_worktree(
+                options,
+                prior,
+                task_sha=task_sha,
+                allowed_write_paths=tuple(context["planAllowedWritePaths"]),
+                expected_commit=None,
+                expected_changed_files=prior.get("changedFiles"),
+                expected_run_receipt=prior.get("runReceipt"),
+                expected_executor_receipt=prior.get("executorReceipt"),
+                allow_dirty=True,
+            )
+
+        engineering_executor = options.engineering_executor or _default_engineering_executor(
+            options, reusable_worktree=reusable_worktree
+        )
         for iteration in range(1, options.limits.max_iterations + 1):
             instruction = _engineering_instruction(context, repairs)
             engineer = options.provider_for_role(ROLE_BY_STAGE["engineer"])
-            attempt = (options.engineering_executor or _default_engineering_executor(options))(
+            attempt = engineering_executor(
                 contract, instruction, engineer, iteration
             )
             failure = _engineering_failure(
@@ -341,8 +418,11 @@ def _run_stage(
     return payload
 
 
-def _default_engineering_executor(options: BoundedDeliveryOptions) -> Callable[[TrustedTaskContract, str, BaseProvider, int], EngineeringAttempt]:
-    reusable_worktree: Path | None = None
+def _default_engineering_executor(
+    options: BoundedDeliveryOptions,
+    *,
+    reusable_worktree: Path | None = None,
+) -> Callable[[TrustedTaskContract, str, BaseProvider, int], EngineeringAttempt]:
 
     def execute(contract: TrustedTaskContract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
         nonlocal reusable_worktree
@@ -561,6 +641,268 @@ def _recover_receipt_paths(report_dir: Path, task_sha: str, state_receipts: Any)
     return recovered
 
 
+def _load_receipt_payloads(paths: list[str]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for item in paths:
+        try:
+            payload = json.loads(Path(item).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise BoundedDeliveryError("receipt-file-invalid") from exc
+        if not isinstance(payload, dict):
+            raise BoundedDeliveryError("receipt-file-invalid")
+        payloads.append(payload)
+    return payloads
+
+
+def _recovered_token_usage(receipts: list[dict[str, Any]]) -> int:
+    total = 0
+    for receipt in receipts:
+        value = receipt.get("tokenUsage", 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise BoundedDeliveryError("receipt-token-usage-invalid")
+        total += value
+    return total
+
+
+def _recover_stage_checkpoints(
+    receipts: list[dict[str, Any]],
+    contract: TrustedTaskContract,
+) -> dict[str, dict[str, Any]]:
+    """Recover only fully attested, dependency-ordered stage successes."""
+    checkpoints: dict[str, dict[str, Any]] = {}
+    for receipt in receipts:
+        validation = receipt.get("validationResult")
+        if not isinstance(validation, dict) or not isinstance(validation.get("success"), bool):
+            raise BoundedDeliveryError("receipt-validation-result-invalid")
+        provider_success = receipt.get("providerSuccess")
+        if not isinstance(provider_success, bool):
+            raise BoundedDeliveryError("receipt-provider-result-invalid")
+        validation_success = validation["success"]
+        stop_reason = receipt.get("stopReason")
+        if validation_success and (not provider_success or stop_reason not in {None, ""}):
+            raise BoundedDeliveryError("receipt-success-attestation-invalid")
+        if not validation_success and (
+            not isinstance(stop_reason, str)
+            or not stop_reason
+            or validation.get("stopReason") != stop_reason
+        ):
+            raise BoundedDeliveryError("receipt-failure-attestation-invalid")
+        if not (provider_success and validation_success and stop_reason in {None, ""}):
+            continue
+        try:
+            _accept_stage_checkpoint(checkpoints, receipt, contract)
+        except (BoundedDeliveryError, KeyError, TypeError, ValueError) as exc:
+            raise BoundedDeliveryError("receipt-checkpoint-invalid") from exc
+    return checkpoints
+
+
+def _accept_stage_checkpoint(
+    checkpoints: dict[str, dict[str, Any]],
+    receipt: dict[str, Any],
+    contract: TrustedTaskContract,
+) -> None:
+    stage = receipt["stage"]
+    expected_provider = "antigravity" if stage in {"pm", "architect", "qa"} else "codex"
+    if receipt.get("provider") != expected_provider:
+        raise BoundedDeliveryError("checkpoint provider mismatch")
+    evidence = receipt.get("evidence")
+    if not isinstance(evidence, dict):
+        raise BoundedDeliveryError("checkpoint evidence missing")
+
+    if stage == "engineer":
+        if "architect" not in checkpoints:
+            raise BoundedDeliveryError("engineer checkpoint has no architect dependency")
+        validation = evidence.get("validation")
+        commit_sha = evidence.get("commitSha")
+        changed_files = evidence.get("changedFiles")
+        if (
+            not isinstance(validation, dict)
+            or validation.get("success") is not True
+            or not isinstance(commit_sha, str)
+            or not commit_sha
+            or receipt.get("commitSha") != commit_sha
+            or not isinstance(changed_files, list)
+            or not changed_files
+            or not all(isinstance(item, str) and item for item in changed_files)
+            or not _paths_within(
+                changed_files,
+                tuple(checkpoints["architect"]["evidence"]["allowedWritePaths"]),
+            )
+        ):
+            raise BoundedDeliveryError("engineer checkpoint attestation invalid")
+        checkpoints["engineer"] = receipt
+        checkpoints.pop("qa", None)
+        checkpoints.pop("review", None)
+        return
+
+    _validate_stage_structure(stage, evidence)
+    _reject_forbidden(json.dumps(evidence, ensure_ascii=False), f"{stage} checkpoint")
+    if stage == "pm":
+        checkpoints["pm"] = receipt
+        for dependent in ("architect", "engineer", "qa", "review"):
+            checkpoints.pop(dependent, None)
+        return
+    if stage == "architect":
+        if "pm" not in checkpoints or evidence.get("schemaOrApiChange") is not False:
+            raise BoundedDeliveryError("architect checkpoint dependency invalid")
+        _validate_plan_scope(evidence, contract)
+        _validate_checkpoint_secondary(receipt, stage, "codex")
+        checkpoints["architect"] = receipt
+        for dependent in ("engineer", "qa", "review"):
+            checkpoints.pop(dependent, None)
+        return
+    if stage == "qa":
+        engineer = checkpoints.get("engineer")
+        if engineer is None or receipt.get("commitSha") != engineer.get("commitSha"):
+            raise BoundedDeliveryError("qa checkpoint commit dependency invalid")
+        _validate_checkpoint_secondary(receipt, stage, "codex", allow_findings=True)
+        checkpoints.pop("qa", None)
+        checkpoints.pop("review", None)
+        if not _findings(evidence):
+            checkpoints["qa"] = receipt
+        return
+    if stage == "review":
+        engineer = checkpoints.get("engineer")
+        if (
+            engineer is None
+            or "qa" not in checkpoints
+            or receipt.get("commitSha") != engineer.get("commitSha")
+        ):
+            return
+        _validate_checkpoint_secondary(receipt, stage, "antigravity", allow_findings=True)
+        checkpoints.pop("review", None)
+        if not _findings(evidence):
+            checkpoints["review"] = receipt
+
+
+def _validate_checkpoint_secondary(
+    receipt: dict[str, Any],
+    stage: str,
+    provider: str,
+    *,
+    allow_findings: bool = False,
+) -> None:
+    secondary = receipt.get("secondaryReview")
+    if (
+        not isinstance(secondary, dict)
+        or secondary.get("success") is not True
+        or secondary.get("provider") != provider
+    ):
+        raise BoundedDeliveryError("checkpoint secondary review invalid")
+    payload = _validate_secondary_review(secondary, stage, provider)
+    if payload["blockers"] or (payload["findings"] and not allow_findings):
+        raise BoundedDeliveryError("checkpoint secondary review did not approve")
+
+
+def _recover_repairs(
+    prior: dict[str, Any],
+    task_sha: str,
+    allowed_write_paths: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    if prior.get("taskSha") != task_sha or prior.get("repairs") is None:
+        return []
+    repairs = prior.get("repairs")
+    if not isinstance(repairs, list):
+        raise BoundedDeliveryError("resume-repair-state-invalid")
+    recovered: list[dict[str, Any]] = []
+    for item in repairs:
+        if not isinstance(item, dict) or not isinstance(item.get("findingSha"), str):
+            raise BoundedDeliveryError("resume-repair-state-invalid")
+        if isinstance(item.get("findings"), list):
+            findings = _findings(item)
+            if item["findingSha"] != _sha(findings) or not _findings_are_attributable(
+                findings, allowed_write_paths
+            ):
+                raise BoundedDeliveryError("resume-repair-state-invalid")
+        elif isinstance(item.get("evidence"), dict):
+            evidence = item["evidence"]
+            if evidence.get("kind") != "deterministic-validation" or item["findingSha"] != _sha(evidence):
+                raise BoundedDeliveryError("resume-repair-state-invalid")
+            changed_files = evidence.get("changedFiles")
+            if not isinstance(changed_files, list) or not _paths_within(changed_files, allowed_write_paths):
+                raise BoundedDeliveryError("resume-repair-state-invalid")
+        else:
+            raise BoundedDeliveryError("resume-repair-state-invalid")
+        recovered.append(item)
+    return recovered
+
+
+def _validated_resume_worktree(
+    options: BoundedDeliveryOptions,
+    prior: dict[str, Any],
+    *,
+    task_sha: str,
+    allowed_write_paths: tuple[str, ...],
+    expected_commit: str | None,
+    expected_changed_files: Any,
+    expected_run_receipt: Any,
+    expected_executor_receipt: Any,
+    allow_dirty: bool,
+) -> Path:
+    try:
+        if prior.get("taskSha") != task_sha or not isinstance(prior.get("worktreePath"), str):
+            raise ValueError("state is not bound to this task and worktree")
+        path = Path(prior["worktreePath"]).resolve()
+        source = load_project(options.project_path, allowlist=options.workspace_allowlist)
+        loaded = load_project(path, allowlist=options.workspace_allowlist)
+        if path == source.root or not loaded.is_disposable_worktree() or loaded.is_branch_protected():
+            raise ValueError("resume target is not a disposable writable worktree")
+        if _git_common_directory(source.root) != _git_common_directory(loaded.root):
+            raise ValueError("resume target belongs to another repository")
+        changed_files = list_changed_files(loaded.root)
+        if not _paths_within(changed_files, allowed_write_paths):
+            raise ValueError("resume target contains out-of-scope changes")
+        if not isinstance(expected_changed_files, list) or not all(
+            isinstance(item, str) and item for item in expected_changed_files
+        ):
+            raise ValueError("resume state has invalid changed files")
+        if not _paths_within(expected_changed_files, allowed_write_paths):
+            raise ValueError("resume state contains out-of-scope changes")
+        for key, value in (
+            ("runReceipt", expected_run_receipt),
+            ("executorReceipt", expected_executor_receipt),
+        ):
+            if prior.get(key) != value or not _is_attested_report_file(options.report_dir, value):
+                raise ValueError(f"resume state has an invalid {key}")
+        if expected_commit is not None:
+            if prior.get("commitSha") != expected_commit or loaded.commit_sha != expected_commit or changed_files:
+                raise ValueError("committed resume target is not clean at the attested commit")
+            if prior.get("changedFiles") != expected_changed_files:
+                raise ValueError("committed resume state does not match its receipt")
+        elif not allow_dirty or sorted(changed_files) != sorted(expected_changed_files):
+            raise ValueError("dirty resume target does not match its attested state")
+        return path
+    except (BoundedDeliveryError, OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise BoundedDeliveryError("resume-worktree-invalid") from exc
+
+
+def _git_common_directory(root: Path) -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ValueError("cannot inspect Git common directory")
+    value = Path(result.stdout.strip())
+    return value.resolve() if value.is_absolute() else (root / value).resolve()
+
+
+def _is_attested_report_file(report_dir: Path, value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    root = report_dir.resolve()
+    path = Path(value).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return path.is_file()
+
+
 def _add_tokens(options: BoundedDeliveryOptions, context: dict[str, Any], result: ProviderResult) -> bool:
     tokens = result.data.get("tokenUsage", 0)
     context["tokenUsage"] += tokens if isinstance(tokens, int) and tokens >= 0 else 0
@@ -717,7 +1059,18 @@ def _findings_are_attributable(findings: list[dict[str, str]], allowed: tuple[st
 
 def _paths_within(paths: list[str], allowed: tuple[str, ...]) -> bool:
     roots = tuple(Path(item).as_posix().rstrip("/") for item in allowed)
-    return all(any(path == root or path.startswith(f"{root}/") for root in roots) for path in paths)
+    normalized: list[str] = []
+    for value in paths:
+        if not isinstance(value, str):
+            return False
+        path = Path(value)
+        if path.is_absolute() or not value or ".." in path.parts or "." in path.parts:
+            return False
+        normalized.append(path.as_posix().rstrip("/"))
+    return all(
+        any(path == root or path.startswith(f"{root}/") for root in roots)
+        for path in normalized
+    )
 
 
 def _engineering_instruction(context: dict[str, Any], repairs: list[dict[str, Any]]) -> str:

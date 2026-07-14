@@ -554,6 +554,281 @@ class BoundedDeliveryTests(unittest.TestCase):
             second = run_bounded_delivery(options)
             self.assertEqual(second["receipts"], [str(Path(tmp) / "reports" / "01-pm.json"), str(Path(tmp) / "reports" / "02-pm.json")])
 
+    def test_retry_resumes_successful_pm_and_architect_and_recovers_token_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+            stage_calls: dict[str, int] = {}
+            engineering_calls = 0
+
+            def provider(role: str) -> BaseProvider:
+                return _CountingStageProvider(role, stage_calls)
+
+            def quota_then_success(
+                contract,
+                instruction: str,
+                engineer: BaseProvider,
+                iteration: int,
+            ) -> EngineeringAttempt:
+                nonlocal engineering_calls
+                engineering_calls += 1
+                if engineering_calls == 1:
+                    return EngineeringAttempt(
+                        provider_result=ProviderResult(
+                            provider="codex",
+                            success=False,
+                            error_type=ProviderErrorType.RATE_LIMIT,
+                            content="quota",
+                            data={"tokenUsage": 7},
+                        ),
+                        worktree_path=root,
+                        changed_files=[],
+                        validation={"success": False},
+                        commit_sha=None,
+                    )
+                return _successful_engineering_attempt(
+                    contract, instruction, engineer, iteration
+                )
+
+            options = _options(
+                Path(tmp), root, contract_path, provider, quota_then_success
+            )
+
+            first = run_bounded_delivery(options)
+            second = run_bounded_delivery(options)
+
+            self.assertEqual(first["stopReason"], "provider-quota-exhausted")
+            self.assertEqual(second["status"], "completed", second)
+            self.assertEqual(stage_calls["pm"], 1)
+            self.assertEqual(stage_calls["architect"], 1)
+            self.assertEqual(stage_calls["qa"], 1)
+            self.assertEqual(stage_calls["review"], 1)
+            self.assertEqual(engineering_calls, 2)
+            self.assertEqual(second["tokenUsage"], 67)
+            self.assertEqual(
+                [Path(path).name for path in second["receipts"]],
+                [
+                    "01-pm.json",
+                    "02-architect.json",
+                    "03-engineer.json",
+                    "04-engineer.json",
+                    "05-qa.json",
+                    "06-review.json",
+                ],
+            )
+
+    def test_retry_resumes_clean_engineer_and_qa_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = _init_project(base / "project")
+            contract_path = _write_contract(base, "docs/safe.md")
+            worktree = base / "resume-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(worktree), "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            target = worktree / "docs" / "safe.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("safe change\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", "docs/safe.md"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "test: create resumable checkpoint"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+            )
+            commit_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            stage_calls: dict[str, int] = {}
+            provider_state = {"reviewFailed": False}
+            engineering_calls = 0
+            isolated_reports = base / "reports" / "isolated"
+            isolated_reports.mkdir(parents=True)
+            run_receipt = isolated_reports / "run.json"
+            executor_receipt = isolated_reports / "executor.json"
+            run_receipt.write_text("{}", encoding="utf-8")
+            executor_receipt.write_text("{}", encoding="utf-8")
+
+            def provider(role: str) -> BaseProvider:
+                return _ReviewQuotaOnceProvider(role, stage_calls, provider_state)
+
+            def engineer(
+                contract,
+                instruction: str,
+                engineer_provider: BaseProvider,
+                iteration: int,
+            ) -> EngineeringAttempt:
+                nonlocal engineering_calls
+                engineering_calls += 1
+                return EngineeringAttempt(
+                    provider_result=ProviderResult(
+                        provider="codex",
+                        success=True,
+                        content="implementation complete",
+                        data={"tokenUsage": 20},
+                    ),
+                    worktree_path=worktree,
+                    changed_files=["docs/safe.md"],
+                    validation={"success": True, "commands": []},
+                    commit_sha=commit_sha,
+                    run_receipt=run_receipt,
+                    executor_receipt=executor_receipt,
+                )
+
+            options = BoundedDeliveryOptions(
+                project_path=root,
+                task_contract_path=contract_path,
+                provider_for_role=provider,
+                workspace_allowlist=[str(base)],
+                report_dir=base / "reports",
+                state_path=base / "state.json",
+                limits=DeliveryLimits(timeout_seconds=30, max_token_usage=1000),
+                engineering_executor=engineer,
+            )
+
+            first = run_bounded_delivery(options)
+            second = run_bounded_delivery(options)
+
+            self.assertEqual(first["stopReason"], "provider-quota-exhausted")
+            self.assertEqual(second["status"], "completed", second)
+            self.assertEqual(engineering_calls, 1)
+            self.assertEqual(stage_calls["pm"], 1)
+            self.assertEqual(stage_calls["architect"], 1)
+            self.assertEqual(stage_calls["qa"], 1)
+            self.assertEqual(stage_calls["review"], 2)
+            self.assertEqual(second["commitSha"], commit_sha)
+
+    def test_resume_fails_closed_for_a_tampered_success_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+            calls = 0
+
+            def quota_engineer(
+                contract,
+                instruction: str,
+                provider: BaseProvider,
+                iteration: int,
+            ) -> EngineeringAttempt:
+                nonlocal calls
+                calls += 1
+                return EngineeringAttempt(
+                    provider_result=ProviderResult(
+                        provider="codex",
+                        success=False,
+                        error_type=ProviderErrorType.RATE_LIMIT,
+                        content="quota",
+                    ),
+                    worktree_path=root,
+                    changed_files=[],
+                    validation={"success": False},
+                    commit_sha=None,
+                )
+
+            options = _options(
+                Path(tmp), root, contract_path, _provider_for_role, quota_engineer
+            )
+            self.assertEqual(
+                run_bounded_delivery(options)["stopReason"],
+                "provider-quota-exhausted",
+            )
+            receipt_path = Path(tmp) / "reports" / "01-pm.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["provider"] = "mock"
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            second = run_bounded_delivery(options)
+
+            self.assertEqual(second["status"], "attention-required")
+            self.assertEqual(second["stopReason"], "receipt-checkpoint-invalid")
+            self.assertEqual(calls, 1)
+
+    def test_resume_fails_closed_when_attested_worktree_is_dirty_outside_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = _init_project(base / "project")
+            contract_path = _write_contract(base, "docs/safe.md")
+            worktree = base / "resume-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(worktree), "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            target = worktree / "docs" / "safe.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("safe change\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", "docs/safe.md"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "test: create resumable checkpoint"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+            )
+            commit_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            stage_calls: dict[str, int] = {}
+            provider_state = {"reviewFailed": False}
+            isolated_reports = base / "reports" / "isolated"
+            isolated_reports.mkdir(parents=True)
+            run_receipt = isolated_reports / "run.json"
+            executor_receipt = isolated_reports / "executor.json"
+            run_receipt.write_text("{}", encoding="utf-8")
+            executor_receipt.write_text("{}", encoding="utf-8")
+
+            def engineer(
+                contract,
+                instruction: str,
+                engineer_provider: BaseProvider,
+                iteration: int,
+            ) -> EngineeringAttempt:
+                return EngineeringAttempt(
+                    provider_result=ProviderResult(
+                        provider="codex", success=True, content="done"
+                    ),
+                    worktree_path=worktree,
+                    changed_files=["docs/safe.md"],
+                    validation={"success": True, "commands": []},
+                    commit_sha=commit_sha,
+                    run_receipt=run_receipt,
+                    executor_receipt=executor_receipt,
+                )
+
+            options = BoundedDeliveryOptions(
+                project_path=root,
+                task_contract_path=contract_path,
+                provider_for_role=lambda role: _ReviewQuotaOnceProvider(
+                    role, stage_calls, provider_state
+                ),
+                workspace_allowlist=[str(base)],
+                report_dir=base / "reports",
+                state_path=base / "state.json",
+                limits=DeliveryLimits(timeout_seconds=30, max_token_usage=1000),
+                engineering_executor=engineer,
+            )
+            self.assertEqual(
+                run_bounded_delivery(options)["stopReason"],
+                "provider-quota-exhausted",
+            )
+            (worktree / "outside.txt").write_text("unexpected\n", encoding="utf-8")
+
+            second = run_bounded_delivery(options)
+
+            self.assertEqual(second["status"], "attention-required")
+            self.assertEqual(second["stopReason"], "resume-worktree-invalid")
+
     def test_restart_recovers_receipt_written_after_the_last_state_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -738,6 +1013,42 @@ class _StageProvider(BaseProvider):
                 }),
             }
         return ProviderResult(provider=expected_provider, success=True, content=json.dumps(payload), data=data)
+
+
+class _CountingStageProvider(_StageProvider):
+    def __init__(self, role: str, calls: dict[str, int]) -> None:
+        super().__init__(role)
+        self.calls = calls
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        stage = request.metadata["boundedStage"]
+        self.calls[stage] = self.calls.get(stage, 0) + 1
+        return super().run(request)
+
+
+class _ReviewQuotaOnceProvider(_CountingStageProvider):
+    def __init__(
+        self,
+        role: str,
+        calls: dict[str, int],
+        state: dict[str, bool],
+    ) -> None:
+        super().__init__(role, calls)
+        self.state = state
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        stage = request.metadata["boundedStage"]
+        if stage == "review" and not self.state["reviewFailed"]:
+            self.calls[stage] = self.calls.get(stage, 0) + 1
+            self.state["reviewFailed"] = True
+            return ProviderResult(
+                provider="codex",
+                success=False,
+                error_type=ProviderErrorType.RATE_LIMIT,
+                content="quota",
+                data={"tokenUsage": 3},
+            )
+        return super().run(request)
 
 
 class _MockSuccessProvider(_StageProvider):
