@@ -101,6 +101,50 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("stage=qa", prompt)
         self.assertIn("Forbidden: edit, shell", prompt)
         self.assertIn("Challenge=challenge-1", prompt)
+
+    def test_antigravity_bounded_qa_prompt_keeps_evidence_json_valid(self) -> None:
+        evidence = json.dumps(
+            {
+                "allowedWritePaths": [f"src/very-long-path-{index}.tsx" for index in range(20)],
+                "validationCommands": ["npm run lint", "npm run typecheck", "npm run test", "npm run build"],
+                "changedFiles": ["src/component.tsx", "src/component.test.ts"],
+                "commitSha": "a" * 40,
+                "validation": {"success": True, "commands": {"npm run test": {"output": "x" * 2000}}},
+                "repairs": [],
+            }
+        )
+        prompt = _compact_prompt(
+            "\n".join(
+                (
+                    "Task: Update a documented behavior",
+                    "Instruction: Edit the approved path only",
+                    f"Allowed write paths: {json.dumps([f'src/very-long-path-{index}.tsx' for index in range(20)])}",
+                    'Validation commands: ["npm run lint", "npm run typecheck", "npm run test", "npm run build"]',
+                    f"Implementation evidence: {evidence}",
+                )
+            ),
+            1200,
+            challenge="challenge-1",
+            bounded_stage="qa",
+        )
+
+        allowed = prompt.split("AllowedWritePaths=", 1)[1].split("; ValidationCommands=", 1)[0]
+        commands = prompt.split("ValidationCommands=", 1)[1].split("; ImplementationEvidence=", 1)[0]
+        compact_evidence = prompt.split("ImplementationEvidence=", 1)[1].removesuffix(".")
+
+        self.assertIsInstance(json.loads(allowed), list)
+        self.assertEqual(json.loads(commands), ["npm run lint", "npm run typecheck", "npm run test", "npm run build"])
+        self.assertEqual(
+            json.loads(compact_evidence),
+            {
+                "changedFileCount": 2,
+                "commitSha": "a" * 12,
+                "validationSuccess": True,
+                "repairCount": 0,
+            },
+        )
+        self.assertNotIn("[truncated]", prompt)
+
     def test_codex_trusted_write_requires_linked_worktree_marker(self) -> None:
         provider = CodexProvider(
             CodexSettings(
