@@ -23,7 +23,11 @@ FORBIDDEN_PATTERNS = (
     r"(?:run|apply|execute|load|populate)\s+(?:the\s+)?(?:database\s+)?seeds?|"
     r"(?:npm|pnpm|yarn)\s+run\s+[\w:-]*seed[\w:-]*|prisma\s+db\s+seed)\b",
     r"\b(?:production\s+)?deploy(?:ment|ing)?\b",
-    r"\b(?:real\s+)?payments?\b",
+    r"\b(?:real|live|production)\s+payments?\b",
+    r"\b(?:process|execute|initiate|submit|make)\s+(?:an?\s+|the\s+)?"
+    r"(?:(?:real|live|production)\s+)?payments?\b",
+    r"\b(?:charge|capture|refund)\s+(?:an?\s+|the\s+)?"
+    r"(?:(?:real|live|production)\s+)?(?:payment|card|funds?|transaction)\b",
     r"\b(?:read|write|expose|rotate|copy)\s+(?:a\s+)?(?:secret|credential|token|api[ _-]?key)\b",
     r"\b(?:delete|drop|truncate)\s+(?:data|database|records?|volume)\b",
     r"\bforce\s+push\b",

@@ -643,6 +643,38 @@ class BoundedDeliveryTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "completed", result)
 
+    def test_delivery_allows_payment_provider_validation_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(
+                Path(tmp),
+                "docs/safe.md",
+                instruction="Add regression tests for payment provider configuration failures",
+            )
+
+            def provider(role: str) -> BaseProvider:
+                return _PaymentConfigurationStageProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "completed", result)
+
+    def test_task_contract_still_rejects_real_payment_actions(self) -> None:
+        for instruction in (
+            "process payments",
+            "process a real payment",
+            "execute production payments",
+            "charge a card",
+            "capture live funds",
+            "refund a transaction",
+        ):
+            with self.subTest(instruction=instruction), tempfile.TemporaryDirectory() as tmp:
+                path = _write_contract(Path(tmp), "docs/safe.md", instruction=instruction)
+                with self.assertRaises(BoundedDeliveryError):
+                    load_trusted_task_contract(path)
+
     def test_task_contract_rejects_path_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_contract(Path(tmp), "../.env")
@@ -724,6 +756,24 @@ class _CryptographicSeedArchitectProvider(_StageProvider):
             return result
         payload = json.loads(result.content)
         payload["plan"] = ["Document deterministic cryptographic seed material used only by tests"]
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
+        )
+
+
+class _PaymentConfigurationStageProvider(_StageProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "pm":
+            return result
+        payload = json.loads(result.content)
+        payload["acceptanceCriteria"] = [
+            "Verify missing payment provider keys fail configuration validation",
+            "Verify payment configuration tests use placeholder values only",
+        ]
         return ProviderResult(
             provider=result.provider,
             success=True,
