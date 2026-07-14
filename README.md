@@ -137,9 +137,9 @@ The current profiles are:
 | Product Manager | Antigravity Gemini 3.5 Flash (High) | Codex gpt-5.6-terra, medium |
 | Architect | Antigravity Gemini 3.1 Pro (High) | Codex gpt-5.6-sol, high fallback and second opinion |
 | Engineer | Codex gpt-5.6-terra, high | none for write workflows |
-| Reviewer | Codex gpt-5.5, high | Claude Sonnet 4.6 (Thinking) fallback and second opinion |
+| Reviewer | Codex gpt-5.6-sol, xhigh | Antigravity Gemini 3.1 Pro (High) mandatory second opinion |
 | QA Engineer | HandsFreeCode / qwen2.5-coder:7b, provider default | none in read-only-agent mode |
-| Delivery QA | Antigravity Claude Sonnet 4.6 (Thinking) | none; provider-native QA is mandatory |
+| Delivery QA | Antigravity Gemini 3.1 Pro (High) | Codex gpt-5.6-sol, xhigh mandatory second QA |
 | Project Analyst | HandsFreeCode / qwen2.5-coder:7b, provider default | none in read-only-agent mode |
 
 Fallback is limited to provider availability failures. Invalid or unvalidated

@@ -213,7 +213,7 @@ def _compact_prompt(
             continue
         key, value = line.split(":", 1)
         values[key.strip().lower()] = value.strip()
-    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa"}:
+    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
         task = values.get("task", "unknown")[:120]
         instruction = values.get("instruction", "unknown")[:280]
         allowed_paths = _compact_json_array(values.get("allowed write paths", "[]"), max_chars=220)
@@ -228,6 +228,7 @@ def _compact_prompt(
                 "schemaOrApiChange=false. Do not expand paths or commands beyond the task."
             ),
             "qa": "Report only evidence-backed diff findings. Use findings=[] when acceptance evidence passes.",
+            "review": "Report only evidence-backed diff findings. Use findings=[] when the reviewed diff passes.",
         }[bounded_stage]
         normalized = (
             f"Bounded read-only stage={bounded_stage}; Challenge={challenge}. "
@@ -436,7 +437,7 @@ def _validate_response(
     if not result.success:
         return replace(result, data=base_data)
     bounded_stage = request.metadata.get("boundedStage")
-    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa"}:
+    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
         expected_schema = "ai-team-bounded-delivery/v1"
     else:
         expected_schema = "ai-team-repository-smoke/v1" if request.workflow == "provider-smoke" else "ai-team-antigravity/v1"
