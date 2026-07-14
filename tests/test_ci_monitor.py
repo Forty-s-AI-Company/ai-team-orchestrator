@@ -75,6 +75,26 @@ class CiMonitorTests(unittest.TestCase):
             self.assertFalse(result.merge_ready)
             self.assertIn("approved review is required", result.evidence["blockers"])
 
+    def test_development_policy_can_explicitly_waive_human_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = _pr_payload(check_status="COMPLETED", conclusion="SUCCESS")
+            payload["mergeStateStatus"] = "CLEAN"
+            runner = _SequenceRunner(pr_payloads=[payload])
+
+            result = monitor_pull_request(
+                root,
+                "example/project",
+                "1",
+                root / "reports",
+                runner=runner,
+                require_approved_review=False,
+            )
+
+            self.assertEqual(result.status, "passed")
+            self.assertTrue(result.merge_ready)
+            self.assertNotIn("approved review is required", result.evidence["blockers"])
+
     def test_failure_classification_covers_all_required_categories(self) -> None:
         self.assertEqual(
             classify_failure({"name": "quality", "workflow": "CI"}, "npm ci package-lock mismatch"),

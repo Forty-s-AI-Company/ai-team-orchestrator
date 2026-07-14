@@ -564,6 +564,41 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertIsNotNone(result.receipt_hash)
             self.assertIsNotNone(result.secret_scan_hash)
 
+    def test_github_executor_blocks_review_waiver_outside_development(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.profile.project.stage = "production"
+            loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
+
+            with (
+                patch("ai_team.core.github_gate.shutil.which", return_value="/usr/bin/gh"),
+                patch(
+                    "ai_team.core.github_gate._gh_auth_status",
+                    return_value={"authenticated": True},
+                ),
+            ):
+                result = execute_github_action(
+                    loaded,
+                    GitHubExecutionOptions(
+                        action="merge",
+                        dry_run=True,
+                        validation_log_hash=VALIDATION_HASH,
+                        receipt_path=receipt,
+                        test_evidence_hash=TEST_HASH,
+                        pr_identifier="123",
+                        require_approved_review=False,
+                    ),
+                )
+
+            self.assertFalse(result.success)
+            self.assertFalse(result.attempted)
+            self.assertIn("development-stage", " ".join(result.reasons))
+
     def test_github_executor_scans_committed_blob_not_working_tree_copy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -774,6 +809,63 @@ class IsolatedExecutorTests(unittest.TestCase):
 
             self.assertFalse(result.success)
             self.assertIn("approved review", " ".join(result.reasons))
+
+    def test_github_executor_can_explicitly_waive_review_for_development(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            make_disposable_worktree_marker(root)
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
+
+            def fake_runner(args: list[str], cwd: Path, timeout: int):
+                if args[:3] == ["gh", "pr", "view"]:
+                    return subprocess.CompletedProcess(
+                        args=args,
+                        returncode=0,
+                        stdout=json.dumps(
+                            {
+                                "mergeStateStatus": "CLEAN",
+                                "reviewDecision": "",
+                                "isDraft": False,
+                                "headRefOid": loaded.commit_sha,
+                                "statusCheckRollup": [
+                                    {
+                                        "__typename": "CheckRun",
+                                        "status": "COMPLETED",
+                                        "conclusion": "SUCCESS",
+                                    }
+                                ],
+                            }
+                        ),
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+            with (
+                patch("ai_team.core.github_gate.shutil.which", return_value="/usr/bin/gh"),
+                patch(
+                    "ai_team.core.github_gate._gh_auth_status",
+                    return_value={"authenticated": True},
+                ),
+            ):
+                result = execute_github_action(
+                    loaded,
+                    GitHubExecutionOptions(
+                        action="merge",
+                        dry_run=False,
+                        validation_log_hash=VALIDATION_HASH,
+                        receipt_path=receipt,
+                        test_evidence_hash=TEST_HASH,
+                        pr_identifier="123",
+                        require_approved_review=False,
+                    ),
+                    runner=fake_runner,
+                )
+
+            self.assertTrue(result.success, result.reasons)
 
     def test_github_executor_merge_blocks_pending_checks_and_stale_head(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
