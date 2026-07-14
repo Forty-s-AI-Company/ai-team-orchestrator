@@ -210,8 +210,15 @@ def _apply_routing_options(
 
 def _with_routing_metadata(result: ProviderResult, request: ProviderRequest) -> ProviderResult:
     token_usage = _extract_token_usage(result)
+    command = result.data.get("command") if isinstance(result.data, dict) else None
+    stdout = command.get("stdout") if isinstance(command, dict) else None
+    # Codex writes native progress and token diagnostics to stderr. Keep those
+    # details in the redacted command evidence, but expose only the generated
+    # stdout as provider content so structured consumers can validate it.
+    content = stdout.strip() if result.success and isinstance(stdout, str) and stdout.strip() else result.content
     return replace(
         result,
+        content=content,
         data={
             **result.data,
             "requestedModel": request.metadata.get("requestedModel"),
