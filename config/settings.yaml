@@ -36,7 +36,9 @@ codex:
   # disposable linked worktree and applies allowed_write_paths + validation gates.
   write_run_args: ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]
   timeout_seconds: 45
-  run_timeout_seconds: 60
+  # High-reasoning write cycles need enough time to inspect, edit, and verify
+  # a bounded diff; outer delivery limits still cap iterations and token use.
+  run_timeout_seconds: 600
   execution_enabled: true
   # Exact names exposed by the installed WSL Codex CLI. Profiles may select
   # only these names and the four audited reasoning levels below.
