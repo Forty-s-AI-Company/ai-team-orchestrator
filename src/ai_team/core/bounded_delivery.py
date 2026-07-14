@@ -611,6 +611,10 @@ def _validate_stage_structure(stage: str, payload: Any) -> None:
         or not isinstance(payload.get("blockers"), list)
     ):
         raise BoundedDeliveryError(f"{stage} did not provide a passed, structured result")
+    if payload["blockers"]:
+        raise BoundedDeliveryError(f"{stage} returned blockers")
+    if stage in {"pm", "architect"} and payload["findings"]:
+        raise BoundedDeliveryError(f"{stage} returned findings")
     if stage == "pm":
         _required_strings(payload, "acceptanceCriteria")
     elif stage == "architect":
