@@ -175,6 +175,66 @@ class BoundedDeliveryTests(unittest.TestCase):
             qa_receipt = json.loads((Path(tmp) / "reports" / "04-qa.json").read_text())
             self.assertFalse(qa_receipt["validationResult"]["success"])
 
+    def test_qa_without_regression_evidence_is_not_stage_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _QaWithoutTestsProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            reason = "tests must be non-empty"
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], reason)
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "04-qa.json",
+                kind="structured-output",
+                stop_reason=reason,
+            )
+
+    def test_secondary_review_without_regression_evidence_is_not_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _ReviewSecondaryWithoutTestsProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            reason = "review-antigravity-read-only-review-tests-missing"
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], reason)
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "05-review.json",
+                kind="secondary-provider-output",
+                stop_reason=reason,
+            )
+
+    def test_qa_prompt_includes_acceptance_criteria_and_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+            prompts: dict[str, str] = {}
+
+            def provider(role: str) -> BaseProvider:
+                return _PromptCapturingProvider(role, prompts)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "completed", result)
+            self.assertIn("A safe documentation file is updated", prompts["qa"])
+            self.assertIn("Edit only docs/safe.md", prompts["qa"])
+            self.assertIn("tests=['evidence citation']", prompts["qa"])
+
     def test_qa_policy_failure_receipt_is_not_stage_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -449,6 +509,50 @@ class _QaWithoutCodexProvider(_StageProvider):
             content=result.content,
             data={**result.data, "secondaryReview": None},
         )
+
+
+class _QaWithoutTestsProvider(_StageProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "qa":
+            return result
+        payload = json.loads(result.content)
+        payload["tests"] = []
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
+        )
+
+
+class _ReviewSecondaryWithoutTestsProvider(_StageProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "review":
+            return result
+        secondary_payload = json.loads(result.data["secondaryReview"]["content"])
+        secondary_payload["tests"] = []
+        secondary = {
+            **result.data["secondaryReview"],
+            "content": json.dumps(secondary_payload),
+        }
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=result.content,
+            data={**result.data, "secondaryReview": secondary},
+        )
+
+
+class _PromptCapturingProvider(_StageProvider):
+    def __init__(self, role: str, prompts: dict[str, str]) -> None:
+        super().__init__(role)
+        self.prompts = prompts
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        self.prompts[request.metadata["boundedStage"]] = request.prompt
+        return super().run(request)
 
 
 class _QaSecondaryFindingProvider(_StageProvider):

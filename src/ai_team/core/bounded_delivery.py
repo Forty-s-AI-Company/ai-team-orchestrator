@@ -332,6 +332,8 @@ def _default_engineering_executor(options: BoundedDeliveryOptions) -> Callable[[
 def _stage_prompt(stage: str, context: dict[str, Any]) -> str:
     task = context["task"]
     evidence = {
+        "acceptanceCriteria": context.get("acceptanceCriteria", []),
+        "plan": context.get("plan", []),
         "allowedWritePaths": task["allowed_write_paths"],
         "validationCommands": task["validation_commands"],
         "changedFiles": context.get("changedFiles", []),
@@ -339,16 +341,20 @@ def _stage_prompt(stage: str, context: dict[str, Any]) -> str:
         "validation": context.get("validation", {"success": False, "reason": "validation evidence unavailable"}),
         "repairs": [item["findingSha"] for item in context.get("repairs", [])],
     }
+    safe_evidence = redact_secrets(evidence)
+    tests_shape = "tests=['evidence citation']" if stage in {"qa", "review"} else "tests=[]"
     return "\n".join((
         f"Bounded delivery stage: {stage}", f"Task SHA: {context['taskSha']}",
         f"Task: {redact_secrets(task['title'])}", f"Instruction: {redact_secrets(task['instruction'])}",
-        f"Allowed write paths: {json.dumps(evidence['allowedWritePaths'])}",
-        f"Validation commands: {json.dumps(evidence['validationCommands'])}",
-        f"Implementation evidence: {json.dumps(evidence)}",
-        "Return only JSON with schema='ai-team-bounded-delivery/v1', stage, status='passed', findings=[], tests=[], blockers=[].",
+        f"Acceptance criteria: {json.dumps(safe_evidence['acceptanceCriteria'])}",
+        f"Allowed write paths: {json.dumps(safe_evidence['allowedWritePaths'])}",
+        f"Validation commands: {json.dumps(safe_evidence['validationCommands'])}",
+        f"Implementation evidence: {json.dumps(safe_evidence)}",
+        f"Return only JSON with schema='ai-team-bounded-delivery/v1', stage, status='passed', findings=[], {tests_shape}, blockers=[].",
         "Do not edit files, run shell commands, deploy, migrate, seed, process payments, read secrets, or propose schema/API changes.",
         "PM: include non-empty acceptanceCriteria. Architect: include non-empty plan, allowedWritePaths, validationCommands, schemaOrApiChange=false.",
-        "QA/review: findings must be [] when passed; each failed finding must include path and message.",
+        "QA/review: evaluate every acceptance criterion; tests must cite non-empty validation or regression evidence; findings must be [] only when passed.",
+        "QA/review: each failed finding must include path and message.",
     ))
 
 
@@ -507,6 +513,13 @@ def _validate_secondary_review(
         or not isinstance(payload.get("blockers"), list)
     ):
         raise BoundedDeliveryError(f"{failure_prefix}-not-approved")
+    if stage in {"qa", "review"}:
+        try:
+            tests = _string_list(payload.get("tests"), "tests")
+        except BoundedDeliveryError as exc:
+            raise BoundedDeliveryError(f"{failure_prefix}-tests-missing") from exc
+        if not tests:
+            raise BoundedDeliveryError(f"{failure_prefix}-tests-missing")
     _findings(payload)
     _reject_forbidden(
         json.dumps(payload, ensure_ascii=False),
@@ -564,6 +577,7 @@ def _validate_stage_structure(stage: str, payload: Any) -> None:
         _required_strings(payload, "validationCommands")
     elif stage in {"qa", "review"}:
         _findings(payload)
+        _required_strings(payload, "tests")
 
 
 def _validation_failure(kind: str, stop_reason: str, **evidence: Any) -> dict[str, Any]:
