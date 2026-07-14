@@ -57,6 +57,27 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertEqual(result["status"], "attention-required")
             self.assertEqual(result["stopReason"], "mock-provider-denied")
 
+    def test_pm_structured_failure_receipt_is_not_stage_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _MissingStageFieldProvider(role, "pm", "acceptanceCriteria")
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            reason = "acceptanceCriteria must be a non-empty string list"
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], reason)
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "01-pm.json",
+                kind="structured-output",
+                stop_reason=reason,
+            )
+
     def test_out_of_scope_qa_finding_stops_without_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -128,9 +149,14 @@ class BoundedDeliveryTests(unittest.TestCase):
                 return _ArchitectWithoutCodexProvider(role)
 
             result = run_bounded_delivery(_options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt))
+            reason = "architect-codex-read-only-review-failed"
             self.assertEqual(result["status"], "attention-required")
-            self.assertEqual(result["stopReason"], "architect-codex-read-only-review-failed")
-            self.assertTrue((Path(tmp) / "reports" / "02-architect.json").exists())
+            self.assertEqual(result["stopReason"], reason)
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "02-architect.json",
+                kind="secondary-provider-output",
+                stop_reason=reason,
+            )
 
     def test_qa_requires_a_structured_codex_second_opinion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -148,6 +174,48 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertEqual(result["stopReason"], "qa-codex-read-only-review-failed")
             qa_receipt = json.loads((Path(tmp) / "reports" / "04-qa.json").read_text())
             self.assertFalse(qa_receipt["validationResult"]["success"])
+
+    def test_qa_policy_failure_receipt_is_not_stage_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _ForbiddenStageOutputProvider(role, "qa")
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            reason = "qa output contains a prohibited action or product-contract change"
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], reason)
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "04-qa.json",
+                kind="policy-validation",
+                stop_reason=reason,
+            )
+
+    def test_review_secondary_failure_receipt_is_not_stage_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _ReviewWithInvalidAntigravityProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            reason = "findings must include path and message"
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], reason)
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "05-review.json",
+                kind="secondary-provider-output",
+                stop_reason=reason,
+            )
 
     def test_secondary_qa_findings_enter_the_repair_loop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,6 +254,15 @@ class BoundedDeliveryTests(unittest.TestCase):
             path = _write_contract(Path(tmp), "../.env")
             with self.assertRaises(BoundedDeliveryError):
                 load_trusted_task_contract(path)
+
+    def _assert_failed_stage_receipt(self, path: Path, *, kind: str, stop_reason: str) -> None:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        self.assertTrue(receipt["providerSuccess"])
+        self.assertFalse(receipt["validationResult"]["success"])
+        self.assertEqual(receipt["validationResult"]["kind"], kind)
+        self.assertEqual(receipt["validationResult"]["stopReason"], stop_reason)
+        self.assertEqual(receipt["stopReason"], stop_reason)
+        self.assertEqual(receipt["evidence"]["validationError"], stop_reason)
 
 
 class _StageProvider(BaseProvider):
@@ -249,6 +326,71 @@ class _ArchitectWithoutCodexProvider(_StageProvider):
         if request.metadata["boundedStage"] != "architect":
             return result
         return ProviderResult(provider=result.provider, success=True, content=result.content, data={**result.data, "secondaryReview": None})
+
+
+class _MissingStageFieldProvider(_StageProvider):
+    def __init__(self, role: str, stage: str, field: str) -> None:
+        super().__init__(role)
+        self.stage = stage
+        self.field = field
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != self.stage:
+            return result
+        payload = json.loads(result.content)
+        payload.pop(self.field, None)
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
+        )
+
+
+class _ForbiddenStageOutputProvider(_StageProvider):
+    def __init__(self, role: str, stage: str) -> None:
+        super().__init__(role)
+        self.stage = stage
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != self.stage:
+            return result
+        payload = json.loads(result.content)
+        payload["tests"] = ["run production deployment"]
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
+        )
+
+
+class _ReviewWithInvalidAntigravityProvider(_StageProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "review":
+            return result
+        secondary = {
+            **result.data["secondaryReview"],
+            "content": json.dumps(
+                {
+                    "schema": "ai-team-bounded-delivery/v1",
+                    "stage": "review",
+                    "status": "passed",
+                    "findings": [{"path": "docs/safe.md"}],
+                    "tests": ["independent review"],
+                    "blockers": [],
+                }
+            ),
+        }
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=result.content,
+            data={**result.data, "secondaryReview": secondary},
+        )
 
 
 class _QaWithoutCodexProvider(_StageProvider):
