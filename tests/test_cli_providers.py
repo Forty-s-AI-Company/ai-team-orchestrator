@@ -101,6 +101,7 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("stage=qa", prompt)
         self.assertIn("Forbidden: edit, shell", prompt)
         self.assertIn("Challenge=challenge-1", prompt)
+        self.assertIn("tests=['evidence citation']", prompt)
 
     def test_antigravity_bounded_review_uses_delivery_schema(self) -> None:
         prompt = _compact_prompt(
@@ -112,7 +113,8 @@ class CliProviderTests(unittest.TestCase):
 
         self.assertIn("schema='ai-team-bounded-delivery/v1'", prompt)
         self.assertIn("stage=review", prompt)
-        self.assertIn("evidence-backed diff findings", prompt)
+        self.assertIn("Verify every AcceptanceCriteria item", prompt)
+        self.assertIn("tests=['evidence citation']", prompt)
 
     def test_antigravity_bounded_stage_requires_read_only_filesystem_sandbox(self) -> None:
         provider = AntigravityProvider(
@@ -182,6 +184,12 @@ class CliProviderTests(unittest.TestCase):
     def test_antigravity_bounded_qa_prompt_keeps_evidence_json_valid(self) -> None:
         evidence = json.dumps(
             {
+                "acceptanceCriteria": [
+                    "The safe path is updated",
+                    "Lint succeeds",
+                    "Tests succeed",
+                    "Build succeeds",
+                ],
                 "allowedWritePaths": [f"src/very-long-path-{index}.tsx" for index in range(20)],
                 "validationCommands": ["npm run lint", "npm run typecheck", "npm run test", "npm run build"],
                 "changedFiles": ["src/component.tsx", "src/component.test.ts"],
@@ -195,6 +203,7 @@ class CliProviderTests(unittest.TestCase):
                 (
                     "Task: Update a documented behavior",
                     "Instruction: Edit the approved path only",
+                    'Acceptance criteria: ["The safe path is updated", "Lint succeeds", "Tests succeed", "Build succeeds"]',
                     f"Allowed write paths: {json.dumps([f'src/very-long-path-{index}.tsx' for index in range(20)])}",
                     'Validation commands: ["npm run lint", "npm run typecheck", "npm run test", "npm run build"]',
                     f"Implementation evidence: {evidence}",
@@ -205,10 +214,15 @@ class CliProviderTests(unittest.TestCase):
             bounded_stage="qa",
         )
 
+        acceptance = prompt.split("AcceptanceCriteria=", 1)[1].split("; AllowedWritePaths=", 1)[0]
         allowed = prompt.split("AllowedWritePaths=", 1)[1].split("; ValidationCommands=", 1)[0]
         commands = prompt.split("ValidationCommands=", 1)[1].split("; ImplementationEvidence=", 1)[0]
         compact_evidence = prompt.split("ImplementationEvidence=", 1)[1].removesuffix(".")
 
+        self.assertEqual(
+            json.loads(acceptance),
+            ["The safe path is updated", "Lint succeeds", "Tests succeed", "Build succeeds"],
+        )
         self.assertIsInstance(json.loads(allowed), list)
         self.assertEqual(json.loads(commands), ["npm run lint", "npm run typecheck", "npm run test", "npm run build"])
         self.assertEqual(

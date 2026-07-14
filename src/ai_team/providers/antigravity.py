@@ -216,6 +216,11 @@ def _compact_prompt(
     if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
         task = values.get("task", "unknown")[:120]
         instruction = values.get("instruction", "unknown")[:280]
+        acceptance_criteria = _compact_json_array(
+            values.get("acceptance criteria", "[]"),
+            max_chars=300,
+            item_max_chars=64,
+        )
         allowed_paths = _compact_json_array(values.get("allowed write paths", "[]"), max_chars=220)
         validation_commands = _compact_json_array(values.get("validation commands", "[]"), max_chars=280)
         implementation_evidence = _compact_implementation_evidence(
@@ -227,18 +232,31 @@ def _compact_prompt(
                 "Include non-empty plan, allowedWritePaths, validationCommands arrays and "
                 "schemaOrApiChange=false. Do not expand paths or commands beyond the task."
             ),
-            "qa": "Report only evidence-backed diff findings. Use findings=[] when acceptance evidence passes.",
-            "review": "Report only evidence-backed diff findings. Use findings=[] when the reviewed diff passes.",
+            "qa": "Verify every AcceptanceCriteria item against the diff and validation evidence.",
+            "review": "Verify every AcceptanceCriteria item against the reviewed diff and validation evidence.",
         }[bounded_stage]
-        normalized = (
-            f"Bounded read-only stage={bounded_stage}; Challenge={challenge}. "
-            "Return JSON only: schema='ai-team-bounded-delivery/v1', challenge, stage, "
-            "status='passed', findings=[], tests=[], blockers=[]. No Markdown. "
-            "Forbidden: edit, shell, migrate, seed, deploy, payment, secrets, data deletion, schema/API changes. "
-            f"{stage_requirements} Task={task}; Instruction={instruction}; "
-            f"AllowedWritePaths={allowed_paths}; ValidationCommands={validation_commands}; "
-            f"ImplementationEvidence={implementation_evidence}."
-        )
+        if bounded_stage in {"qa", "review"}:
+            normalized = (
+                f"Bounded read-only stage={bounded_stage}; Challenge={challenge}. "
+                "Return JSON only: schema='ai-team-bounded-delivery/v1', challenge, stage, "
+                "status='passed', findings=[], tests=['evidence citation'], blockers=[]. No Markdown. "
+                "Forbidden: edit, shell, migrate, seed, deploy, payment, secrets, delete, schema/API change. "
+                f"{stage_requirements} Findings may be empty only when all criteria pass. "
+                f"Instruction={instruction[:120]}; AcceptanceCriteria={acceptance_criteria}; "
+                f"AllowedWritePaths={_compact_json_array(allowed_paths, max_chars=140)}; "
+                f"ValidationCommands={_compact_json_array(validation_commands, max_chars=180)}; "
+                f"ImplementationEvidence={implementation_evidence}."
+            )
+        else:
+            normalized = (
+                f"Bounded read-only stage={bounded_stage}; Challenge={challenge}. "
+                "Return JSON only: schema='ai-team-bounded-delivery/v1', challenge, stage, "
+                "status='passed', findings=[], tests=[], blockers=[]. No Markdown. "
+                "Forbidden: edit, shell, migrate, seed, deploy, payment, secrets, data deletion, schema/API changes. "
+                f"{stage_requirements} Task={task}; Instruction={instruction}; "
+                f"AllowedWritePaths={allowed_paths}; ValidationCommands={validation_commands}; "
+                f"ImplementationEvidence={implementation_evidence}."
+            )
     elif probe_path:
         normalized = (
             "Repository visibility smoke. Read the exact tracked file "
@@ -264,7 +282,7 @@ def _compact_prompt(
     return f"{normalized[: limit - len(suffix)].rstrip()}{suffix}"
 
 
-def _compact_json_array(raw: str, *, max_chars: int) -> str:
+def _compact_json_array(raw: str, *, max_chars: int, item_max_chars: int = 160) -> str:
     """Return a bounded JSON array without leaving a truncated JSON fragment."""
     try:
         value = json.loads(raw)
@@ -272,7 +290,7 @@ def _compact_json_array(raw: str, *, max_chars: int) -> str:
         return "[]"
     if not isinstance(value, list):
         return "[]"
-    items = [item[:160] for item in value if isinstance(item, str)]
+    items = [item[:item_max_chars] for item in value if isinstance(item, str)]
     while items:
         encoded = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
         if len(encoded) <= max_chars:
