@@ -305,6 +305,11 @@ def build_antigravity_provider(settings: dict) -> AntigravityProvider:
         execution_enabled=bool(antigravity.get("execution_enabled", False)),
         prompt_max_chars=int(antigravity.get("prompt_max_chars") or 1200),
         diagnostics_cache_ttl_seconds=float(antigravity.get("diagnostics_cache_ttl_seconds") or 30),
+        read_only_sandbox_executable=(
+            str(antigravity["read_only_sandbox_executable"])
+            if isinstance(antigravity.get("read_only_sandbox_executable"), str)
+            else None
+        ),
         allowed_models=tuple(_string_list(antigravity.get("allowed_models"), [])),
         allowed_reasoning_efforts=tuple(
             _string_list(

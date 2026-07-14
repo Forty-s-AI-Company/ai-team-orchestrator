@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -189,7 +190,17 @@ def _run_stage(options: BoundedDeliveryOptions, root: Path, stage: str, context:
             "taskSha": context["taskSha"], "boundedStage": stage,
         },
     )
+    before = _read_only_git_fingerprint(root)
     result = provider.run(request)
+    if _read_only_git_fingerprint(root) != before:
+        _write_receipt(
+            options,
+            context,
+            stage,
+            result,
+            {"validationError": "read-only-stage-modified-worktree"},
+        )
+        raise BoundedDeliveryError("read-only-stage-modified-worktree")
     expected = "antigravity" if stage in {"pm", "architect", "qa"} else "codex"
     if not _native_success(result, expected):
         _write_receipt(options, context, stage, result, {"validationError": _provider_stop_reason(result)})
@@ -327,6 +338,29 @@ def _provider_stop_reason(result: ProviderResult) -> str:
     if result.error_type == ProviderErrorType.TIMEOUT:
         return "provider-timeout"
     return "provider-native-execution-failed"
+
+
+def _read_only_git_fingerprint(root: Path) -> str:
+    """Fingerprint Git-visible state before and after every read-only stage."""
+    outputs: list[bytes] = []
+    for args in (
+        ["git", "rev-parse", "--verify", "HEAD"],
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    ):
+        try:
+            result = subprocess.run(
+                args,
+                cwd=root,
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise BoundedDeliveryError("read-only-stage-git-inspection-failed") from exc
+        if result.returncode != 0:
+            raise BoundedDeliveryError("read-only-stage-git-inspection-failed")
+        outputs.append(result.stdout)
+    return hashlib.sha256(b"\0".join(outputs)).hexdigest()
 
 
 def _required_strings(payload: dict[str, Any], key: str) -> list[str]:

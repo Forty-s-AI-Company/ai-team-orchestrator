@@ -27,6 +27,7 @@ class AntigravitySettings:
     execution_enabled: bool = False
     prompt_max_chars: int = 1200
     diagnostics_cache_ttl_seconds: float = 30
+    read_only_sandbox_executable: str | None = None
     allowed_models: tuple[str, ...] = ()
     allowed_reasoning_efforts: tuple[str, ...] = ("low", "medium", "high", "thinking")
 
@@ -152,6 +153,26 @@ class AntigravityProvider(BaseProvider):
             run_args=_bounded_run_args(routed_args, workspace_root, remaining),
             run_timeout_seconds=min(cli_settings.run_timeout_seconds, remaining),
         )
+        bounded_stage = request.metadata.get("boundedStage")
+        if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
+            sandboxed = _read_only_sandbox_settings(
+                cli_settings,
+                self.settings.read_only_sandbox_executable,
+                workspace_root,
+            )
+            if sandboxed is None:
+                return ProviderResult(
+                    provider=self.name,
+                    success=False,
+                    error_type=ProviderErrorType.INVALID_RESPONSE,
+                    content="bounded Antigravity stage requires a configured read-only filesystem sandbox",
+                    data={
+                        "providerNative": True,
+                        "boundedStage": bounded_stage,
+                        "readOnlySandbox": False,
+                    },
+                )
+            cli_settings = sandboxed
         command_result = cli_run_result(
             self.name,
             cli_settings,
@@ -315,6 +336,41 @@ def _bounded_run_args(run_args: list[str], project_root: Path, remaining: float)
     insert_at = args.index("--print") if "--print" in args else len(args)
     args[insert_at:insert_at] = ["--add-dir", str(project_root)]
     return args
+
+
+def _read_only_sandbox_settings(
+    settings: CliProviderSettings,
+    sandbox_executable: str | None,
+    project_root: Path,
+) -> CliProviderSettings | None:
+    """Wrap a bounded stage in a filesystem sandbox with only /tmp writable."""
+    if not isinstance(sandbox_executable, str) or not sandbox_executable.strip():
+        return None
+    sandbox = Path(sandbox_executable).expanduser()
+    if not sandbox.is_absolute() or not sandbox.is_file() or not os.access(sandbox, os.X_OK):
+        return None
+    return replace(
+        settings,
+        executable=str(sandbox),
+        run_args=[
+            "--die-with-parent",
+            "--new-session",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev-bind",
+            "/dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--chdir",
+            str(project_root),
+            settings.executable,
+            *settings.run_args,
+        ],
+    )
 
 
 def _apply_routing_options(

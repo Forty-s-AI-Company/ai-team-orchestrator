@@ -95,6 +95,26 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertEqual(result["stopReason"], "provider-timeout")
             self.assertTrue((Path(tmp) / "reports" / "01-pm.json").exists())
 
+    def test_read_only_stage_worktree_write_is_a_fail_closed_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _WritingQaProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], "read-only-stage-modified-worktree")
+            qa_receipt = json.loads((Path(tmp) / "reports" / "04-qa.json").read_text())
+            self.assertEqual(
+                qa_receipt["evidence"]["validationError"],
+                "read-only-stage-modified-worktree",
+            )
+
     def test_architect_requires_a_structured_codex_second_opinion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -197,6 +217,13 @@ class _TimeoutProvider(BaseProvider):
         return ProviderResult(provider="antigravity", success=False, error_type=ProviderErrorType.TIMEOUT, content="timeout")
 
 
+class _WritingQaProvider(_StageProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        if request.metadata["boundedStage"] == "qa":
+            (request.project_root / "qa-must-not-write.txt").write_text("unexpected", encoding="utf-8")
+        return super().run(request)
+
+
 def _provider_for_role(role: str) -> BaseProvider:
     return _StageProvider(role)
 
@@ -213,6 +240,18 @@ def _successful_engineering_attempt(contract, instruction: str, provider: BasePr
 
 
 def _options(base: Path, root: Path, contract_path: Path, provider_for_role, engineering_executor) -> BoundedDeliveryOptions:
+    def execute_in_project(contract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
+        attempt = engineering_executor(contract, instruction, provider, iteration)
+        return EngineeringAttempt(
+            provider_result=attempt.provider_result,
+            worktree_path=root,
+            changed_files=attempt.changed_files,
+            validation=attempt.validation,
+            commit_sha=attempt.commit_sha,
+            run_receipt=attempt.run_receipt,
+            executor_receipt=attempt.executor_receipt,
+        )
+
     return BoundedDeliveryOptions(
         project_path=root,
         task_contract_path=contract_path,
@@ -221,7 +260,7 @@ def _options(base: Path, root: Path, contract_path: Path, provider_for_role, eng
         report_dir=base / "reports",
         state_path=base / "state.json",
         limits=DeliveryLimits(max_iterations=2, max_repair_attempts=1, max_token_usage=1000, timeout_seconds=30),
-        engineering_executor=engineering_executor,
+        engineering_executor=execute_in_project,
     )
 
 
