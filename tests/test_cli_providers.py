@@ -116,6 +116,17 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("Verify every AcceptanceCriteria item", prompt)
         self.assertIn("tests=['evidence citation']", prompt)
 
+    def test_antigravity_pm_prompt_forbids_restatement_findings(self) -> None:
+        prompt = _compact_prompt(
+            "Task: Define acceptance criteria\nInstruction: Analyze only",
+            1200,
+            challenge="challenge-pm",
+            bounded_stage="pm",
+        )
+
+        self.assertIn("findings and blockers MUST be exactly []", prompt)
+        self.assertIn("never restate required work as a finding or blocker", prompt)
+
     def test_antigravity_bounded_stage_requires_read_only_filesystem_sandbox(self) -> None:
         provider = AntigravityProvider(
             AntigravitySettings(

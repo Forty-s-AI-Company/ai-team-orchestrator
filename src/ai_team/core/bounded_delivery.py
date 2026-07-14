@@ -363,8 +363,9 @@ def _stage_prompt(stage: str, context: dict[str, Any]) -> str:
         f"Return only JSON with schema='ai-team-bounded-delivery/v1', stage, status='passed', findings=[], {tests_shape}, blockers=[].",
         "Do not edit files, run shell commands, deploy, migrate, seed, process payments, read secrets, or propose schema/API changes.",
         "PM: include non-empty acceptanceCriteria. Architect: include non-empty plan, allowedWritePaths, validationCommands, schemaOrApiChange=false.",
+        "PM/architect: findings and blockers must be exactly []; do not restate required work as a finding or blocker.",
         "QA/review: evaluate every acceptance criterion; tests must cite non-empty validation or regression evidence; findings must be [] only when passed.",
-        "QA/review: each failed finding must include path and message.",
+        "QA/review: each failed finding must include path and message; blockers must be exactly [] for status='passed'.",
     ))
 
 

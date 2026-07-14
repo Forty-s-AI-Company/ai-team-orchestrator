@@ -337,6 +337,7 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertIn("A safe documentation file is updated", prompts["qa"])
             self.assertIn("Edit only docs/safe.md", prompts["qa"])
             self.assertIn("tests=['evidence citation']", prompts["qa"])
+            self.assertIn("findings and blockers must be exactly []", prompts["pm"])
 
     def test_qa_policy_failure_receipt_is_not_stage_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
