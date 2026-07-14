@@ -188,6 +188,93 @@ class BoundedDeliveryTests(unittest.TestCase):
                 stop_reason=reason,
             )
 
+    def test_deterministic_validation_failure_enters_bounded_repair_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+            instructions: list[dict] = []
+
+            def fail_once_then_pass(contract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
+                instructions.append(json.loads(instruction))
+                if iteration == 1:
+                    return EngineeringAttempt(
+                        provider_result=ProviderResult(
+                            provider="codex",
+                            success=True,
+                            content="implementation generated",
+                            data={"tokenUsage": 20},
+                        ),
+                        worktree_path=root,
+                        changed_files=["docs/safe.md"],
+                        validation={
+                            "success": False,
+                            "commands": [{
+                                "command": "npm run lint",
+                                "returnCode": 1,
+                                "stdout": "api_key=super-secret-value\nParsing error: '}' expected",
+                                "stderr": "",
+                            }],
+                        },
+                        commit_sha=None,
+                    )
+                return _successful_engineering_attempt(contract, instruction, provider, iteration)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, _provider_for_role, fail_once_then_pass)
+            )
+
+            self.assertEqual(result["status"], "completed", result)
+            self.assertEqual(len(instructions), 2)
+            repair = instructions[1]["repairs"][0]
+            self.assertEqual(repair["kind"], "deterministic-validation")
+            self.assertEqual(repair["evidence"]["changedFiles"], ["docs/safe.md"])
+            self.assertIn("Parsing error", repair["evidence"]["failedCommands"][0]["stdout"])
+            self.assertNotIn("super-secret-value", json.dumps(repair))
+            receipts = [Path(path) for path in result["receipts"]]
+            self.assertEqual(
+                [path.name for path in receipts],
+                ["01-pm.json", "02-architect.json", "03-engineer.json", "04-engineer.json", "05-qa.json", "06-review.json"],
+            )
+            failed_receipt = json.loads(receipts[2].read_text(encoding="utf-8"))
+            self.assertTrue(failed_receipt["providerSuccess"])
+            self.assertFalse(failed_receipt["validationResult"]["success"])
+            self.assertEqual(failed_receipt["validationResult"]["kind"], "deterministic-validation")
+            self.assertNotIn("super-secret-value", receipts[2].read_text(encoding="utf-8"))
+
+    def test_validation_failure_with_out_of_scope_diff_never_enters_repair_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+            calls = 0
+
+            def outside_scope_failure(contract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
+                nonlocal calls
+                calls += 1
+                return EngineeringAttempt(
+                    provider_result=ProviderResult(provider="codex", success=True, content="generated"),
+                    worktree_path=root,
+                    changed_files=["src/outside.ts"],
+                    validation={
+                        "success": False,
+                        "commands": [{"command": "npm run lint", "returnCode": 1, "stdout": "failed", "stderr": ""}],
+                    },
+                    commit_sha=None,
+                )
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, _provider_for_role, outside_scope_failure)
+            )
+
+            self.assertEqual(calls, 1)
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], "engineering-diff-outside-allowed-paths")
+            self.assertEqual(result["worktreePath"], str(root))
+            self._assert_failed_stage_receipt(
+                Path(tmp) / "reports" / "03-engineer.json",
+                kind="policy-validation",
+                stop_reason="engineering-diff-outside-allowed-paths",
+            )
+
     def test_provider_success_with_git_commit_failure_is_not_engineer_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
