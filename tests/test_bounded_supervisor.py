@@ -338,6 +338,44 @@ class ContinuousBoundedSupervisorTests(unittest.TestCase):
             self.assertEqual(sleeps, [60, 120, 60])
             self.assertEqual(result["status"], "completed")
 
+    def test_quota_backoff_uses_task_checkpoint_stage_when_runner_summary_omits_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            contract_path = _write_contract(contracts / "001-task.json", "task")
+            task_sha = load_trusted_task_contract(contract_path)[1]
+
+            def delivery(options):
+                options.state_path.parent.mkdir(parents=True, exist_ok=True)
+                options.state_path.write_text(
+                    json.dumps({"status": "attention-required", "stage": "engineer"}),
+                    encoding="utf-8",
+                )
+                return {
+                    "status": "attention-required",
+                    "stopReason": "provider-quota-exhausted",
+                    "taskSha": task_sha,
+                }
+
+            result = run_continuous_bounded_delivery(
+                ContinuousBoundedOptions(
+                    project_path=root,
+                    contract_dir=contracts,
+                    provider_for_role=lambda _role: _NoopProvider(),
+                    workspace_allowlist=[tmp],
+                    report_dir=root / "reports",
+                    state_path=root / "state.json",
+                    once=True,
+                    interval_minutes=1,
+                    delivery_runner=delivery,
+                    wall_clock=lambda: datetime(2026, 7, 15, tzinfo=UTC),
+                )
+            )
+
+            self.assertEqual(result["status"], "waiting-provider")
+            self.assertEqual(result["providerBackoff"]["stage"], "engineer")
+
     def test_delivery_exception_is_recorded_without_escaping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
