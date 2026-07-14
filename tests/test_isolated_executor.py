@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -9,7 +10,11 @@ from unittest.mock import patch
 
 from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action, sanitize_branch_name
 from ai_team.core.github_gate import evaluate_github_action
-from ai_team.core.isolated_executor import run_in_disposable_worktree
+from ai_team.core.isolated_executor import (
+    prepare_dependency_link,
+    remove_dependency_link,
+    run_in_disposable_worktree,
+)
 from ai_team.core.project_loader import load_project
 from ai_team.providers import MockProvider
 from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
@@ -80,6 +85,52 @@ def write_valid_receipt(root: Path, loaded) -> Path:
 
 
 class IsolatedExecutorTests(unittest.TestCase):
+    def test_next_dependencies_are_copied_inside_disposable_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            worktree = root / "worktree"
+            source_module = source / "node_modules" / "sample" / "index.js"
+            source_module.parent.mkdir(parents=True)
+            source_module.write_text("source\n", encoding="utf-8")
+            worktree.mkdir()
+            (worktree / "package.json").write_text(
+                json.dumps({"dependencies": {"next": "16.2.10"}}),
+                encoding="utf-8",
+            )
+
+            prepared = prepare_dependency_link(worktree, source)
+
+            self.assertEqual(prepared, worktree / "node_modules")
+            self.assertFalse(prepared.is_symlink())
+            copied_module = prepared / "sample" / "index.js"
+            copied_module.write_text("worktree\n", encoding="utf-8")
+            self.assertEqual(source_module.read_text(encoding="utf-8"), "source\n")
+
+            remove_dependency_link(prepared)
+            self.assertFalse(prepared.exists())
+
+    def test_non_next_dependencies_keep_lightweight_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            worktree = root / "worktree"
+            (source / "node_modules").mkdir(parents=True)
+            worktree.mkdir()
+            (worktree / "package.json").write_text(
+                json.dumps({"dependencies": {"react": "19.0.0"}}),
+                encoding="utf-8",
+            )
+
+            prepared = prepare_dependency_link(worktree, source)
+
+            if os.name == "nt":
+                self.assertTrue(prepared.exists())
+            else:
+                self.assertTrue(prepared.is_symlink())
+            remove_dependency_link(prepared)
+            self.assertFalse(prepared.exists())
+
     def test_write_workflow_runs_in_disposable_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
