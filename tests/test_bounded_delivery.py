@@ -18,6 +18,68 @@ from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderRequ
 
 
 class BoundedDeliveryTests(unittest.TestCase):
+    def test_allows_project_declared_additional_validation_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project", additional_validation=["npm run e2e:smoke"])
+            contract_path = _write_contract(
+                Path(tmp),
+                "docs/safe.md",
+                validation_commands=[
+                    "npm run lint",
+                    "npm run typecheck",
+                    "npm run test",
+                    "npm run build",
+                    "npm run e2e:smoke",
+                ],
+            )
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, _provider_for_role, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "completed", result)
+
+    def test_rejects_undeclared_or_missing_baseline_validation_command(self) -> None:
+        cases = (
+            (
+                ["npm run lint", "npm run typecheck", "npm run test", "npm run build", "npm run e2e:smoke"],
+                "undeclared additional validation command",
+            ),
+            (
+                ["npm run lint", "npm run typecheck", "npm run test"],
+                "must run the project lint, typecheck, test, and build commands",
+            ),
+        )
+        for commands, message in cases:
+            with self.subTest(commands=commands), tempfile.TemporaryDirectory() as tmp:
+                root = _init_project(Path(tmp) / "project")
+                contract_path = _write_contract(Path(tmp), "docs/safe.md", validation_commands=commands)
+
+                with self.assertRaisesRegex(BoundedDeliveryError, message):
+                    run_bounded_delivery(
+                        _options(Path(tmp), root, contract_path, _provider_for_role, _successful_engineering_attempt)
+                    )
+
+    def test_rejects_duplicate_validation_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(
+                Path(tmp),
+                "docs/safe.md",
+                validation_commands=[
+                    "npm run lint",
+                    "npm run typecheck",
+                    "npm run test",
+                    "npm run build",
+                    "npm run test",
+                ],
+            )
+
+            with self.assertRaisesRegex(BoundedDeliveryError, "validationCommands must not contain duplicate values"):
+                run_bounded_delivery(
+                    _options(Path(tmp), root, contract_path, _provider_for_role, _successful_engineering_attempt)
+                )
+
     def test_fake_native_providers_complete_all_state_transitions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -1368,7 +1430,12 @@ def _options(
     )
 
 
-def _write_contract(base: Path, allowed_path: str, instruction: str = "Update the approved documentation only") -> Path:
+def _write_contract(
+    base: Path,
+    allowed_path: str,
+    instruction: str = "Update the approved documentation only",
+    validation_commands: list[str] | None = None,
+) -> Path:
     path = base / "task.json"
     path.write_text(json.dumps({
         "schemaVersion": 1,
@@ -1377,20 +1444,27 @@ def _write_contract(base: Path, allowed_path: str, instruction: str = "Update th
         "source": {"kind": "trusted-contract", "reference": "ops/2026-07-13/doc-update"},
         "instruction": instruction,
         "allowedWritePaths": [allowed_path],
-        "validationCommands": ["npm run lint", "npm run typecheck", "npm run test", "npm run build"],
+        "validationCommands": validation_commands or [
+            "npm run lint", "npm run typecheck", "npm run test", "npm run build",
+        ],
     }), encoding="utf-8")
     return path
 
 
-def _init_project(root: Path) -> Path:
+def _init_project(root: Path, additional_validation: list[str] | None = None) -> Path:
     root.mkdir()
     subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@example.local"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.name", "AI Team Test"], cwd=root, check=True)
     profile = root / ".ai-team" / "project.yaml"
     profile.parent.mkdir()
+    additional = "" if not additional_validation else "  additional_validation:\n" + "".join(
+        f"    - {command}\n" for command in additional_validation
+    )
     profile.write_text(
-        """project:\n  name: sample\n  root: \".\"\n  stage: development\nrepository:\n  protected_branches: [master, main]\ncommands:\n  lint: npm run lint\n  typecheck: npm run typecheck\n  test: npm run test\n  build: npm run build\nsafety:\n  allow_git_push: true\n  allow_deploy: false\n  allow_database_migration: false\n  allow_database_seed: false\n  allow_destructive_commands: false\n""",
+        """project:\n  name: sample\n  root: \".\"\n  stage: development\nrepository:\n  protected_branches: [master, main]\ncommands:\n  lint: npm run lint\n  typecheck: npm run typecheck\n  test: npm run test\n  build: npm run build\n"""
+        + additional
+        + """safety:\n  allow_git_push: true\n  allow_deploy: false\n  allow_database_migration: false\n  allow_database_seed: false\n  allow_destructive_commands: false\n""",
         encoding="utf-8",
     )
     subprocess.run(["git", "add", "."], cwd=root, check=True)

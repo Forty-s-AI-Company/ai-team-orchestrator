@@ -618,8 +618,24 @@ receipt and secret-scan evidence, and an approved GitHub review.
 `--bounded-delivery` is a separate fail-closed delivery path. It never
 discovers product requirements itself: an operator supplies versioned JSON task
 contracts that cite either a GitHub issue or another trusted source. Every
-contract must declare the exact approved write paths and must use exactly the
-project contract's `lint`, `typecheck`, `test`, and `build` commands.
+contract must declare the exact approved write paths and must always run the
+project contract's `lint`, `typecheck`, `test`, and `build` commands. A project
+may additionally allowlist task-specific deterministic checks under
+`commands.additional_validation`; a task can select from that tracked list,
+while an undeclared command still fails closed.
+
+For example, a project with an existing Playwright smoke script can opt in
+without allowing arbitrary task-contract shell commands:
+
+```yaml
+commands:
+  lint: npm run lint
+  typecheck: npm run typecheck
+  test: npm run test
+  build: npm run build
+  additional_validation:
+    - npm run e2e:smoke
+```
 
 The role and repair cycle runs PM (Antigravity), Architect (Antigravity plus mandatory
 read-only Codex second opinion), Codex Engineer in a disposable worktree,
