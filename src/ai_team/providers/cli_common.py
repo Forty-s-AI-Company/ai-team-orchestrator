@@ -267,13 +267,13 @@ def _command_result_dict(args: list[str], result: CliCommandResult) -> dict[str,
 
 
 def _error_type_from_command(result: CliCommandResult) -> ProviderErrorType | None:
-    if _looks_like_quota(result.combined):
-        return ProviderErrorType.RATE_LIMIT
     lowered = result.combined.lower()
     if "orchestrator_helper_" in lowered or "windows sandbox failed" in lowered:
         return ProviderErrorType.NETWORK
     if result.return_code == 0:
         return None
+    if _looks_like_quota(result.combined):
+        return ProviderErrorType.RATE_LIMIT
     if result.error and "timeout" in result.error.lower():
         return ProviderErrorType.TIMEOUT
     if "timeout" in result.combined.lower():
