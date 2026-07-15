@@ -329,6 +329,10 @@ The Antigravity adapter uses a provider-specific compact prompt and passes the
 project through `--add-dir` in sandboxed plan mode. A trivial native request can
 prove login/model availability, while a workflow timeout remains a timeout and
 must never be reported as an Antigravity pass or replaced by a Codex label.
+Bounded-delivery prompts preserve the complete trusted task instruction within
+an 8192-character cap. If the instruction and mandatory policy context cannot
+fit losslessly, the provider fails closed before invoking the model instead of
+silently truncating acceptance requirements.
 
 Antigravity native success now requires a challenge-bound JSON response. The
 `provider-smoke` workflow asks Antigravity to read a small tracked manifest and

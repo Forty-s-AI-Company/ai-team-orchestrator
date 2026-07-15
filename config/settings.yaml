@@ -105,9 +105,9 @@ antigravity:
   timeout_seconds: 20
   run_timeout_seconds: 40
   execution_enabled: true
-  # Bounded delivery needs enough room for task scope and validation evidence;
-  # the provider still enforces a hard 1,600-character cap.
-  prompt_max_chars: 1600
+  # Bounded delivery preserves complete trusted instructions and fails closed
+  # when task scope plus mandatory policy evidence exceeds this hard cap.
+  prompt_max_chars: 8192
   diagnostics_cache_ttl_seconds: 30
   # All bounded Antigravity PM/architect/QA/review stages run with the repo
   # read-only. The CLI may persist only ephemeral state under /tmp.
