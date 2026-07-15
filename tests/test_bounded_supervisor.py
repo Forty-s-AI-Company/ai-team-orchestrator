@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ai_team.core.bounded_delivery import load_trusted_task_contract
+from ai_team.core.cloud_resilience import LocalContinuitySettings, RetrySettings, default_engineer_routes
 from ai_team.core.bounded_supervisor import (
     ContinuousBoundedOptions,
     _sync_primary,
@@ -20,6 +21,84 @@ from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
 
 
 class ContinuousBoundedSupervisorTests(unittest.TestCase):
+    def test_cloud_fallback_creates_checkpoint_then_resumes_preferred_model(self) -> None:
+        """A temporary model outage must not permanently block the queue."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            contract_path = _write_contract(contracts / "001-task.json", "task")
+            task_sha = load_trusted_task_contract(contract_path)[1]
+            now = [datetime(2026, 7, 15, tzinfo=UTC)]
+            monotonic = [0.0]
+            models: list[str] = []
+            snapshots: list[dict[str, object]] = []
+            finished = [False]
+            state_path = root / "state.json"
+
+            def delivery(delivery_options):
+                selected = delivery_options.provider_for_role("engineer")
+                models.append(selected.route.model)
+                if len(models) <= 3:
+                    return {
+                        "status": "attention-required",
+                        "stopReason": "provider-rate-limit",
+                        "taskSha": task_sha,
+                        "stage": "engineer",
+                    }
+                finished[0] = True
+                return {"status": "completed", "taskSha": task_sha, "commitSha": "commit-task"}
+
+            def sleep(seconds: float) -> None:
+                snapshots.append(json.loads(state_path.read_text(encoding="utf-8")))
+                now[0] += timedelta(seconds=seconds)
+                monotonic[0] += seconds
+                if finished[0]:
+                    monotonic[0] = 100_000
+
+            result = run_continuous_bounded_delivery(
+                ContinuousBoundedOptions(
+                    project_path=root,
+                    contract_dir=contracts,
+                    provider_for_role=lambda _role: _NoopProvider(),
+                    workspace_allowlist=[tmp],
+                    report_dir=root / "reports",
+                    state_path=state_path,
+                    once=False,
+                    interval_minutes=1,
+                    max_runtime_minutes=1_000,
+                    github_execute=True,
+                    auto_merge=True,
+                    delivery_runner=delivery,
+                    publisher=lambda _options, _entry, _result: {"success": True},
+                    sleeper=sleep,
+                    monotonic=lambda: monotonic[0],
+                    wall_clock=lambda: now[0],
+                    cloud_routes=default_engineer_routes(),
+                    cloud_retry=RetrySettings(
+                        max_attempts_per_model=1,
+                        initial_delay_seconds=1,
+                        multiplier=2,
+                        max_delay_seconds=10,
+                        jitter_ratio=0,
+                        max_task_provider_attempts=8,
+                        circuit_failure_threshold=1,
+                        circuit_cooldown_seconds=10,
+                        circuit_max_cooldown_seconds=10,
+                        probe_interval_seconds=1,
+                    ),
+                    local_continuity=LocalContinuitySettings(),
+                )
+            )
+
+            self.assertEqual(models, ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"])
+            waiting = next(item for item in snapshots if item["status"] == "cloud_waiting")
+            self.assertEqual(waiting["stopReason"], "all-cloud-models-temporarily-unavailable")
+            packet = waiting["continuity"]["resumePacket"]
+            self.assertTrue(Path(packet["json"]).is_file())
+            self.assertEqual(result["status"], "idle")
+
     def test_continuous_mode_runs_ordered_contracts_until_runtime_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

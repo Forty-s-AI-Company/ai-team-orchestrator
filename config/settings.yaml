@@ -52,6 +52,50 @@ codex:
     - "gpt-5.3-codex-spark"
   allowed_reasoning_efforts: ["low", "medium", "high", "xhigh"]
 
+# The bounded delivery supervisor owns retry and fallback decisions for the
+# Engineer.  Do not add a cross-provider write fallback here: all three routes
+# remain the audited WSL Codex CLI in the same disposable worktree policy.
+providers:
+  codex_engineer:
+    models:
+      - name: "gpt-5.6-terra"
+        reasoning: medium
+        priority: 100
+      - name: "gpt-5.6-sol"
+        reasoning: medium
+        priority: 80
+      - name: "gpt-5.6-luna"
+        reasoning: medium
+        priority: 60
+    retry:
+      max_attempts_per_model: 2
+      initial_delay_seconds: 60
+      multiplier: 2
+      max_delay_seconds: 1800
+      jitter_ratio: 0.15
+    circuit_breaker:
+      failure_threshold: 2
+      cooldown_seconds: 1800
+      max_cooldown_seconds: 14400
+      probe_interval_seconds: 900
+    budgets:
+      max_task_provider_attempts: 8
+      max_provider_probes_per_hour: 4
+
+# Optional local recorder configuration.  With no command configured the
+# supervisor writes deterministic, redacted resume packets only.  It may never
+# write a product repository, run tests, create commits, or generate code.
+local_continuity:
+  enabled: true
+  mode: recorder_only
+  timeout_seconds: 180
+  max_output_tokens: 2000
+  allow_repository_writes: false
+  allow_git_writes: false
+  allow_test_execution: false
+  allow_code_generation: false
+  deterministic_fallback: true
+
 antigravity:
   # Pin the audited WSL-native CLI and use an authenticated command for doctor.
   executable: "/home/eden/.local/bin/agy"
@@ -112,8 +156,16 @@ routing:
       primary:
         provider: codex
         model: "gpt-5.6-terra"
-        reasoning_effort: high
-      fallbacks: []
+        reasoning_effort: medium
+      # These are only selected by the persistent bounded delivery circuit
+      # breaker; RoleRouter never auto-switches a write workflow itself.
+      fallbacks:
+        - provider: codex
+          model: "gpt-5.6-sol"
+          reasoning_effort: medium
+        - provider: codex
+          model: "gpt-5.6-luna"
+          reasoning_effort: medium
       allow_write: true
 
     reviewer:
