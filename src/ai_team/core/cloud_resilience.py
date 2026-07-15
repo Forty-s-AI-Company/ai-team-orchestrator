@@ -216,6 +216,11 @@ class CloudRecoveryState:
                 if circuit["circuitState"] != "open":
                     self.current_key = route.key
                     return "delivery", route, now
+            for route in self.routes:
+                circuit = self._circuit(route)
+                if _time(circuit.get("nextProbeAt")) <= now:
+                    self.current_key = route.key
+                    return "probe", route, now
             next_probe = min(_time(self._circuit(route).get("nextProbeAt")) for route in self.routes)
             return "cloud_waiting", None, next_probe
         return "delivery", current, now
