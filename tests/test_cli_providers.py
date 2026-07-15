@@ -222,6 +222,67 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("findings and blockers MUST be exactly []", prompt)
         self.assertIn("never restate required work as a finding or blocker", prompt)
 
+    def test_antigravity_bounded_prompts_preserve_the_complete_instruction(self) -> None:
+        instruction = "Begin exact contract. " + ("bounded detail " * 40) + "TAIL_REQUIREMENT_MUST_SURVIVE"
+        source = "\n".join(
+            (
+                "Task: Preserve a trusted contract",
+                f"Instruction: {instruction}",
+                'Acceptance criteria: ["Honor the exact contract"]',
+                'Allowed write paths: ["tests/example.test.ts"]',
+                'Validation commands: ["npm run test"]',
+                'Implementation evidence: {"changedFiles": [], "validation": {"success": false}}',
+            )
+        )
+
+        for stage in ("pm", "architect", "qa", "review"):
+            with self.subTest(stage=stage):
+                prompt = _compact_prompt(
+                    source,
+                    4096,
+                    challenge=f"challenge-{stage}",
+                    bounded_stage=stage,
+                )
+
+                self.assertIn(instruction, prompt)
+                self.assertNotIn("[truncated]", prompt)
+
+    def test_antigravity_bounded_prompt_fails_closed_when_lossless_limit_is_too_small(self) -> None:
+        with self.assertRaisesRegex(ValueError, "lossless prompt limit"):
+            _compact_prompt(
+                "Task: Preserve a trusted contract\nInstruction: " + ("exact requirement " * 100),
+                400,
+                challenge="challenge-pm",
+                bounded_stage="pm",
+            )
+
+    def test_antigravity_provider_reports_bounded_prompt_rejection_without_running_model(self) -> None:
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "raise SystemExit('must not run')"],
+                execution_enabled=True,
+                prompt_max_chars=400,
+            )
+        )
+
+        result = provider.run(
+            ProviderRequest(
+                workflow="bounded-delivery-pm",
+                prompt="Task: Preserve a trusted contract\nInstruction: " + ("exact requirement " * 100),
+                project_root=Path.cwd(),
+                run_mode="run-agent",
+                metadata={"boundedStage": "pm", "writeAccess": False},
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
+        self.assertTrue(result.data["boundedPromptRejected"])
+        self.assertNotIn("exact requirement", result.content)
+
     def test_antigravity_bounded_stage_requires_read_only_filesystem_sandbox(self) -> None:
         provider = AntigravityProvider(
             AntigravitySettings(

@@ -25,7 +25,7 @@ class AntigravitySettings:
     timeout_seconds: float = 45
     run_timeout_seconds: float = 180
     execution_enabled: bool = False
-    prompt_max_chars: int = 1200
+    prompt_max_chars: int = 8192
     diagnostics_cache_ttl_seconds: float = 30
     read_only_sandbox_executable: str | None = None
     allowed_models: tuple[str, ...] = ()
@@ -115,13 +115,27 @@ class AntigravityProvider(BaseProvider):
         probe: tuple[str, str] | None,
         workspace_root: Path,
     ) -> ProviderResult:
-        prompt = _compact_prompt(
-            request.prompt,
-            self.settings.prompt_max_chars,
-            challenge=challenge,
-            probe_path=probe[0] if probe else None,
-            bounded_stage=request.metadata.get("boundedStage"),
-        )
+        bounded_stage = request.metadata.get("boundedStage")
+        try:
+            prompt = _compact_prompt(
+                request.prompt,
+                self.settings.prompt_max_chars,
+                challenge=challenge,
+                probe_path=probe[0] if probe else None,
+                bounded_stage=bounded_stage,
+            )
+        except ValueError as exc:
+            return ProviderResult(
+                provider=self.name,
+                success=False,
+                error_type=ProviderErrorType.INVALID_RESPONSE,
+                content=str(exc),
+                data={
+                    "providerNative": True,
+                    "boundedStage": bounded_stage,
+                    "boundedPromptRejected": True,
+                },
+            )
         compact_request = replace(
             request,
             prompt=prompt,
@@ -153,7 +167,6 @@ class AntigravityProvider(BaseProvider):
             run_args=_bounded_run_args(routed_args, workspace_root, remaining),
             run_timeout_seconds=min(cli_settings.run_timeout_seconds, remaining),
         )
-        bounded_stage = request.metadata.get("boundedStage")
         if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
             sandboxed = _read_only_sandbox_settings(
                 cli_settings,
@@ -215,7 +228,7 @@ def _compact_prompt(
         values[key.strip().lower()] = value.strip()
     if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
         task = values.get("task", "unknown")[:120]
-        instruction = values.get("instruction", "unknown")[:280]
+        instruction = values.get("instruction", "unknown")
         acceptance_criteria = _compact_json_array(
             values.get("acceptance criteria", "[]"),
             max_chars=300,
@@ -243,7 +256,7 @@ def _compact_prompt(
                 "Use the exact JSON key 'schema'; '$schema' is invalid. No Markdown. "
                 "Forbidden: edit, shell, migrate, seed, deploy, payment, secrets, delete, schema/API change. "
                 f"{stage_requirements} Findings may be empty only when all criteria pass. "
-                f"Instruction={instruction[:120]}; AcceptanceCriteria={acceptance_criteria}; "
+                f"Instruction={instruction}; AcceptanceCriteria={acceptance_criteria}; "
                 f"AllowedWritePaths={_compact_json_array(allowed_paths, max_chars=140)}; "
                 f"ValidationCommands={_compact_json_array(validation_commands, max_chars=180)}; "
                 f"ImplementationEvidence={implementation_evidence}."
@@ -278,9 +291,11 @@ def _compact_prompt(
             "Return only strict JSON with schema='ai-team-antigravity/v1', challenge, status, "
             "findings=[], tests=[], blockers=[]. Do not use Markdown fences."
         )
-    limit = min(1600, max(240, max_chars))
+    limit = min(8192, max(240, max_chars))
     if len(normalized) <= limit:
         return normalized
+    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
+        raise ValueError("bounded delivery prompt exceeds the configured lossless prompt limit")
     suffix = " [truncated]"
     return f"{normalized[: limit - len(suffix)].rstrip()}{suffix}"
 
