@@ -86,6 +86,32 @@ class CloudResilienceTests(unittest.TestCase):
         self.assertEqual(action, "delivery")
         self.assertEqual(route, terra)
 
+    def test_next_due_fallback_is_probed_when_preferred_reopens_with_longer_cooldown(self) -> None:
+        recovery = CloudRecoveryState(
+            task_sha="g" * 64,
+            stage="engineer",
+            routes=default_engineer_routes(),
+            settings=self.settings,
+        )
+        terra, sol, luna = default_engineer_routes()
+        recovery.record_failure(terra, reason="provider-rate-limit", now=self.now)
+        recovery.record_failure(terra, reason="provider-rate-limit", now=self.now + timedelta(seconds=60))
+        recovery.record_failure(sol, reason="provider-rate-limit", now=self.now + timedelta(seconds=120))
+        recovery.record_failure(sol, reason="provider-rate-limit", now=self.now + timedelta(seconds=180))
+        recovery.record_failure(luna, reason="provider-rate-limit", now=self.now + timedelta(seconds=240))
+        recovery.record_failure(luna, reason="provider-rate-limit", now=self.now + timedelta(seconds=300))
+
+        probe_action, probe_route, _ = recovery.next_action(self.now + timedelta(seconds=360))
+        self.assertEqual((probe_action, probe_route), ("probe", terra))
+        recovery.record_probe(terra, success=True, now=self.now + timedelta(seconds=360))
+        recovery.record_failure(terra, reason="provider-rate-limit", now=self.now + timedelta(seconds=361))
+
+        action, route, next_time = recovery.next_action(self.now + timedelta(seconds=362))
+        self.assertEqual(action, "probe")
+        self.assertEqual(route, sol)
+        self.assertEqual(next_time, self.now + timedelta(seconds=362))
+        self.assertEqual(recovery.current_route(), sol)
+
     def test_provider_probe_budget_is_bounded_per_hour(self) -> None:
         settings = RetrySettings(max_provider_probes_per_hour=1)
         recovery = CloudRecoveryState(
