@@ -216,6 +216,14 @@ class RoleRouterProvider(BaseProvider):
             self.profile.primary,
             *self.profile.fallbacks,
         )
+        selected_cloud_route = request.metadata.get("boundedCloudRoute")
+        if selected_cloud_route is not None:
+            if not write_required or self.profile.role != "engineer":
+                return self._policy_failure("bounded cloud route is allowed only for the Engineer write stage")
+            target = _bounded_cloud_target(selected_cloud_route, (self.profile.primary, *self.profile.fallbacks))
+            if target is None:
+                return self._policy_failure("bounded cloud route is not allowlisted by the Engineer role profile")
+            targets = (target,)
         attempts: list[ProviderRouteAttempt] = []
         selected_target: RouteTarget | None = None
         selected_result: ProviderResult | None = None
@@ -394,6 +402,26 @@ def _request_for_target(
             "requestedModel": target.model,
             "reasoningEffort": target.reasoning_effort,
         },
+    )
+
+
+def _bounded_cloud_target(value: object, targets: tuple[RouteTarget, ...]) -> RouteTarget | None:
+    """Resolve a supervisor route only when it exactly matches profile policy."""
+
+    if not isinstance(value, dict):
+        return None
+    provider = value.get("provider")
+    model = value.get("model")
+    reasoning = value.get("reasoningEffort")
+    if not all(isinstance(item, str) for item in (provider, model, reasoning)):
+        return None
+    return next(
+        (
+            target
+            for target in targets
+            if target.provider == provider and target.model == model and target.reasoning_effort == reasoning
+        ),
+        None,
     )
 
 

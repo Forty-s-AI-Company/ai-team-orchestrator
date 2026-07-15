@@ -11,6 +11,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from ai_team.core.cloud_resilience import (
+    CloudModelRoute,
+    CloudRecoveryState,
+    LocalContinuitySettings,
+    RetrySettings,
+    SelectedCloudRouteProvider,
+    classify_failure,
+    create_resume_packet,
+)
 from ai_team.core.bounded_delivery import (
     BoundedDeliveryOptions,
     DeliveryLimits,
@@ -59,6 +68,9 @@ class ContinuousBoundedOptions:
     allow_unreviewed_development_merge: bool = False
     ci_wait_seconds: int = 900
     ci_poll_seconds: int = 10
+    cloud_routes: tuple[CloudModelRoute, ...] = ()
+    cloud_retry: RetrySettings = RetrySettings()
+    local_continuity: LocalContinuitySettings = LocalContinuitySettings()
     delivery_runner: Callable[[BoundedDeliveryOptions], dict[str, Any]] = run_bounded_delivery
     publisher: Callable[["ContinuousBoundedOptions", ContractEntry, dict[str, Any]], dict[str, Any]] | None = None
     sleeper: Callable[[float], None] = time.sleep
@@ -126,11 +138,79 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 options.sleeper(options.interval_minutes * 60)
                 continue
 
-            remaining_backoff = _provider_backoff_remaining(
-                prior,
-                selected,
-                options.wall_clock(),
-            )
+            now = options.wall_clock()
+            cloud_recovery: CloudRecoveryState | None = None
+            selected_route: CloudModelRoute | None = None
+            if options.cloud_routes:
+                recovery_stage = _recovery_stage(prior, selected)
+                cloud_recovery = CloudRecoveryState(
+                    task_sha=selected.task_sha,
+                    stage=recovery_stage,
+                    routes=options.cloud_routes,
+                    settings=options.cloud_retry,
+                    payload=prior.get("cloudResilience"),
+                )
+                cloud_remaining = _cloud_recovery_remaining(prior, cloud_recovery, now)
+                action, selected_route, next_time = cloud_recovery.next_action(now)
+                if cloud_remaining > 0 or action == "cloud_waiting":
+                    wait_until = next_time if action == "cloud_waiting" else _cloud_retry_time(cloud_recovery)
+                    continuity = _continuity_for_waiting(
+                        options, selected, cloud_recovery, prior, wait_until, task_state=None
+                    ) if action == "cloud_waiting" else None
+                    state = _supervisor_state(
+                        prior,
+                        cycles,
+                        "cloud_waiting" if action == "cloud_waiting" else str(prior.get("status") or "retry_backoff"),
+                        completed,
+                        queue_size=_pending_count(entries, completed),
+                        current=selected,
+                        stop_reason="all-cloud-models-temporarily-unavailable" if action == "cloud_waiting" else "transient-provider-backoff",
+                        next_action="provider-probe" if action == "cloud_waiting" else "retry-selected-cloud-model",
+                        cloud_resilience=cloud_recovery.as_dict(),
+                        continuity=continuity,
+                    )
+                    _write_json(options.state_path, state)
+                    if _must_stop(options, started):
+                        return state
+                    options.sleeper(max(1, cloud_remaining if cloud_remaining > 0 else _seconds_until(wait_until, now)))
+                    continue
+                if action == "probe" and selected_route is not None:
+                    # This is a cheap readiness probe only.  It does not create
+                    # a worktree, run an agent, or consume task output.
+                    if not cloud_recovery.probe_allowed(now):
+                        next_probe = cloud_recovery.next_probe_budget_at(now)
+                        state = _supervisor_state(
+                            prior, cycles, "cloud_waiting", completed,
+                            queue_size=_pending_count(entries, completed), current=selected,
+                            stop_reason="provider-probe-budget-exhausted", next_action="provider-probe",
+                            cloud_resilience=cloud_recovery.as_dict(),
+                        )
+                        _write_json(options.state_path, state)
+                        if _must_stop(options, started):
+                            return state
+                        options.sleeper(max(1, _seconds_until(next_probe, now)))
+                        continue
+                    probe_provider = SelectedCloudRouteProvider(options.provider_for_role("engineer"), selected_route)
+                    try:
+                        probe_success = probe_provider.ready()
+                    except Exception:
+                        probe_success = False
+                    cloud_recovery.record_probe(selected_route, success=probe_success, now=now)
+                    if not probe_success:
+                        _continuity_for_waiting(options, selected, cloud_recovery, prior, None, task_state=None)
+                        state = _supervisor_state(
+                            prior, cycles, "cloud_waiting", completed,
+                            queue_size=_pending_count(entries, completed), current=selected,
+                            stop_reason="all-cloud-models-temporarily-unavailable", next_action="provider-probe",
+                            cloud_resilience=cloud_recovery.as_dict(),
+                        )
+                        _write_json(options.state_path, state)
+                        if _must_stop(options, started):
+                            return state
+                        options.sleeper(max(1, _seconds_until(cloud_recovery.next_action(now)[2], now)))
+                        continue
+
+            remaining_backoff = _provider_backoff_remaining(prior, selected, now)
             if remaining_backoff > 0:
                 state = _supervisor_state(
                     prior,
@@ -159,6 +239,7 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 queue_size=_pending_count(entries, completed),
                 current=selected,
                 next_action="bounded-delivery",
+                cloud_resilience=cloud_recovery.as_dict() if cloud_recovery else None,
             )
             _write_json(options.state_path, running)
             try:
@@ -166,7 +247,11 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                     BoundedDeliveryOptions(
                         project_path=options.project_path,
                         task_contract_path=selected.path,
-                        provider_for_role=options.provider_for_role,
+                        provider_for_role=(
+                            (lambda role: SelectedCloudRouteProvider(options.provider_for_role(role), selected_route)
+                             if role == "engineer" and selected_route is not None else options.provider_for_role(role))
+                            if cloud_recovery is not None else options.provider_for_role
+                        ),
                         workspace_allowlist=options.workspace_allowlist,
                         report_dir=task_dir / "receipts",
                         state_path=task_state,
@@ -209,6 +294,49 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 return state
             if status not in {"completed", "already-completed"}:
                 reason = str(effective_result.get("stopReason") or "bounded-delivery-failed")
+                if cloud_recovery is not None and selected_route is not None:
+                    classification = classify_failure(reason)
+                    if classification == "transient_provider_error":
+                        transition = cloud_recovery.record_failure(
+                            selected_route,
+                            reason=reason,
+                            now=options.wall_clock(),
+                            summary=str(effective_result.get("diagnostic") or ""),
+                        )
+                        task_checkpoint = _read_json(task_state)
+                        waiting_state = str(transition["status"])
+                        continuity = (
+                            _continuity_for_waiting(
+                                options, selected, cloud_recovery, prior,
+                                _time_or_none(transition.get("nextRetryAt")), task_state=task_checkpoint,
+                            )
+                            if waiting_state == "cloud_waiting" else None
+                        )
+                        state = _supervisor_state(
+                            running,
+                            cycles,
+                            waiting_state,
+                            completed,
+                            queue_size=_pending_count(entries, completed),
+                            current=selected,
+                            stop_reason=(
+                                "all-cloud-models-temporarily-unavailable"
+                                if waiting_state == "cloud_waiting" else reason
+                            ),
+                            next_action=(
+                                "provider-probe" if waiting_state == "cloud_waiting"
+                                else "retry-selected-cloud-model"
+                            ),
+                            delivery_result=effective_result,
+                            cloud_resilience=cloud_recovery.as_dict(),
+                            continuity=continuity,
+                        )
+                        _write_json(options.state_path, state)
+                        if _must_stop(options, started):
+                            return state
+                        retry_at = _time_or_none(transition.get("nextRetryAt"))
+                        options.sleeper(max(1, _seconds_until(retry_at, options.wall_clock())))
+                        continue
                 waiting = reason in RECOVERABLE_STOP_REASONS
                 provider_backoff = (
                     _next_provider_quota_backoff(
@@ -479,9 +607,13 @@ def _supervisor_state(
     publication: dict[str, Any] | None = None,
     diagnostic: str | None = None,
     provider_backoff: dict[str, Any] | None = None,
+    cloud_resilience: dict[str, Any] | None = None,
+    continuity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
-        "schemaVersion": 1,
+        # Version 2 adds cloudResilience and continuity while readers continue
+        # to accept version-1 state that has only providerBackoff.
+        "schemaVersion": 2,
         "revision": int(prior.get("revision") or 0) + 1,
         "updatedAt": datetime.now(UTC).isoformat(),
         "status": status,
@@ -503,7 +635,116 @@ def _supervisor_state(
         "publication": publication,
         "diagnostic": diagnostic,
         "providerBackoff": provider_backoff,
+        "cloudResilience": cloud_resilience,
+        "continuity": continuity,
     }
+
+
+def _recovery_stage(prior: dict[str, Any], current: ContractEntry) -> str:
+    recovery = prior.get("cloudResilience")
+    if isinstance(recovery, dict) and recovery.get("taskSha") == current.task_sha:
+        stage = recovery.get("stage")
+        if isinstance(stage, str) and stage:
+            return stage
+    delivery = prior.get("delivery")
+    if isinstance(delivery, dict) and isinstance(delivery.get("stage"), str):
+        return str(delivery["stage"])
+    return "engineer"
+
+
+def _cloud_recovery_remaining(prior: dict[str, Any], recovery: CloudRecoveryState, now: datetime) -> int:
+    if prior.get("status") not in {"retry_backoff", "provider_fallback", "cloud_waiting"}:
+        return 0
+    retry_at = _cloud_retry_time(recovery)
+    return _seconds_until(retry_at, now)
+
+
+def _cloud_retry_time(recovery: CloudRecoveryState) -> datetime | None:
+    circuit = recovery.circuits.get(recovery.current_route().key)
+    if isinstance(circuit, dict):
+        return _time_or_none(circuit.get("nextRetryAt")) or _time_or_none(circuit.get("nextProbeAt"))
+    return None
+
+
+def _seconds_until(value: datetime | None, now: datetime) -> int:
+    if value is None:
+        return 1
+    return max(0, int((_as_utc(value) - _as_utc(now)).total_seconds() + 0.999999))
+
+
+def _time_or_none(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _continuity_for_waiting(
+    options: ContinuousBoundedOptions,
+    entry: ContractEntry,
+    recovery: CloudRecoveryState,
+    prior: dict[str, Any],
+    _next_retry_at: datetime | None,
+    *,
+    task_state: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Create a recorder-only packet; a packet failure never kills supervision."""
+
+    if not options.local_continuity.enabled:
+        return {"status": "disabled", "repositoryModifications": "none"}
+    try:
+        checkpoint = task_state
+        if checkpoint is None:
+            task_dir = options.report_dir / "tasks" / f"{_slug(entry.contract.id)}-{entry.task_sha[:12]}"
+            checkpoint = _read_json(task_dir / "state.json")
+        snapshot_path = options.project_path.resolve()
+        worktree_value = checkpoint.get("worktreePath") if isinstance(checkpoint, dict) else None
+        if isinstance(worktree_value, str):
+            candidate = Path(worktree_value).resolve()
+            allowed_parent = options.project_path.resolve().parent
+            if candidate.is_dir() and allowed_parent in candidate.parents and _same_git_repository(
+                candidate, options.project_path.resolve()
+            ):
+                snapshot_path = candidate
+        delivery = prior.get("delivery") if isinstance(prior.get("delivery"), dict) else {}
+        recovered_receipts = checkpoint.get("receipts") if isinstance(checkpoint, dict) else []
+        receipts = [str(value) for value in recovered_receipts if isinstance(value, str)] if isinstance(recovered_receipts, list) else []
+        receipts.extend(
+            str(value)
+            for value in (delivery or {}).values()
+            if isinstance(value, str) and ("receipt" in value.lower() or value.endswith(".json"))
+        )
+        packet = create_resume_packet(
+            state_root=options.state_path.parent,
+            project_path=snapshot_path,
+            project_id=options.project_path.name,
+            task_id=entry.contract.id,
+            task_sha=entry.task_sha,
+            task_title=entry.contract.title,
+            task_state=checkpoint or {},
+            supervisor_state=recovery,
+            receipt_paths=receipts,
+            continuity=options.local_continuity,
+            now=options.wall_clock(),
+        )
+        return {"status": "completed", "repositoryModifications": "none", "resumePacket": packet}
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {"status": "deterministic-fallback-failed", "repositoryModifications": "none", "diagnostic": str(redact_secrets(str(exc)))}
+
+
+def _same_git_repository(left: Path, right: Path) -> bool:
+    def common(path: Path) -> Path | None:
+        result = _run(["git", "rev-parse", "--git-common-dir"], path, 15)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        value = Path(result.stdout.strip())
+        return (path / value).resolve() if not value.is_absolute() else value.resolve()
+
+    left_common = common(left)
+    right_common = common(right)
+    return left_common is not None and left_common == right_common
 
 
 def _next_provider_quota_backoff(
@@ -689,7 +930,26 @@ def _read_supervisor_state(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("continuous bounded delivery state must be a JSON object")
     _validate_provider_backoff(value.get("providerBackoff"))
+    _validate_cloud_resilience(value.get("cloudResilience"))
     return value
+
+
+def _validate_cloud_resilience(value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("continuous bounded delivery cloud resilience must be an object")
+    required = {"schemaVersion", "taskSha", "stage", "currentRoute", "routes", "circuits", "retryHistory", "probes", "automaticRecovery", "preferredRoute"}
+    if set(value) != required:
+        raise ValueError("continuous bounded delivery cloud resilience has invalid fields")
+    if value.get("schemaVersion") != 1 or value.get("automaticRecovery") is not True:
+        raise ValueError("continuous bounded delivery cloud resilience schema is invalid")
+    if not isinstance(value.get("taskSha"), str) or len(value["taskSha"]) != 64:
+        raise ValueError("continuous bounded delivery cloud resilience task SHA is invalid")
+    if not isinstance(value.get("stage"), str) or not isinstance(value.get("currentRoute"), str):
+        raise ValueError("continuous bounded delivery cloud resilience route is invalid")
+    if not isinstance(value.get("routes"), list) or not isinstance(value.get("circuits"), dict):
+        raise ValueError("continuous bounded delivery cloud resilience routes are invalid")
 
 
 def _validate_provider_backoff(value: Any) -> None:

@@ -136,7 +136,7 @@ The current profiles are:
 | --- | --- | --- |
 | Product Manager | Antigravity Gemini 3.5 Flash (High) | Codex gpt-5.6-terra, medium |
 | Architect | Antigravity Gemini 3.1 Pro (High) | Codex gpt-5.6-sol, high fallback and second opinion |
-| Engineer | Codex gpt-5.6-terra, high | none for write workflows |
+| Engineer | Codex gpt-5.6-terra, medium | Persistent Terra → Sol → Luna fallback, same Codex provider only |
 | Reviewer | Codex gpt-5.6-sol, xhigh | Antigravity Gemini 3.1 Pro (High) mandatory second opinion |
 | QA Engineer | HandsFreeCode / qwen2.5-coder:7b, provider default | none in read-only-agent mode |
 | Delivery QA | Antigravity Gemini 3.1 Pro (High) | Codex gpt-5.6-sol, xhigh mandatory second QA |
@@ -147,6 +147,80 @@ model output fails closed. Write workflows never cross-provider fallback, and
 second opinions are always forced to read-only metadata. Receipts record the
 role, selected model, reasoning effort, fallback chain, and redacted secondary
 review without changing the existing schema version.
+
+## Continuous bounded-delivery cloud recovery
+
+The non-`--once` bounded supervisor persists Engineer recovery state in its
+state file. It treats temporary rate limits, capacity errors, timeouts,
+connection resets, and HTTP 429/502/503/504-style failures differently from
+authentication, billing, code-validation, and infrastructure failures.
+
+- Engineer cloud route order is Codex `gpt-5.6-terra` → `gpt-5.6-sol` →
+  `gpt-5.6-luna`, all with `medium` reasoning.
+- Each model has an independent retry count, exponential backoff with jitter,
+  circuit state, cooldown, and probe timestamp. A write worktree never changes
+  provider; the fallback models are all the same audited Codex CLI provider.
+- A temporary error first retries the same model within its configured budget;
+  only then does the supervisor open that model circuit and select the next
+  model. A successful low-cost readiness probe closes a circuit. At a safe
+  stage boundary, Terra is preferred again.
+- When all model circuits are open, the task becomes `cloud_waiting`, not
+  permanently blocked. The supervisor stays active and waits for the next
+  single-flight probe. Account/authentication failures, unsafe state, and
+  unreconcilable Git state remain fail-closed human gates.
+
+`providers.codex_engineer` in `config/settings.yaml` controls the model order,
+retry budget, circuit breaker, and probe budget. The state output includes
+`cloudResilience`, `nextAction`, and `continuity` so a status report can say
+whether automatic recovery is still enabled.
+
+### Continuity recorder and resume packets
+
+`local_continuity` is deliberately **recorder-only**. It cannot write a product
+repository, perform Git writes, run tests, generate code, create commits, push,
+open PRs, merge, migrate, seed, deploy, or mark an Engineer stage complete.
+If no explicitly configured local recorder is available, the supervisor uses a
+deterministic Python fallback and atomically writes redacted JSON and Markdown
+resume packets below the configured state directory:
+
+```text
+~/.local/state/ai-team/<project>/continuity/<task-id>/
+```
+
+Packets contain the task/stage, per-model circuit state, retry history, Git
+summary, receipts, pending QA/review/PR/CI/merge stages, and a precise resume
+action. They never contain secret values. Before a resumed cloud Engineer acts,
+the existing bounded-delivery worktree validation reconciles the recorded
+worktree, branch, HEAD, receipts, and changed files; it never resets or cleans
+human changes.
+
+An optional local recorder is configured explicitly; it is run only inside a
+network-isolated `bwrap` sandbox where the product repository and home directory
+are not mounted. Its
+stdout is an informational summary only, never code or a completion signal:
+
+```yaml
+local_continuity:
+  enabled: true
+  provider: ollama            # label for observability; not a cloud fallback
+  model: small-local-model
+  command: ["local-recorder-adapter", "--stdin-json"]
+  timeout_seconds: 180
+  max_output_tokens: 2000
+  allow_repository_writes: false
+  allow_git_writes: false
+  allow_test_execution: false
+  allow_code_generation: false
+  deterministic_fallback: true
+```
+
+If the sandbox or command is unavailable, the deterministic packet remains the
+source of truth and the supervisor continues waiting for cloud recovery.
+
+To pause automatic recovery, stop the supervisor service. To manually clear a
+circuit, stop the supervisor first, inspect its redacted state and resume
+packet, then restart it only after deciding that the persisted task/worktree is
+safe to resume. Do not edit a state file while the supervisor lock is held.
 
 ## OpenHands Provider
 

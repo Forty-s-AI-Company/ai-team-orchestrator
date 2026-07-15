@@ -14,6 +14,7 @@ from ai_team.core.ci_monitor import monitor_pull_request, write_repair_completio
 from ai_team.core.delivery import DeliveryOptions, run_delivery_supervisor
 from ai_team.core.bounded_delivery import BoundedDeliveryError, BoundedDeliveryOptions, DeliveryLimits, run_bounded_delivery
 from ai_team.core.bounded_supervisor import ContinuousBoundedOptions, run_continuous_bounded_delivery
+from ai_team.core.cloud_resilience import load_resilience_settings
 from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
@@ -605,6 +606,7 @@ def supervise(
                 else selected_report_dir / "continuous-bounded-delivery-state.json"
             )
             try:
+                cloud_routes, cloud_retry, local_continuity = load_resilience_settings(settings)
                 result = run_continuous_bounded_delivery(
                     ContinuousBoundedOptions(
                         project_path=Path(project_path).resolve(),
@@ -622,6 +624,9 @@ def supervise(
                         allow_unreviewed_development_merge=allow_unreviewed_development_merge,
                         ci_wait_seconds=ci_wait_seconds,
                         ci_poll_seconds=ci_poll_seconds,
+                        cloud_routes=cloud_routes,
+                        cloud_retry=cloud_retry,
+                        local_continuity=local_continuity,
                     )
                 )
             except (OSError, RuntimeError, ValueError) as exc:
