@@ -93,16 +93,7 @@ def run_in_disposable_worktree(
                 run_mode=run_mode,
                 task_instruction=task_instruction,
             )
-            changed_files = list_changed_files(loaded.root)
-            file_check = inspect_candidate_files(loaded.root, changed_files)
-            scope_check = inspect_write_scope(changed_files, allowed_write_paths)
-            git_policy = evaluate_git_action(loaded, "commit", candidate_files=changed_files).as_dict()
-            git_policy["changedFiles"] = changed_files
-            git_policy["fileCheck"] = file_check
-            git_policy["scopeCheck"] = scope_check
-            if not scope_check["allowed"]:
-                git_policy["allowed"] = False
-                git_policy.setdefault("reasons", []).extend(scope_check["reasons"])
+            candidate_before_validation = capture_candidate_snapshot(loaded.root)
             validation_result = run_validation_commands(
                 loaded.root,
                 validation_commands or [],
@@ -113,6 +104,15 @@ def run_in_disposable_worktree(
                     else source.root
                 ),
             )
+            candidate_after_validation = capture_candidate_snapshot(loaded.root)
+            changed_files = candidate_after_validation["files"]
+            git_policy = inspect_candidate_policy(loaded, changed_files, allowed_write_paths)
+            if candidate_before_validation["hash"] != candidate_after_validation["hash"]:
+                validation_result = validation_mutation_result(
+                    validation_result,
+                    before=candidate_before_validation,
+                    after=candidate_after_validation,
+                )
         finally:
             remove_dependency_link(dependency_link)
         effective_validation_hash = validation_log_hash or validation_result["hash"]
@@ -149,6 +149,11 @@ def run_in_disposable_worktree(
                 "committed": False,
                 "reason": "provider validation failed, produced no diff, or validation command failed; commit denied",
                 "validation": validation_result,
+                "validationResult": {
+                    "success": False,
+                    "kind": validation_result.get("kind", "deterministic-validation"),
+                    "stopReason": validation_result.get("stopReason", "deterministic-validation-failed"),
+                },
             }
         run_receipt = write_run_receipt(
             loaded,
@@ -222,6 +227,86 @@ def list_changed_files(project_root: Path) -> list[str]:
         if path:
             files.append(path)
     return files
+
+
+def capture_candidate_snapshot(project_root: Path) -> dict[str, Any]:
+    """Fingerprint the exact Git candidate without following symlinks.
+
+    Validation commands are expected to inspect, not rewrite, the provider's
+    candidate. Recording file modes, symlink targets, and file bytes closes the
+    gap where a validation process changes the worktree after the first policy
+    inspection but before staging.
+    """
+    status = _run_git(project_root, ["status", "--porcelain", "--untracked-files=all"]).stdout
+    files = list_changed_files(project_root)
+    entries: list[dict[str, Any]] = []
+    for relative in files:
+        path = project_root / relative
+        try:
+            stat = path.lstat()
+        except FileNotFoundError:
+            entries.append({"path": relative, "kind": "missing"})
+            continue
+        entry: dict[str, Any] = {
+            "path": relative,
+            "mode": stat.st_mode,
+        }
+        if path.is_symlink():
+            entry.update({"kind": "symlink", "target": os.readlink(path)})
+        elif path.is_file():
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            entry.update({"kind": "file", "size": stat.st_size, "sha256": digest.hexdigest()})
+        else:
+            entry["kind"] = "other"
+        entries.append(entry)
+    payload = {"status": status, "files": files, "entries": entries}
+    return {
+        "hash": hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest(),
+        "files": files,
+    }
+
+
+def inspect_candidate_policy(
+    loaded: LoadedProject,
+    changed_files: list[str],
+    allowed_write_paths: list[str] | None,
+) -> dict[str, Any]:
+    file_check = inspect_candidate_files(loaded.root, changed_files)
+    scope_check = inspect_write_scope(changed_files, allowed_write_paths)
+    git_policy = evaluate_git_action(loaded, "commit", candidate_files=changed_files).as_dict()
+    git_policy["changedFiles"] = changed_files
+    git_policy["fileCheck"] = file_check
+    git_policy["scopeCheck"] = scope_check
+    if not scope_check["allowed"]:
+        git_policy["allowed"] = False
+        git_policy.setdefault("reasons", []).extend(scope_check["reasons"])
+    return git_policy
+
+
+def validation_mutation_result(
+    validation_result: dict[str, Any],
+    *,
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        **validation_result,
+        "success": False,
+        "kind": "candidate-integrity",
+        "stopReason": "validation-mutated-candidate",
+        "reason": "validation commands changed the Git candidate; commit denied",
+        "candidateBefore": before,
+        "candidateAfter": after,
+    }
+    payload.pop("hash", None)
+    redacted = redact_secrets(payload)
+    redacted["hash"] = hashlib.sha256(
+        json.dumps(redacted, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return redacted
 
 
 def inspect_write_scope(changed_files: list[str], allowed_write_paths: list[str] | None) -> dict[str, Any]:
@@ -391,7 +476,6 @@ def _validation_env(dependency_root: Path | None) -> dict[str, str]:
         dependency_bin = dependency_root / "node_modules" / ".bin"
         env["PATH"] = f"{dependency_bin}{os.pathsep}{env.get('PATH', '')}"
     env["CI"] = "1"
-    env["NODE_ENV"] = "test"
     return env
 
 
@@ -649,8 +733,8 @@ def _executor_validation_result(
     if not command_validation.get("success"):
         return {
             "success": False,
-            "kind": "deterministic-validation",
-            "stopReason": "deterministic-validation-failed",
+            "kind": command_validation.get("kind", "deterministic-validation"),
+            "stopReason": command_validation.get("stopReason", "deterministic-validation-failed"),
         }
     commit_validation = commit_result.get("validationResult")
     if isinstance(commit_validation, dict):

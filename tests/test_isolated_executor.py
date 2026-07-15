@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import patch
 from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action, sanitize_branch_name
 from ai_team.core.github_gate import evaluate_github_action
 from ai_team.core.isolated_executor import (
+    _validation_env,
     prepare_dependency_link,
     remove_dependency_link,
     run_validation_commands,
@@ -186,6 +188,108 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertEqual(result["kind"], "execution-environment")
             self.assertEqual(result["stopReason"], "validation-command-unavailable")
             self.assertEqual(result["commands"][0]["returnCode"], 127)
+
+    def test_validation_environment_does_not_force_node_mode(self) -> None:
+        with patch.dict(os.environ, {"NODE_ENV": "production"}, clear=False):
+            env = _validation_env(None)
+
+        self.assertEqual(env["CI"], "1")
+        self.assertNotIn("NODE_ENV", env)
+
+    def test_validation_out_of_scope_mutation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+            mutator = Path(tmp) / "mutate.py"
+            mutator.write_text(
+                "from pathlib import Path\n"
+                "path = Path('.ai-team/project.yaml')\n"
+                "path.write_text(path.read_text(encoding='utf-8') + '# mutated\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            result = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=_WritingProvider("notes/change.md", "safe change\n"),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                auto_commit=True,
+                allowed_write_paths=["notes/change.md"],
+                validation_commands=[f"{sys.executable} {mutator}"],
+                require_validation=True,
+            )
+
+            self.assertFalse(result.commit_result["committed"])
+            self.assertEqual(result.commit_result["validationResult"]["kind"], "candidate-integrity")
+            self.assertEqual(
+                result.commit_result["validationResult"]["stopReason"],
+                "validation-mutated-candidate",
+            )
+            self.assertIn(".ai-team/project.yaml", result.git_policy["changedFiles"])
+            self.assertFalse(result.git_policy["scopeCheck"]["allowed"])
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=result.worktree_path,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                base_sha,
+            )
+            receipt = json.loads(result.executor_receipt.read_text(encoding="utf-8"))
+            self.assertTrue(receipt["providerSuccess"])
+            self.assertFalse(receipt["validationResult"]["success"])
+            self.assertEqual(receipt["validationResult"]["kind"], "candidate-integrity")
+
+    def test_validation_in_scope_mutation_still_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+            mutator = Path(tmp) / "mutate.py"
+            mutator.write_text(
+                "from pathlib import Path\n"
+                "path = Path('notes/change.md')\n"
+                "path.write_text(path.read_text(encoding='utf-8') + 'validation rewrite\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+
+            result = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=_WritingProvider("notes/change.md", "safe change\n"),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                auto_commit=True,
+                allowed_write_paths=["notes/change.md"],
+                validation_commands=[f"{sys.executable} {mutator}"],
+                require_validation=True,
+            )
+
+            self.assertFalse(result.commit_result["committed"])
+            self.assertTrue(result.git_policy["scopeCheck"]["allowed"])
+            self.assertEqual(
+                result.commit_result["validationResult"],
+                {
+                    "success": False,
+                    "kind": "candidate-integrity",
+                    "stopReason": "validation-mutated-candidate",
+                },
+            )
 
     def test_non_next_dependencies_keep_lightweight_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
