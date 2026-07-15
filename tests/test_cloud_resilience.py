@@ -17,7 +17,9 @@ from ai_team.core.cloud_resilience import (
     classify_failure,
     create_resume_packet,
     default_engineer_routes,
+    load_resilience_settings,
 )
+from ai_team.cli import load_settings
 
 
 class CloudResilienceTests(unittest.TestCase):
@@ -67,6 +69,26 @@ class CloudResilienceTests(unittest.TestCase):
         self.assertEqual(recovery.as_dict()["circuits"][terra.key]["circuitState"], "open")
         self.assertEqual(recovery.as_dict()["circuits"][sol.key]["circuitState"], "open")
         self.assertEqual(recovery.as_dict()["circuits"][luna.key]["circuitState"], "open")
+
+    def test_default_engineer_route_keeps_terra_high_reasoning(self) -> None:
+        terra, sol, luna = default_engineer_routes()
+
+        self.assertEqual(
+            (terra.provider, terra.model, terra.reasoning_effort, terra.priority),
+            ("codex", "gpt-5.6-terra", "high", 100),
+        )
+        self.assertEqual(
+            (sol.reasoning_effort, luna.reasoning_effort),
+            ("medium", "medium"),
+        )
+
+    def test_configured_engineer_route_keeps_terra_high_reasoning(self) -> None:
+        routes, _retry, _continuity = load_resilience_settings(load_settings())
+
+        self.assertEqual(
+            (routes[0].provider, routes[0].model, routes[0].reasoning_effort, routes[0].priority),
+            ("codex", "gpt-5.6-terra", "high", 100),
+        )
 
     def test_preferred_terra_is_probed_and_resumed_after_cooldown(self) -> None:
         recovery = CloudRecoveryState(

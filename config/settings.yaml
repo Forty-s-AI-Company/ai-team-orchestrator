@@ -59,7 +59,7 @@ providers:
   codex_engineer:
     models:
       - name: "gpt-5.6-terra"
-        reasoning: medium
+        reasoning: high
         priority: 100
       - name: "gpt-5.6-sol"
         reasoning: medium
@@ -156,7 +156,7 @@ routing:
       primary:
         provider: codex
         model: "gpt-5.6-terra"
-        reasoning_effort: medium
+        reasoning_effort: high
       # These are only selected by the persistent bounded delivery circuit
       # breaker; RoleRouter never auto-switches a write workflow itself.
       fallbacks:
