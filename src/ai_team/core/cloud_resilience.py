@@ -458,9 +458,12 @@ def _git_summary(project: Path) -> dict[str, Any]:
             result = subprocess.run(["git", *args], cwd=project, text=True, capture_output=True, timeout=15, check=False)
         except (OSError, subprocess.SubprocessError):
             return ""
-        return redact_secrets(result.stdout.strip()) if result.returncode == 0 else ""
+        # Porcelain status uses the first two columns for index/worktree state.
+        # Removing leading whitespace corrupts paths whose first status column
+        # is blank (for example, `` M tests/example.ts``).
+        return redact_secrets(result.stdout.rstrip("\r\n")) if result.returncode == 0 else ""
 
-    porcelain = run("status", "--porcelain")
+    porcelain = run("status", "--porcelain", "--untracked-files=all")
     lines = porcelain.splitlines()
     return {
         "path": str(project.resolve()), "branch": run("branch", "--show-current"), "head": run("rev-parse", "HEAD"),
@@ -474,8 +477,29 @@ def _git_summary(project: Path) -> dict[str, Any]:
 
 def _last_completed_stage(receipts: list[str]) -> str | None:
     stages = ("review", "qa", "engineer", "architect", "pm")
-    values = " ".join(receipts)
-    return next((stage for stage in stages if f"-{stage}.json" in values), None)
+    completed: set[str] = set()
+    for receipt in receipts:
+        path = Path(receipt)
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+
+        stage = payload.get("stage")
+        validation = payload.get("validationResult")
+        if (
+            stage in stages
+            and payload.get("providerSuccess") is True
+            and isinstance(validation, dict)
+            and validation.get("success") is True
+            and payload.get("stopReason") in (None, "")
+            and (stage != "engineer" or bool(payload.get("commitSha")))
+        ):
+            completed.add(stage)
+
+    return next((stage for stage in stages if stage in completed), None)
 
 
 def _cooldown_summary(state: CloudRecoveryState) -> dict[str, Any]:

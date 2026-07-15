@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -161,6 +162,69 @@ class CloudResilienceTests(unittest.TestCase):
             payload = json.loads(Path(packet["json"]).read_text(encoding="utf-8"))
             self.assertEqual(payload["localContinuity"]["repositoryModifications"], "none")
             self.assertTrue(Path(packet["markdown"]).is_file())
+
+    def test_resume_packet_preserves_paths_and_only_marks_successful_stages_completed(self) -> None:
+        recovery = CloudRecoveryState(
+            task_sha="e" * 64,
+            stage="engineer",
+            routes=default_engineer_routes(),
+            settings=self.settings,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            tracked = project / "tests/e2e/smoke.spec.ts"
+            tracked.parent.mkdir(parents=True)
+            tracked.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+            subprocess.run(["git", "config", "user.name", "AI Team Test"], cwd=project, check=True)
+            subprocess.run(["git", "config", "user.email", "ai-team@example.invalid"], cwd=project, check=True)
+            subprocess.run(["git", "add", "tests/e2e/smoke.spec.ts"], cwd=project, check=True)
+            subprocess.run(["git", "commit", "-qm", "test fixture"], cwd=project, check=True)
+            tracked.write_text("after\n", encoding="utf-8")
+            untracked = project / "src/app/api/security/csp-report/route.test.ts"
+            untracked.parent.mkdir(parents=True)
+            untracked.write_text("test\n", encoding="utf-8")
+
+            receipts = root / "receipts"
+            receipts.mkdir()
+            pm = receipts / "01-pm.json"
+            architect = receipts / "02-architect.json"
+            engineer = receipts / "03-engineer.json"
+            pm.write_text(json.dumps({
+                "stage": "pm", "providerSuccess": True, "validationResult": {"success": True}, "stopReason": None,
+            }), encoding="utf-8")
+            architect.write_text(json.dumps({
+                "stage": "architect", "providerSuccess": True, "validationResult": {"success": True}, "stopReason": None,
+            }), encoding="utf-8")
+            engineer.write_text(json.dumps({
+                "stage": "engineer", "providerSuccess": False,
+                "validationResult": {"success": False, "kind": "provider-execution"},
+                "stopReason": "provider-quota-exhausted", "commitSha": None,
+            }), encoding="utf-8")
+
+            packet = create_resume_packet(
+                state_root=root / "state",
+                project_path=project,
+                task_id="resume-integrity",
+                task_sha="e" * 64,
+                task_title="resume integrity",
+                task_state={"stage": "engineer", "worktreePath": str(project)},
+                supervisor_state=recovery,
+                receipt_paths=[str(pm), str(architect), str(engineer)],
+                continuity=LocalContinuitySettings(),
+                now=self.now,
+            )
+
+            payload = json.loads(Path(packet["json"]).read_text(encoding="utf-8"))
+            self.assertEqual(payload["lastCompletedStage"], "architect")
+            self.assertEqual(payload["nextPendingStage"], "engineer")
+            self.assertEqual(payload["changedFiles"], [
+                "tests/e2e/smoke.spec.ts",
+                "src/app/api/security/csp-report/route.test.ts",
+            ])
+            self.assertEqual(payload["filesForNextEngineer"], payload["changedFiles"])
 
     def test_resume_packet_redacts_secret_like_values(self) -> None:
         recovery = CloudRecoveryState(
