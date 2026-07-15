@@ -19,7 +19,7 @@ from ai_team.providers import (
     WriteSmokeProvider,
 )
 from ai_team.providers.cli_common import CliProviderSettings, run_cli_command
-from ai_team.providers.antigravity import _compact_prompt, _read_only_sandbox_settings
+from ai_team.providers.antigravity import _compact_prompt, _read_only_sandbox_settings, _validate_response
 from ai_team.providers.antigravity import _apply_routing_options as apply_antigravity_routing
 from ai_team.providers.codex import _apply_routing_options as apply_codex_routing
 from ai_team.providers.codex import _extract_token_usage
@@ -161,6 +161,8 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("Forbidden: edit, shell", prompt)
         self.assertIn("Challenge=challenge-1", prompt)
         self.assertIn("tests=['evidence citation']", prompt)
+        self.assertIn("exact JSON key 'schema'", prompt)
+        self.assertIn("'$schema' is invalid", prompt)
 
     def test_antigravity_bounded_review_uses_delivery_schema(self) -> None:
         prompt = _compact_prompt(
@@ -174,6 +176,40 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("stage=review", prompt)
         self.assertIn("Verify every AcceptanceCriteria item", prompt)
         self.assertIn("tests=['evidence citation']", prompt)
+        self.assertIn("exact JSON key 'schema'", prompt)
+        self.assertIn("'$schema' is invalid", prompt)
+
+    def test_antigravity_bounded_stage_keeps_dollar_schema_fail_closed(self) -> None:
+        request = ProviderRequest(
+            workflow="bounded-delivery-review",
+            prompt="review only",
+            project_root=Path.cwd(),
+            metadata={"boundedStage": "review", "writeAccess": False},
+        )
+        result = _validate_response(
+            ProviderResult(
+                provider="antigravity",
+                success=True,
+                content=json.dumps(
+                    {
+                        "$schema": "ai-team-bounded-delivery/v1",
+                        "challenge": "challenge-review",
+                        "stage": "review",
+                        "status": "passed",
+                        "findings": [],
+                        "tests": ["evidence citation"],
+                        "blockers": [],
+                    }
+                ),
+            ),
+            request,
+            "challenge-review",
+            None,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
+        self.assertFalse(result.data["responseValidated"])
 
     def test_antigravity_pm_prompt_forbids_restatement_findings(self) -> None:
         prompt = _compact_prompt(
