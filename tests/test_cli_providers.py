@@ -71,6 +71,45 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("native progress", result.data["command"]["stderr"])
         self.assertEqual(result.data["tokenUsage"], 42)
 
+    def test_successful_codex_run_may_inspect_rate_limit_text_without_being_provider_limited(self) -> None:
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=[
+                    "-c",
+                    "import sys; print('{\"schema\":\"example/v1\"}'); "
+                    "sys.stderr.write('inspected application response: HTTP 429 Too Many Requests')",
+                ],
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertTrue(result.success)
+        self.assertIsNone(result.error_type)
+        self.assertFalse(result.data["quotaExhausted"])
+
+    def test_nonzero_codex_run_with_usage_limit_remains_rate_limited(self) -> None:
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=[
+                    "-c",
+                    "import sys; sys.stderr.write(\"You've hit your usage limit.\"); sys.exit(1)",
+                ],
+            )
+        )
+
+        result = provider.run(_request())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.RATE_LIMIT)
+        self.assertTrue(result.data["quotaExhausted"])
+
     def test_codex_structured_content_is_not_limited_by_command_evidence(self) -> None:
         provider = CodexProvider(
             CodexSettings(
