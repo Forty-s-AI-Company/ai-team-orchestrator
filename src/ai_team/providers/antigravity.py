@@ -239,7 +239,8 @@ def _compact_prompt(
             normalized = (
                 f"Bounded read-only stage={bounded_stage}; Challenge={challenge}. "
                 "Return JSON only: schema='ai-team-bounded-delivery/v1', challenge, stage, "
-                "status='passed', findings=[], tests=['evidence citation'], blockers=[]. No Markdown. "
+                "status='passed', findings=[], tests=['evidence citation'], blockers=[]. "
+                "Use the exact JSON key 'schema'; '$schema' is invalid. No Markdown. "
                 "Forbidden: edit, shell, migrate, seed, deploy, payment, secrets, delete, schema/API change. "
                 f"{stage_requirements} Findings may be empty only when all criteria pass. "
                 f"Instruction={instruction[:120]}; AcceptanceCriteria={acceptance_criteria}; "
@@ -251,7 +252,8 @@ def _compact_prompt(
             normalized = (
                 f"Bounded read-only stage={bounded_stage}; Challenge={challenge}. "
                 "Return JSON only: schema='ai-team-bounded-delivery/v1', challenge, stage, "
-                "status='passed', findings=[], tests=[], blockers=[]. No Markdown. "
+                "status='passed', findings=[], tests=[], blockers=[]. "
+                "Use the exact JSON key 'schema'; '$schema' is invalid. No Markdown. "
                 "findings and blockers MUST be exactly []; never restate required work as a finding or blocker. "
                 "Forbidden: edit, shell, migrate, seed, deploy, payment, secrets, data deletion, schema/API changes. "
                 f"{stage_requirements} Task={task}; Instruction={instruction}; "
