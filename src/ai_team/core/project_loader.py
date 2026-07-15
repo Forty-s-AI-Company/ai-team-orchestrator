@@ -42,6 +42,17 @@ class CommandSet(BaseModel):
     typecheck: str | None = None
     test: str | None = None
     build: str | None = None
+    additional_validation: list[str] = Field(default_factory=list)
+
+    @field_validator("additional_validation")
+    @classmethod
+    def non_empty_additional_validation(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("additional validation commands must not be empty")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("additional validation commands must be unique")
+        return normalized
 
 
 class SafetyPolicy(BaseModel):

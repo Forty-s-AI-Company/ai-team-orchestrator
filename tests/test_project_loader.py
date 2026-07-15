@@ -47,6 +47,43 @@ class ProjectLoaderTests(unittest.TestCase):
             self.assertEqual(loaded.profile.project.name, "sample")
             self.assertEqual(loaded.root, root.resolve())
 
+    def test_loads_normalized_additional_validation_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            profile = root / ".ai-team" / "project.yaml"
+            profile.write_text(
+                profile.read_text(encoding="utf-8").replace(
+                    "  lint: npm run lint\n",
+                    "  lint: npm run lint\n  additional_validation:\n    - '  npm run e2e:smoke  '\n",
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_project(root)
+
+            self.assertEqual(loaded.profile.commands.additional_validation, ["npm run e2e:smoke"])
+
+    def test_rejects_duplicate_or_empty_additional_validation_commands(self) -> None:
+        for values in (["npm run e2e:smoke", "npm run e2e:smoke"], [""]):
+            with self.subTest(values=values), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "project"
+                root.mkdir()
+                init_git_project(root)
+                profile = root / ".ai-team" / "project.yaml"
+                rendered = "\n".join(f"    - {value!r}" for value in values)
+                profile.write_text(
+                    profile.read_text(encoding="utf-8").replace(
+                        "  lint: npm run lint\n",
+                        f"  lint: npm run lint\n  additional_validation:\n{rendered}\n",
+                    ),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaises(ProjectConfigError):
+                    load_project(root)
+
     def test_blocks_project_root_path_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

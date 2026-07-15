@@ -979,16 +979,21 @@ def _validate_plan_scope(payload: dict[str, Any], contract: TrustedTaskContract)
 
 
 def _validate_contract_validation_commands(project: Any, contract: TrustedTaskContract) -> None:
-    required = [
+    baseline = [
         project.profile.commands.lint,
         project.profile.commands.typecheck,
         project.profile.commands.test,
         project.profile.commands.build,
     ]
-    if not all(isinstance(command, str) and command.strip() for command in required):
+    if not all(isinstance(command, str) and command.strip() for command in baseline):
         raise BoundedDeliveryError("project contract must define lint, typecheck, test, and build for bounded delivery")
-    if set(contract.validation_commands) != set(required):
-        raise BoundedDeliveryError("trusted task contract must run exactly the project lint, typecheck, test, and build commands")
+    command_set = set(contract.validation_commands)
+    baseline_set = set(baseline)
+    if not baseline_set.issubset(command_set):
+        raise BoundedDeliveryError("trusted task contract must run the project lint, typecheck, test, and build commands")
+    allowed = baseline_set | set(project.profile.commands.additional_validation)
+    if not command_set.issubset(allowed):
+        raise BoundedDeliveryError("trusted task contract contains an undeclared additional validation command")
 
 
 def _validate_allowed_write_paths(paths: tuple[str, ...]) -> None:
