@@ -136,7 +136,7 @@ The current profiles are:
 | --- | --- | --- |
 | Product Manager | Antigravity Gemini 3.5 Flash (High) | Codex gpt-5.6-terra, medium |
 | Architect | Antigravity Gemini 3.1 Pro (High) | Codex gpt-5.6-sol, high fallback and second opinion |
-| Engineer | Codex gpt-5.6-terra, medium | Persistent Terra → Sol → Luna fallback, same Codex provider only |
+| Engineer | Codex gpt-5.6-terra, high | Persistent Terra → Sol → Luna fallback, same Codex provider only |
 | Reviewer | Codex gpt-5.6-sol, xhigh | Antigravity Gemini 3.1 Pro (High) mandatory second opinion |
 | QA Engineer | HandsFreeCode / qwen2.5-coder:7b, provider default | none in read-only-agent mode |
 | Delivery QA | Antigravity Gemini 3.1 Pro (High) | Codex gpt-5.6-sol, xhigh mandatory second QA |
@@ -155,8 +155,8 @@ state file. It treats temporary rate limits, capacity errors, timeouts,
 connection resets, and HTTP 429/502/503/504-style failures differently from
 authentication, billing, code-validation, and infrastructure failures.
 
-- Engineer cloud route order is Codex `gpt-5.6-terra` → `gpt-5.6-sol` →
-  `gpt-5.6-luna`, all with `medium` reasoning.
+- Engineer cloud route order is Codex `gpt-5.6-terra` (`high`) →
+  `gpt-5.6-sol` (`medium`) → `gpt-5.6-luna` (`medium`).
 - Each model has an independent retry count, exponential backoff with jitter,
   circuit state, cooldown, and probe timestamp. A write worktree never changes
   provider; the fallback models are all the same audited Codex CLI provider.

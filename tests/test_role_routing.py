@@ -56,9 +56,18 @@ class RoleRoutingConfigurationTests(unittest.TestCase):
 
     def test_delivery_qa_uses_mandatory_gemini_and_codex_pair(self) -> None:
         settings = load_settings()
+        engineer = load_role_profile(settings, "engineer")
         qa = load_role_profile(settings, "delivery-qa")
         reviewer = load_role_profile(settings, "reviewer")
 
+        self.assertEqual(
+            (
+                engineer.primary.provider,
+                engineer.primary.model,
+                engineer.primary.reasoning_effort,
+            ),
+            ("codex", "gpt-5.6-terra", "high"),
+        )
         self.assertEqual(
             (qa.primary.provider, qa.primary.model, qa.primary.reasoning_effort),
             ("antigravity", "Gemini 3.1 Pro (High)", "high"),

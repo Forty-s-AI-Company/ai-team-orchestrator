@@ -109,7 +109,7 @@ def classify_failure(reason: str, *, error_summary: str = "") -> str:
 
 def default_engineer_routes() -> tuple[CloudModelRoute, ...]:
     return (
-        CloudModelRoute("codex", "gpt-5.6-terra", "medium", 100),
+        CloudModelRoute("codex", "gpt-5.6-terra", "high", 100),
         CloudModelRoute("codex", "gpt-5.6-sol", "medium", 80),
         CloudModelRoute("codex", "gpt-5.6-luna", "medium", 60),
     )
