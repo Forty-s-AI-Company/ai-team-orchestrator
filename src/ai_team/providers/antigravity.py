@@ -28,6 +28,8 @@ _ANTIGRAVITY_EPHEMERAL_DIRECTORY_NAMES = (
     "scratch",
     "updater",
 )
+_REVIEW_EVIDENCE_TARGET = Path("/tmp/ai-team-review-evidence")
+_MAX_REVIEW_PATCH_BYTES = 512_000
 
 
 @dataclass(frozen=True)
@@ -176,9 +178,39 @@ class AntigravityProvider(BaseProvider):
                     "reasoningEffort": request.metadata.get("reasoningEffort"),
                 },
             )
+        review_evidence: tempfile.TemporaryDirectory[str] | None = None
+        review_evidence_source: Path | None = None
+        if bounded_stage in {"qa", "review"}:
+            patch_content = request.metadata.get("reviewPatch")
+            patch_sha = request.metadata.get("reviewPatchSha")
+            if not isinstance(patch_content, str) or not isinstance(patch_sha, str):
+                return _invalid_review_evidence_result(bounded_stage)
+            encoded_patch = patch_content.encode("utf-8")
+            if (
+                not encoded_patch
+                or len(encoded_patch) > _MAX_REVIEW_PATCH_BYTES
+                or hashlib.sha256(encoded_patch).hexdigest() != patch_sha
+            ):
+                return _invalid_review_evidence_result(bounded_stage)
+            try:
+                review_evidence = tempfile.TemporaryDirectory(
+                    prefix="ai-team-antigravity-review-",
+                    dir="/tmp" if os.name != "nt" else None,
+                )
+                review_evidence_source = Path(review_evidence.name)
+                (review_evidence_source / "patch.diff").write_text(patch_content, encoding="utf-8")
+            except OSError:
+                if review_evidence is not None:
+                    review_evidence.cleanup()
+                return _invalid_review_evidence_result(bounded_stage)
         cli_settings = replace(
             cli_settings,
-            run_args=_bounded_run_args(routed_args, workspace_root, remaining),
+            run_args=_bounded_run_args(
+                routed_args,
+                workspace_root,
+                remaining,
+                evidence_workspace=_REVIEW_EVIDENCE_TARGET if review_evidence_source else None,
+            ),
             run_timeout_seconds=min(cli_settings.run_timeout_seconds, remaining),
         )
         if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
@@ -186,8 +218,11 @@ class AntigravityProvider(BaseProvider):
                 cli_settings,
                 self.settings.read_only_sandbox_executable,
                 workspace_root,
+                review_evidence_source,
             )
             if sandboxed is None:
+                if review_evidence is not None:
+                    review_evidence.cleanup()
                 return ProviderResult(
                     provider=self.name,
                     success=False,
@@ -200,13 +235,17 @@ class AntigravityProvider(BaseProvider):
                     },
                 )
             cli_settings = sandboxed
-        command_result = cli_run_result(
-            self.name,
-            cli_settings,
-            compact_request,
-            prompt_arg_mode="append",
-            diagnostics_override=diagnostics,
-        )
+        try:
+            command_result = cli_run_result(
+                self.name,
+                cli_settings,
+                compact_request,
+                prompt_arg_mode="append",
+                diagnostics_override=diagnostics,
+            )
+        finally:
+            if review_evidence is not None:
+                review_evidence.cleanup()
         result = _validate_response(command_result, request, challenge, probe)
         return replace(
             result,
@@ -259,8 +298,14 @@ def _compact_prompt(
                 "Include non-empty plan, allowedWritePaths, validationCommands arrays and "
                 "schemaOrApiChange=false. Do not expand paths or commands beyond the task."
             ),
-            "qa": "Verify every AcceptanceCriteria item against the diff and validation evidence.",
-            "review": "Verify every AcceptanceCriteria item against the reviewed diff and validation evidence.",
+            "qa": (
+                "Read the exact patch at reviewEvidence.path with the read_file tool, never a command tool; "
+                "Verify every AcceptanceCriteria item against that patch and validation evidence."
+            ),
+            "review": (
+                "Read the exact patch at reviewEvidence.path with the read_file tool, never a command tool; "
+                "Verify every AcceptanceCriteria item against that patch and validation evidence."
+            ),
         }[bounded_stage]
         if bounded_stage in {"qa", "review"}:
             normalized = (
@@ -343,12 +388,19 @@ def _compact_implementation_evidence(raw: str) -> str:
     repairs = value.get("repairs")
     validation = value.get("validation")
     commit_sha = value.get("commitSha")
-    summary = {
+    review_evidence = value.get("reviewEvidence")
+    summary: dict[str, Any] = {
         "changedFileCount": len(changed_files) if isinstance(changed_files, list) else 0,
         "commitSha": commit_sha[:12] if isinstance(commit_sha, str) else None,
         "validationSuccess": validation.get("success") is True if isinstance(validation, dict) else False,
         "repairCount": len(repairs) if isinstance(repairs, list) else 0,
     }
+    if isinstance(review_evidence, dict):
+        summary["reviewEvidence"] = {
+            "path": review_evidence.get("path"),
+            "sha256": review_evidence.get("sha256"),
+            "bytes": review_evidence.get("bytes"),
+        }
     return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -378,14 +430,23 @@ def _select_repository_probe(project_root: Path) -> tuple[str, str] | None:
     return None
 
 
-def _bounded_run_args(run_args: list[str], project_root: Path, remaining: float) -> list[str]:
+def _bounded_run_args(
+    run_args: list[str],
+    project_root: Path,
+    remaining: float,
+    *,
+    evidence_workspace: Path | None = None,
+) -> list[str]:
     args = list(run_args)
     if "--print-timeout" in args:
         index = args.index("--print-timeout")
         if index + 1 < len(args):
             args[index + 1] = f"{max(1, int(remaining - 2))}s"
     insert_at = args.index("--print") if "--print" in args else len(args)
-    args[insert_at:insert_at] = ["--add-dir", str(project_root)]
+    workspace_args = ["--add-dir", str(project_root)]
+    if evidence_workspace is not None:
+        workspace_args.extend(["--add-dir", str(evidence_workspace)])
+    args[insert_at:insert_at] = workspace_args
     return args
 
 
@@ -393,6 +454,7 @@ def _read_only_sandbox_settings(
     settings: CliProviderSettings,
     sandbox_executable: str | None,
     project_root: Path,
+    review_evidence_source: Path | None = None,
 ) -> CliProviderSettings | None:
     """Wrap a bounded stage in a read-only sandbox with ephemeral CLI state."""
     if not isinstance(sandbox_executable, str) or not sandbox_executable.strip():
@@ -402,6 +464,15 @@ def _read_only_sandbox_settings(
         return None
     runtime_mounts = _antigravity_ephemeral_runtime_mounts()
     runtime_args = [argument for path in runtime_mounts for argument in ("--tmpfs", str(path))]
+    evidence_args: list[str] = []
+    if review_evidence_source is not None:
+        if (
+            not review_evidence_source.is_absolute()
+            or review_evidence_source.is_symlink()
+            or not review_evidence_source.is_dir()
+        ):
+            return None
+        evidence_args = ["--ro-bind", str(review_evidence_source), str(_REVIEW_EVIDENCE_TARGET)]
     return replace(
         settings,
         executable=str(sandbox),
@@ -418,12 +489,27 @@ def _read_only_sandbox_settings(
             "/proc",
             "--tmpfs",
             "/tmp",
+            *evidence_args,
             *runtime_args,
             "--chdir",
             str(project_root),
             settings.executable,
             *settings.run_args,
         ],
+    )
+
+
+def _invalid_review_evidence_result(bounded_stage: Any) -> ProviderResult:
+    return ProviderResult(
+        provider="antigravity",
+        success=False,
+        error_type=ProviderErrorType.INVALID_RESPONSE,
+        content="bounded Antigravity review requires exact redacted patch evidence",
+        data={
+            "providerNative": True,
+            "boundedStage": bounded_stage,
+            "reviewEvidence": False,
+        },
     )
 
 

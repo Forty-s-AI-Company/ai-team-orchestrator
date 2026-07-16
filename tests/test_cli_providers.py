@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import subprocess
@@ -284,6 +285,7 @@ class CliProviderTests(unittest.TestCase):
         self.assertNotIn("exact requirement", result.content)
 
     def test_antigravity_bounded_stage_requires_read_only_filesystem_sandbox(self) -> None:
+        review_patch = "diff --git a/safe b/safe"
         provider = AntigravityProvider(
             AntigravitySettings(
                 executable=sys.executable,
@@ -300,13 +302,52 @@ class CliProviderTests(unittest.TestCase):
                 prompt="Task: inspect only",
                 project_root=Path.cwd(),
                 run_mode="run-agent",
-                metadata={"boundedStage": "qa", "writeAccess": False},
+                metadata={
+                    "boundedStage": "qa",
+                    "writeAccess": False,
+                    "reviewPatch": review_patch,
+                    "reviewPatchSha": hashlib.sha256(review_patch.encode()).hexdigest(),
+                },
             )
         )
 
         self.assertFalse(result.success)
         self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
         self.assertIn("read-only filesystem sandbox", result.content)
+
+    def test_antigravity_bounded_review_rejects_missing_or_tampered_patch_evidence(self) -> None:
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "raise SystemExit('must not run')"],
+                execution_enabled=True,
+            )
+        )
+        for metadata in (
+            {"boundedStage": "review", "writeAccess": False},
+            {
+                "boundedStage": "review",
+                "writeAccess": False,
+                "reviewPatch": "safe patch",
+                "reviewPatchSha": "0" * 64,
+            },
+        ):
+            with self.subTest(metadata=metadata):
+                result = provider.run(
+                    ProviderRequest(
+                        workflow="bounded-delivery-review",
+                        prompt="Task: inspect only",
+                        project_root=Path.cwd(),
+                        run_mode="run-agent",
+                        metadata=metadata,
+                    )
+                )
+
+                self.assertFalse(result.success)
+                self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
+                self.assertFalse(result.data["reviewEvidence"])
 
     def test_antigravity_read_only_sandbox_mounts_root_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -359,6 +400,30 @@ class CliProviderTests(unittest.TestCase):
         )
         self.assertNotIn(str(runtime / "antigravity-oauth-token"), wrapped.run_args)
 
+    def test_antigravity_read_only_sandbox_mounts_review_evidence_after_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = Path(tmp) / "bwrap"
+            sandbox.write_text("test", encoding="utf-8")
+            sandbox.chmod(0o700)
+            evidence = Path(tmp) / "evidence"
+            evidence.mkdir()
+            wrapped = _read_only_sandbox_settings(
+                CliProviderSettings(executable="/opt/agy"),
+                str(sandbox),
+                Path("/workspace"),
+                evidence,
+            )
+
+        self.assertIsNotNone(wrapped)
+        assert wrapped is not None
+        tmp_index = wrapped.run_args.index("/tmp")
+        evidence_index = wrapped.run_args.index(str(evidence))
+        self.assertGreater(evidence_index, tmp_index)
+        self.assertEqual(
+            wrapped.run_args[evidence_index : evidence_index + 2],
+            [str(evidence), "/tmp/ai-team-review-evidence"],
+        )
+
     def test_antigravity_read_only_sandbox_ignores_symlinked_runtime_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -397,6 +462,11 @@ class CliProviderTests(unittest.TestCase):
                 "commitSha": "a" * 40,
                 "validation": {"success": True, "commands": {"npm run test": {"output": "x" * 2000}}},
                 "repairs": [],
+                "reviewEvidence": {
+                    "path": "/tmp/ai-team-review-evidence/patch.diff",
+                    "sha256": "b" * 64,
+                    "bytes": 120,
+                },
             }
         )
         prompt = _compact_prompt(
@@ -410,7 +480,7 @@ class CliProviderTests(unittest.TestCase):
                     f"Implementation evidence: {evidence}",
                 )
             ),
-            1200,
+            1600,
             challenge="challenge-1",
             bounded_stage="qa",
         )
@@ -433,8 +503,14 @@ class CliProviderTests(unittest.TestCase):
                 "commitSha": "a" * 12,
                 "validationSuccess": True,
                 "repairCount": 0,
+                "reviewEvidence": {
+                    "path": "/tmp/ai-team-review-evidence/patch.diff",
+                    "sha256": "b" * 64,
+                    "bytes": 120,
+                },
             },
         )
+        self.assertIn("read_file tool, never a command tool", prompt)
         self.assertNotIn("[truncated]", prompt)
 
     def test_codex_trusted_write_requires_linked_worktree_marker(self) -> None:

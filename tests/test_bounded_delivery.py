@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -89,7 +90,7 @@ class BoundedDeliveryTests(unittest.TestCase):
             result = run_bounded_delivery(options)
 
             self.assertEqual(result["status"], "completed", result)
-            self.assertEqual(result["commitSha"], "fake-commit")
+            self.assertRegex(result["commitSha"], r"^[0-9a-f]{40}$")
             receipts = [Path(path) for path in result["receipts"]]
             self.assertEqual([path.name for path in receipts], ["01-pm.json", "02-architect.json", "03-engineer.json", "04-qa.json", "05-review.json"])
             self.assertTrue(all(path.exists() for path in receipts))
@@ -99,11 +100,11 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertFalse(architect_receipt["writeAccess"])
             engineer_receipt = json.loads(receipts[2].read_text(encoding="utf-8"))
             self.assertTrue(engineer_receipt["writeAccess"])
-            self.assertEqual(engineer_receipt["commitSha"], "fake-commit")
+            self.assertEqual(engineer_receipt["commitSha"], result["commitSha"])
             qa_receipt = json.loads(receipts[3].read_text(encoding="utf-8"))
             review_receipt = json.loads(receipts[4].read_text(encoding="utf-8"))
-            self.assertEqual(qa_receipt["commitSha"], "fake-commit")
-            self.assertEqual(review_receipt["commitSha"], "fake-commit")
+            self.assertEqual(qa_receipt["commitSha"], result["commitSha"])
+            self.assertEqual(review_receipt["commitSha"], result["commitSha"])
             self.assertNotIn("super-secret-value", receipts[0].read_text(encoding="utf-8"))
             qa_prompt_evidence = qa_receipt["evidence"]
             self.assertEqual(qa_prompt_evidence["stage"], "qa")
@@ -534,9 +535,10 @@ class BoundedDeliveryTests(unittest.TestCase):
             root = _init_project(Path(tmp) / "project")
             contract_path = _write_contract(Path(tmp), "docs/safe.md")
             prompts: dict[str, str] = {}
+            metadata: dict[str, dict[str, object]] = {}
 
             def provider(role: str) -> BaseProvider:
-                return _PromptCapturingProvider(role, prompts)
+                return _PromptCapturingProvider(role, prompts, metadata)
 
             result = run_bounded_delivery(
                 _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
@@ -547,6 +549,16 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertIn("Edit only docs/safe.md", prompts["qa"])
             self.assertIn("tests=['evidence citation']", prompts["qa"])
             self.assertIn("findings and blockers must be exactly []", prompts["pm"])
+            qa_patch = metadata["qa"]["reviewPatch"]
+            self.assertIsInstance(qa_patch, str)
+            assert isinstance(qa_patch, str)
+            self.assertIn("diff --git a/docs/safe.md b/docs/safe.md", qa_patch)
+            self.assertEqual(
+                metadata["qa"]["reviewPatchSha"],
+                hashlib.sha256(qa_patch.encode()).hexdigest(),
+            )
+            self.assertNotIn(qa_patch, prompts["qa"])
+            self.assertNotIn("diff --git", (Path(tmp) / "reports" / "04-qa.json").read_text())
 
     def test_qa_policy_failure_receipt_is_not_stage_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1314,12 +1326,20 @@ class _ReviewSecondaryWithoutTestsProvider(_StageProvider):
 
 
 class _PromptCapturingProvider(_StageProvider):
-    def __init__(self, role: str, prompts: dict[str, str]) -> None:
+    def __init__(
+        self,
+        role: str,
+        prompts: dict[str, str],
+        metadata: dict[str, dict[str, object]] | None = None,
+    ) -> None:
         super().__init__(role)
         self.prompts = prompts
+        self.metadata = metadata
 
     def run(self, request: ProviderRequest) -> ProviderResult:
         self.prompts[request.metadata["boundedStage"]] = request.prompt
+        if self.metadata is not None:
+            self.metadata[request.metadata["boundedStage"]] = dict(request.metadata)
         return super().run(request)
 
 
@@ -1403,12 +1423,42 @@ def _options(
 ) -> BoundedDeliveryOptions:
     def execute_in_project(contract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
         attempt = engineering_executor(contract, instruction, provider, iteration)
+        commit_sha = attempt.commit_sha
+        if commit_sha == "fake-commit":
+            current_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            for relative in attempt.changed_files:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    f"bounded test change from {current_head}\n",
+                    encoding="utf-8",
+                )
+            subprocess.run(["git", "add", "--", *attempt.changed_files], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "test: bounded engineering attempt"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            commit_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
         return EngineeringAttempt(
             provider_result=attempt.provider_result,
             worktree_path=root,
             changed_files=attempt.changed_files,
             validation=attempt.validation,
-            commit_sha=attempt.commit_sha,
+            commit_sha=commit_sha,
             run_receipt=attempt.run_receipt,
             executor_receipt=attempt.executor_receipt,
         )
