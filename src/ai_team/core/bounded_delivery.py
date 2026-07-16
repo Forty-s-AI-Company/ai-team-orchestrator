@@ -41,6 +41,8 @@ FORBIDDEN_PATTERNS = (
 ROLE_BY_STAGE = {"pm": "product-manager", "architect": "architect", "engineer": "engineer", "qa": "delivery-qa", "review": "reviewer"}
 SECONDARY_PROVIDER_BY_STAGE = {"architect": "codex", "qa": "codex", "review": "antigravity"}
 RECEIPT_FILE_PATTERN = re.compile(r"^(\d+)-(pm|architect|engineer|qa|review)\.json$")
+REVIEW_EVIDENCE_PATH = "/tmp/ai-team-review-evidence/patch.diff"
+MAX_REVIEW_PATCH_BYTES = 512_000
 
 
 class BoundedDeliveryError(ValueError):
@@ -296,14 +298,17 @@ def _run_stage(
 ) -> dict[str, Any]:
     provider = options.provider_for_role(ROLE_BY_STAGE[stage])
     expected = "antigravity" if stage in {"pm", "architect", "qa"} else "codex"
+    review_patch = _review_patch_evidence(root, context) if stage in {"qa", "review"} else None
     request = ProviderRequest(
         workflow=f"bounded-delivery-{stage}", project_root=root, run_mode="run-agent",
         timeout_seconds=options.limits.timeout_seconds,
-        prompt=_stage_prompt(stage, context),
+        prompt=_stage_prompt(stage, context, review_patch),
         metadata={
             "role": ROLE_BY_STAGE[stage], "writeRequired": False, "writeAccess": False,
             "taskSha": context["taskSha"], "boundedStage": stage,
             "requiredProvider": expected,
+            "reviewPatch": review_patch["content"] if review_patch else None,
+            "reviewPatchSha": review_patch["sha256"] if review_patch else None,
         },
     )
     before = _read_only_git_fingerprint(root)
@@ -449,7 +454,11 @@ def _default_engineering_executor(
     return execute
 
 
-def _stage_prompt(stage: str, context: dict[str, Any]) -> str:
+def _stage_prompt(
+    stage: str,
+    context: dict[str, Any],
+    review_patch: dict[str, Any] | None = None,
+) -> str:
     task = context["task"]
     evidence = {
         "acceptanceCriteria": context.get("acceptanceCriteria", []),
@@ -460,6 +469,15 @@ def _stage_prompt(stage: str, context: dict[str, Any]) -> str:
         "commitSha": context.get("commitSha"),
         "validation": context.get("validation", {"success": False, "reason": "validation evidence unavailable"}),
         "repairs": [item["findingSha"] for item in context.get("repairs", [])],
+        "reviewEvidence": (
+            {
+                "path": REVIEW_EVIDENCE_PATH,
+                "sha256": review_patch["sha256"],
+                "bytes": review_patch["bytes"],
+            }
+            if review_patch
+            else None
+        ),
     }
     safe_evidence = redact_secrets(evidence)
     tests_shape = "tests=['evidence citation']" if stage in {"qa", "review"} else "tests=[]"
@@ -475,8 +493,58 @@ def _stage_prompt(stage: str, context: dict[str, Any]) -> str:
         "PM: include non-empty acceptanceCriteria. Architect: include non-empty plan, allowedWritePaths, validationCommands, schemaOrApiChange=false.",
         "PM/architect: findings and blockers must be exactly []; do not restate required work as a finding or blocker.",
         "QA/review: evaluate every acceptance criterion; tests must cite non-empty validation or regression evidence; findings must be [] only when passed.",
+        "QA/review: read the exact redacted patch from reviewEvidence.path with the read_file tool; do not use shell or command tools.",
         "QA/review: each failed finding must include path and message; blockers must be exactly [] for status='passed'.",
     ))
+
+
+def _review_patch_evidence(root: Path, context: dict[str, Any]) -> dict[str, Any]:
+    """Build exact, redacted diff evidence without exposing the primary worktree."""
+    commit_sha = context.get("commitSha")
+    changed_files = context.get("changedFiles")
+    if (
+        not isinstance(commit_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", commit_sha) is None
+        or not isinstance(changed_files, list)
+        or not changed_files
+        or not all(isinstance(path, str) and path for path in changed_files)
+    ):
+        raise BoundedDeliveryError("review-patch-evidence-invalid")
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "show",
+                "--format=",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=3",
+                commit_sha,
+                "--",
+                *changed_files,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BoundedDeliveryError("review-patch-evidence-unavailable") from exc
+    if completed.returncode != 0:
+        raise BoundedDeliveryError("review-patch-evidence-unavailable")
+    content = str(redact_secrets(completed.stdout)).strip()
+    encoded = content.encode("utf-8")
+    if not content or len(encoded) > MAX_REVIEW_PATCH_BYTES:
+        raise BoundedDeliveryError("review-patch-evidence-out-of-bounds")
+    return {
+        "content": content,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded),
+    }
 
 
 def _engineering_failure(
