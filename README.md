@@ -726,3 +726,75 @@ the project contract declares `project.stage: development`. Omitting
 gate. Continuous bounded delivery requires both `--github-execute` and
 `--auto-merge`; it refuses to run indefinitely while leaving completed changes
 unpublished or unverifiable.
+
+### Staging-only external operations
+
+Database migration, seed, and deployment remain forbidden in bounded delivery.
+They are not made safe by changing `safety.allow_*` to `true`: those legacy
+flags remain production-capable and must stay `false`.  Instead, an operator
+may use the separate deterministic `staging-operations` command for one
+explicit staging/Preview contract. It does not invoke an LLM, shell, Git
+write, or arbitrary contract command.
+
+The only executable operations are fixed in the orchestrator source:
+
+- `database-migration` → `npm run db:migrate:deploy`
+- `database-seed` → `npm run db:seed`
+- `preview-deploy` → `vercel deploy --yes` (never `--prod`)
+
+The project must opt in separately while preserving every legacy production
+flag as `false`. Database actions also require an operator-provided SHA-256
+fingerprint of the staging `DATABASE_URL`; the executor compares it in memory
+without printing the URL or its value. Preview deployment requires the tracked
+attestation environment variable to equal `preview`.
+
+```yaml
+safety:
+  allow_deploy: false
+  allow_database_migration: false
+  allow_database_seed: false
+
+staging_operations:
+  enabled: true
+  environment: staging
+  database_url_env: DATABASE_URL
+  database_url_sha256: "<SHA-256 of the approved staging DATABASE_URL>"
+  allow_migration: true
+  allow_seed: true
+  allow_preview_deploy: true
+  preview_environment_variable: VERCEL_ENV
+```
+
+The contract cannot supply command text and must identify only `staging` and
+`preview`:
+
+```json
+{
+  "schema": "ai-team-staging-operations/v1",
+  "id": "celebratedeal-preview-smoke",
+  "title": "Apply the approved staging schema and test fixture",
+  "source": {"kind": "trusted-contract", "reference": "staging-approval-2026-07-16"},
+  "target": {"environment": "staging", "deployment": "preview"},
+  "operations": ["database-migration", "database-seed", "preview-deploy"]
+}
+```
+
+Validate first, then execute only after the receipt confirms the target guard:
+
+```bash
+ai-team staging-operations /home/eden/projects/CelebrateDeal \
+  --contract /tmp/celebratedeal-staging.json
+
+ai-team staging-operations /home/eden/projects/CelebrateDeal \
+  --contract /tmp/celebratedeal-staging.json --execute
+```
+
+Each invocation writes a redacted receipt containing the contract SHA, target,
+fixed-command digests, target validation, and stable stop reason. A malformed
+contract, production target, missing/mismatched database fingerprint, missing
+Preview attestation, unapproved operation, command failure, or any legacy
+production safety flag fails closed before a later operation can run. The
+executor also requires a clean product worktree before it starts and stops if
+an operation changes tracked project files; it never resets or cleans those
+changes. `database-seed` always forces `SEED_MODE=demo`, so an inherited
+production-bootstrap seed setting cannot be reused.
