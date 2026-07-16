@@ -293,8 +293,14 @@ def _compact_prompt(
             values.get("implementation evidence", "{}")
         )
         stage_requirements = {
-            "pm": "Include a non-empty acceptanceCriteria string array.",
+            "pm": (
+                "Do not inspect the repository, execute the task, or call tools. "
+                "Convert only the trusted task text into acceptance criteria. "
+                "Include a non-empty acceptanceCriteria string array."
+            ),
             "architect": (
+                "Do not inspect the repository, execute the task, or call tools. "
+                "Produce only a bounded plan from the trusted task and acceptance criteria. "
                 "Include non-empty plan, allowedWritePaths, validationCommands arrays and "
                 "schemaOrApiChange=false. Do not expand paths or commands beyond the task."
             ),

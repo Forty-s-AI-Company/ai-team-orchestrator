@@ -222,6 +222,20 @@ class CliProviderTests(unittest.TestCase):
 
         self.assertIn("findings and blockers MUST be exactly []", prompt)
         self.assertIn("never restate required work as a finding or blocker", prompt)
+        self.assertIn("Do not inspect the repository, execute the task, or call tools", prompt)
+        self.assertIn("Convert only the trusted task text into acceptance criteria", prompt)
+
+    def test_antigravity_architect_prompt_forbids_tools_and_task_execution(self) -> None:
+        prompt = _compact_prompt(
+            "Task: Plan a bounded change\nInstruction: Modify only the approved path",
+            1600,
+            challenge="challenge-architect",
+            bounded_stage="architect",
+        )
+
+        self.assertIn("Do not inspect the repository, execute the task, or call tools", prompt)
+        self.assertIn("Produce only a bounded plan", prompt)
+        self.assertIn("schemaOrApiChange=false", prompt)
 
     def test_antigravity_bounded_prompts_preserve_the_complete_instruction(self) -> None:
         instruction = "Begin exact contract. " + ("bounded detail " * 40) + "TAIL_REQUIREMENT_MUST_SURVIVE"
