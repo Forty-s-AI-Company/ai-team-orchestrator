@@ -310,6 +310,11 @@ class CliProviderTests(unittest.TestCase):
 
     def test_antigravity_read_only_sandbox_mounts_root_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            runtime = home / ".gemini" / "antigravity-cli"
+            (runtime / "log").mkdir(parents=True)
+            (runtime / "conversations").mkdir()
+            (runtime / "antigravity-oauth-token").write_text("must-stay-read-only", encoding="utf-8")
             sandbox = Path(tmp) / "bwrap"
             sandbox.write_text("test", encoding="utf-8")
             sandbox.chmod(0o700)
@@ -318,7 +323,8 @@ class CliProviderTests(unittest.TestCase):
                 run_args=["--mode", "plan", "--sandbox", "--print"],
             )
 
-            wrapped = _read_only_sandbox_settings(settings, str(sandbox), Path("/workspace"))
+            with patch.dict("os.environ", {"HOME": str(home)}):
+                wrapped = _read_only_sandbox_settings(settings, str(sandbox), Path("/workspace"))
 
         self.assertIsNotNone(wrapped)
         assert wrapped is not None
@@ -338,6 +344,10 @@ class CliProviderTests(unittest.TestCase):
                 "/proc",
                 "--tmpfs",
                 "/tmp",
+                "--tmpfs",
+                str(runtime / "conversations"),
+                "--tmpfs",
+                str(runtime / "log"),
                 "--chdir",
                 "/workspace",
                 "/opt/agy",
@@ -347,6 +357,30 @@ class CliProviderTests(unittest.TestCase):
                 "--print",
             ],
         )
+        self.assertNotIn(str(runtime / "antigravity-oauth-token"), wrapped.run_args)
+
+    def test_antigravity_read_only_sandbox_ignores_symlinked_runtime_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            runtime = home / ".gemini" / "antigravity-cli"
+            runtime.mkdir(parents=True)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (runtime / "log").symlink_to(outside, target_is_directory=True)
+            sandbox = Path(tmp) / "bwrap"
+            sandbox.write_text("test", encoding="utf-8")
+            sandbox.chmod(0o700)
+
+            with patch.dict("os.environ", {"HOME": str(home)}):
+                wrapped = _read_only_sandbox_settings(
+                    CliProviderSettings(executable="/opt/agy"),
+                    str(sandbox),
+                    Path("/workspace"),
+                )
+
+        self.assertIsNotNone(wrapped)
+        assert wrapped is not None
+        self.assertNotIn(str(runtime / "log"), wrapped.run_args)
 
     def test_antigravity_bounded_qa_prompt_keeps_evidence_json_valid(self) -> None:
         evidence = json.dumps(
