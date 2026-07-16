@@ -16,6 +16,20 @@ from .base import BaseProvider, ProviderErrorType, ProviderRequest, ProviderResu
 from .cli_common import CliProviderSettings, build_diagnostics, cli_run_result
 
 
+_ANTIGRAVITY_EPHEMERAL_DIRECTORY_NAMES = (
+    "bin",
+    "brain",
+    "cache",
+    "conversations",
+    "crashes",
+    "implicit",
+    "knowledge",
+    "log",
+    "scratch",
+    "updater",
+)
+
+
 @dataclass(frozen=True)
 class AntigravitySettings:
     executable: str = "antigravity"
@@ -380,12 +394,14 @@ def _read_only_sandbox_settings(
     sandbox_executable: str | None,
     project_root: Path,
 ) -> CliProviderSettings | None:
-    """Wrap a bounded stage in a filesystem sandbox with only /tmp writable."""
+    """Wrap a bounded stage in a read-only sandbox with ephemeral CLI state."""
     if not isinstance(sandbox_executable, str) or not sandbox_executable.strip():
         return None
     sandbox = Path(sandbox_executable).expanduser()
     if not sandbox.is_absolute() or not sandbox.is_file() or not os.access(sandbox, os.X_OK):
         return None
+    runtime_mounts = _antigravity_ephemeral_runtime_mounts()
+    runtime_args = [argument for path in runtime_mounts for argument in ("--tmpfs", str(path))]
     return replace(
         settings,
         executable=str(sandbox),
@@ -402,12 +418,46 @@ def _read_only_sandbox_settings(
             "/proc",
             "--tmpfs",
             "/tmp",
+            *runtime_args,
             "--chdir",
             str(project_root),
             settings.executable,
             *settings.run_args,
         ],
     )
+
+
+def _antigravity_ephemeral_runtime_mounts() -> tuple[Path, ...]:
+    """Return audited runtime directories that may be replaced by empty tmpfs mounts.
+
+    Antigravity writes logs and conversation artifacts even in plan/sandbox mode. The
+    credential and settings files live beside these directories and deliberately stay
+    on the root read-only bind. Symlinks and unexpected locations are rejected so an
+    attacker cannot turn a runtime mount into a writable repository path.
+    """
+    home_value = os.environ.get("HOME")
+    if not home_value:
+        return ()
+    base = Path(home_value).expanduser() / ".gemini" / "antigravity-cli"
+    try:
+        if base.is_symlink() or base.resolve(strict=True) != base.absolute():
+            return ()
+    except (OSError, RuntimeError):
+        return ()
+
+    mounts: list[Path] = []
+    for name in _ANTIGRAVITY_EPHEMERAL_DIRECTORY_NAMES:
+        candidate = base / name
+        try:
+            if (
+                candidate.is_dir()
+                and not candidate.is_symlink()
+                and candidate.resolve(strict=True).parent == base
+            ):
+                mounts.append(candidate)
+        except (OSError, RuntimeError):
+            continue
+    return tuple(mounts)
 
 
 def _apply_routing_options(
