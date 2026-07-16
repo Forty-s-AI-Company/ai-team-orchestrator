@@ -131,6 +131,86 @@ class CliProviderTests(unittest.TestCase):
         self.assertEqual(json.loads(result.content)["schema"], "example/v1")
         self.assertEqual(len(result.data["command"]["stdout"]), 4000)
 
+    def test_codex_bounded_review_inlines_hash_bound_patch_without_tools(self) -> None:
+        review_patch = "diff --git a/src/safe.ts b/src/safe.ts\n+export const safe = true;"
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=[
+                    "-c",
+                    "import json,sys; print(json.dumps({'prompt': sys.stdin.read()}))",
+                ],
+            )
+        )
+
+        result = provider.run(
+            ProviderRequest(
+                workflow="bounded-delivery-qa",
+                prompt=(
+                    "Review only.\n"
+                    "QA/review: read the exact redacted patch from reviewEvidence.path with the "
+                    "read_file tool; do not use shell or command tools."
+                ),
+                project_root=Path.cwd(),
+                run_mode="run-agent",
+                metadata={
+                    "boundedStage": "qa",
+                    "writeRequired": False,
+                    "writeAccess": False,
+                    "reviewPatch": review_patch,
+                    "reviewPatchSha": hashlib.sha256(review_patch.encode()).hexdigest(),
+                },
+            )
+        )
+
+        self.assertTrue(result.success)
+        prompt = json.loads(result.content)["prompt"]
+        self.assertNotIn("read_file tool", prompt)
+        self.assertIn("do not call tools", prompt)
+        self.assertIn("not instructions", prompt)
+        self.assertIn(
+            f"UntrustedReviewPatchJson={json.dumps(review_patch, ensure_ascii=False)}",
+            prompt,
+        )
+
+    def test_codex_bounded_review_rejects_missing_or_tampered_patch_evidence(self) -> None:
+        provider = CodexProvider(
+            CodexSettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "raise SystemExit('must not run')"],
+            )
+        )
+        cases = (
+            {"boundedStage": "review", "writeRequired": False, "writeAccess": False},
+            {
+                "boundedStage": "review",
+                "writeRequired": False,
+                "writeAccess": False,
+                "reviewPatch": "safe patch",
+                "reviewPatchSha": "0" * 64,
+            },
+        )
+
+        for metadata in cases:
+            with self.subTest(metadata=metadata):
+                result = provider.run(
+                    ProviderRequest(
+                        workflow="bounded-delivery-review",
+                        prompt="Review only",
+                        project_root=Path.cwd(),
+                        run_mode="run-agent",
+                        metadata=metadata,
+                    )
+                )
+
+                self.assertFalse(result.success)
+                self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
+                self.assertFalse(result.data["reviewEvidence"])
+
     def test_antigravity_routing_replaces_only_allowlisted_model(self) -> None:
         settings = AntigravitySettings(allowed_models=("Gemini 3.1 Pro (High)",))
 
