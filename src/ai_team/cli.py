@@ -19,6 +19,7 @@ from ai_team.core.isolated_executor import run_in_disposable_worktree
 from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
 from ai_team.core.routing_config import ROLE_CHOICES, load_role_profile
+from ai_team.core.staging_operations import run_staging_operations
 from ai_team.core.supervisor import SupervisorOptions, run_supervisor
 from ai_team.providers import (
     AntigravityProvider,
@@ -848,6 +849,15 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_parser.add_argument("--ci-wait-seconds", type=int, default=900)
     supervisor_parser.add_argument("--ci-poll-seconds", type=int, default=10)
 
+    staging_parser = subparsers.add_parser(
+        "staging-operations",
+        help="Run an explicit deterministic staging migration, seed, or Preview deployment",
+    )
+    staging_parser.add_argument("project", nargs="?", default=".")
+    staging_parser.add_argument("--contract", required=True, help="Path to an ai-team-staging-operations/v1 contract")
+    staging_parser.add_argument("--report-dir")
+    staging_parser.add_argument("--execute", action="store_true", help="Execute fixed allowlisted commands after validation")
+
     return parser
 
 
@@ -962,6 +972,29 @@ def main() -> None:
                 args.ci_poll_seconds,
                 args.role,
             )
+        elif args.command == "staging-operations":
+            settings = load_settings()
+            result = run_staging_operations(
+                Path(args.project),
+                Path(args.contract),
+                Path(args.report_dir).resolve() if args.report_dir else REPO_ROOT / "reports" / "staging-operations",
+                execute=args.execute,
+                workspace_allowlist=workspace_allowlist(settings),
+            )
+            print(
+                json.dumps(
+                    {
+                        "success": result.success,
+                        "stopReason": result.stop_reason,
+                        "validationKind": result.validation_kind,
+                        "contractSha": result.contract_sha,
+                        "receiptPath": str(result.receipt_path),
+                    },
+                    indent=2,
+                )
+            )
+            if not result.success:
+                raise SystemExit(2)
     except (BoundedDeliveryError, ProjectConfigError, WorkflowError) as exc:
         print(f"ai-team error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

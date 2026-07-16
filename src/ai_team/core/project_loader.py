@@ -66,6 +66,43 @@ class SafetyPolicy(BaseModel):
     require_disposable_worktree_for_writes: bool = True
 
 
+class StagingOperationsPolicy(BaseModel):
+    """Explicit opt-in for deterministic non-production external operations.
+
+    This policy is deliberately separate from ``SafetyPolicy``.  Enabling a
+    staging operation must never turn on the corresponding production-capable
+    project flag.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    environment: str = "staging"
+    database_url_env: str = "DATABASE_URL"
+    database_url_sha256: str | None = None
+    allow_migration: bool = False
+    allow_seed: bool = False
+    allow_preview_deploy: bool = False
+    preview_environment_variable: str = "VERCEL_ENV"
+
+    @field_validator("environment", "database_url_env", "preview_environment_variable")
+    @classmethod
+    def non_empty_staging_value(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("must not be empty")
+        return value.strip()
+
+    @field_validator("database_url_sha256")
+    @classmethod
+    def valid_database_fingerprint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+            raise ValueError("database_url_sha256 must be a SHA-256 hex digest")
+        return normalized
+
+
 class ProjectProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -73,6 +110,7 @@ class ProjectProfile(BaseModel):
     repository: RepositoryPolicy = Field(default_factory=RepositoryPolicy)
     commands: CommandSet = Field(default_factory=CommandSet)
     safety: SafetyPolicy = Field(default_factory=SafetyPolicy)
+    staging_operations: StagingOperationsPolicy = Field(default_factory=StagingOperationsPolicy)
 
 
 class LoadedProject(BaseModel):
