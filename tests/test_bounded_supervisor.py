@@ -151,6 +151,68 @@ class ContinuousBoundedSupervisorTests(unittest.TestCase):
             }
             self.assertEqual(set(result["completedTaskShas"]), expected_shas)
 
+    def test_dependency_backlog_runs_ready_backend_before_blocked_ui(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            ui = _write_contract(contracts / "001-ui.json", "ui", depends_on=["backend"])
+            backend = _write_contract(contracts / "002-backend.json", "backend")
+            state_path = root / "state.json"
+            executed: list[str] = []
+            snapshots: list[dict[str, object]] = []
+
+            def delivery(options):
+                snapshots.append(json.loads(state_path.read_text(encoding="utf-8")))
+                contract, task_sha = load_trusted_task_contract(options.task_contract_path)
+                executed.append(contract.id)
+                return {"status": "completed", "taskSha": task_sha, "commitSha": f"commit-{contract.id}"}
+
+            times = iter((0.0, 0.0, 61.0))
+            result = run_continuous_bounded_delivery(
+                ContinuousBoundedOptions(
+                    project_path=root,
+                    contract_dir=contracts,
+                    provider_for_role=lambda _role: _NoopProvider(),
+                    workspace_allowlist=[tmp],
+                    report_dir=root / "reports",
+                    state_path=state_path,
+                    once=False,
+                    interval_minutes=1,
+                    max_runtime_minutes=1,
+                    github_execute=True,
+                    auto_merge=True,
+                    delivery_runner=delivery,
+                    publisher=lambda _options, _entry, _result: {"success": True},
+                    monotonic=lambda: next(times),
+                )
+            )
+
+            self.assertEqual(executed, ["backend", "ui"])
+            self.assertEqual(snapshots[0]["blockedTasks"][0]["id"], "ui")
+            self.assertEqual(snapshots[0]["blockedTasks"][0]["unmetDependencies"], ["backend"])
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(
+                set(result["completedTaskShas"]),
+                {load_trusted_task_contract(backend)[1], load_trusted_task_contract(ui)[1]},
+            )
+
+    def test_dependency_backlog_rejects_unknown_dependency_and_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            contracts = Path(tmp) / "unknown"
+            contracts.mkdir()
+            _write_contract(contracts / "001-ui.json", "ui", depends_on=["missing"])
+            with self.assertRaisesRegex(ValueError, "unknown dependencies"):
+                discover_contracts(contracts)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            contracts = Path(tmp) / "cycle"
+            contracts.mkdir()
+            _write_contract(contracts / "001-a.json", "a", depends_on=["b"])
+            _write_contract(contracts / "002-b.json", "b", depends_on=["a"])
+            with self.assertRaisesRegex(ValueError, "contain a cycle"):
+                discover_contracts(contracts)
+
     def test_attention_required_stops_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -883,7 +945,7 @@ class _NoopProvider(BaseProvider):
         return ProviderResult(provider="noop", success=True)
 
 
-def _write_contract(path: Path, task_id: str) -> Path:
+def _write_contract(path: Path, task_id: str, *, depends_on: list[str] | None = None) -> Path:
     path.write_text(
         json.dumps(
             {
@@ -894,6 +956,7 @@ def _write_contract(path: Path, task_id: str) -> Path:
                 "instruction": f"Update the documented behavior for {task_id}.",
                 "allowedWritePaths": [f"docs/{task_id}.md"],
                 "validationCommands": ["git diff --check"],
+                **({"dependsOn": depends_on} if depends_on is not None else {}),
             }
         ),
         encoding="utf-8",

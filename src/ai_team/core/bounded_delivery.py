@@ -22,7 +22,9 @@ from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderRequ
 
 SCHEMA = "ai-team-bounded-delivery/v1"
 FORBIDDEN_PATTERNS = (
-    r"\b(?:database\s+)?migrat(?:e|ion|ions)\b",
+    r"\b(?:run|apply|execute)\s+(?:a\s+|the\s+)?(?:database\s+)?migrat(?:e|ion|ions)\b",
+    r"\bproduction\s+(?:database\s+)?migrat(?:e|ion|ions)\b",
+    r"\b(?:prisma\s+migrate|npm\s+run\s+[\w:-]*migrat[\w:-]*|pnpm\s+[\w:-]*migrat[\w:-]*|yarn\s+[\w:-]*migrat[\w:-]*)\b",
     r"\b(?:database\s+seeds?|seed(?:ing)?\s+(?:the\s+)?(?:data|database)|"
     r"(?:run|apply|execute|load|populate)\s+(?:the\s+)?(?:database\s+)?seeds?|"
     r"(?:npm|pnpm|yarn)\s+run\s+[\w:-]*seed[\w:-]*|prisma\s+db\s+seed)\b",
@@ -35,9 +37,12 @@ FORBIDDEN_PATTERNS = (
     r"\b(?:read|write|expose|rotate|copy)\s+(?:a\s+)?(?:secret|credential|token|api[ _-]?key)\b",
     r"\b(?:delete|drop|truncate)\s+(?:data|database|records?|volume)\b",
     r"\bforce\s+push\b",
-    r"\b(?:schema\s+change|api\s+contract\s+change)\b",
     r"\b(?:prisma\s+db\s+push|drizzle(?:-kit)?\s+push|git\s+push|gh\s+(?:pr|api))\b",
 )
+MIGRATION_ARTIFACT_PATTERN = re.compile(r"\bmigrat(?:e|ion|ions)\b")
+SCHEMA_CHANGE_PATTERN = re.compile(r"\b(?:database\s+|prisma\s+)?schema\s+(?:change|changes|update|updates)\b")
+API_CONTRACT_CHANGE_PATTERN = re.compile(r"\bapi\s+(?:contract\s+)?(?:change|changes|update|updates)\b")
+FIXTURE_DATA_PATTERN = re.compile(r"\b(?:deterministic\s+)?(?:fixture|fake|sample|placeholder)\s+data\b")
 ROLE_BY_STAGE = {"pm": "product-manager", "architect": "architect", "engineer": "engineer", "qa": "delivery-qa", "review": "reviewer"}
 SECONDARY_PROVIDER_BY_STAGE = {"architect": "codex", "qa": "codex", "review": "antigravity"}
 RECEIPT_FILE_PATTERN = re.compile(r"^(\d+)-(pm|architect|engineer|qa|review)\.json$")
@@ -54,6 +59,16 @@ class PolicyValidationError(BoundedDeliveryError):
 
 
 @dataclass(frozen=True)
+class TaskChangePolicy:
+    """Explicit, code-only product changes allowed by the trusted contract."""
+
+    schema_changes: bool = False
+    api_contract_changes: bool = False
+    migration_artifacts: bool = False
+    fixture_data: bool = False
+
+
+@dataclass(frozen=True)
 class TrustedTaskContract:
     id: str
     title: str
@@ -62,6 +77,8 @@ class TrustedTaskContract:
     instruction: str
     allowed_write_paths: tuple[str, ...]
     validation_commands: tuple[str, ...]
+    depends_on: tuple[str, ...] = ()
+    change_policy: TaskChangePolicy = TaskChangePolicy()
 
 
 @dataclass(frozen=True)
@@ -113,17 +130,23 @@ def load_trusted_task_contract(path: Path) -> tuple[TrustedTaskContract, str]:
         raise BoundedDeliveryError("task contract requires non-empty id, title, instruction, and source reference")
     paths = _string_list(raw.get("allowedWritePaths"), "allowedWritePaths")
     commands = _string_list(raw.get("validationCommands"), "validationCommands")
+    depends_on = _optional_string_list(raw.get("dependsOn"), "dependsOn")
+    change_policy = _load_change_policy(raw.get("changePolicy"))
     if not paths or not commands:
         raise BoundedDeliveryError("trusted write tasks require allowedWritePaths and validationCommands")
     contract = TrustedTaskContract(
         id=values["id"].strip(), title=values["title"].strip(), source_kind=values["source_kind"].strip(),
         source_reference=values["source_reference"].strip(), instruction=values["instruction"].strip(),
         allowed_write_paths=tuple(paths), validation_commands=tuple(commands),
+        depends_on=tuple(depends_on), change_policy=change_policy,
     )
-    _reject_forbidden(contract.instruction, "task instruction")
+    if contract.id in contract.depends_on:
+        raise BoundedDeliveryError("trusted task contract cannot depend on itself")
+    _reject_forbidden(contract.instruction, "task instruction", contract)
     _validate_allowed_write_paths(contract.allowed_write_paths)
+    _validate_change_policy_paths(contract)
     for command in contract.validation_commands:
-        _reject_forbidden(command, "validation command")
+        _reject_forbidden(command, "validation command", contract)
     normalized = json.dumps(raw, sort_keys=True, separators=(",", ":"))
     return contract, hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
@@ -345,9 +368,12 @@ def _run_stage(
         )
         raise
     try:
-        _reject_forbidden(json.dumps(payload, ensure_ascii=False), f"{stage} output")
+        _reject_forbidden(json.dumps(payload, ensure_ascii=False), f"{stage} output", contract)
         if stage == "architect":
-            if payload.get("schemaOrApiChange") is not False:
+            schema_or_api_change = payload.get("schemaOrApiChange")
+            if not isinstance(schema_or_api_change, bool):
+                raise PolicyValidationError("architect-schema-or-api-change-must-be-boolean")
+            if schema_or_api_change and not _schema_or_api_change_allowed(contract):
                 raise PolicyValidationError("architect-requires-product-decision")
             _validate_plan_scope(payload, contract)
     except PolicyValidationError as exc:
@@ -375,6 +401,7 @@ def _run_stage(
                 secondary,
                 stage,
                 expected_secondary,
+                contract,
             )
         if secondary_payload is not None:
             if secondary_payload["blockers"]:
@@ -460,6 +487,10 @@ def _stage_prompt(
     review_patch: dict[str, Any] | None = None,
 ) -> str:
     task = context["task"]
+    change_policy = task.get("change_policy", {})
+    schema_or_api_allowed = bool(
+        change_policy.get("schema_changes") or change_policy.get("api_contract_changes")
+    )
     evidence = {
         "acceptanceCriteria": context.get("acceptanceCriteria", []),
         "plan": context.get("plan", []),
@@ -487,10 +518,17 @@ def _stage_prompt(
         f"Acceptance criteria: {json.dumps(safe_evidence['acceptanceCriteria'])}",
         f"Allowed write paths: {json.dumps(safe_evidence['allowedWritePaths'])}",
         f"Validation commands: {json.dumps(safe_evidence['validationCommands'])}",
+        f"Change policy: {json.dumps(redact_secrets(change_policy))}",
         f"Implementation evidence: {json.dumps(safe_evidence)}",
         f"Return only JSON with schema='ai-team-bounded-delivery/v1', stage, status='passed', findings=[], {tests_shape}, blockers=[].",
-        "Do not edit files, run shell commands, deploy, migrate, seed, process payments, read secrets, or propose schema/API changes.",
-        "PM: include non-empty acceptanceCriteria. Architect: include non-empty plan, allowedWritePaths, validationCommands, schemaOrApiChange=false.",
+        "Do not edit files, run shell commands, deploy, execute migrations or seeds, process payments, read secrets, or perform destructive actions.",
+        "Schema/API code changes, migration artifacts, and fixture data are allowed only when their exact change-policy flag is true.",
+        (
+            "PM: include non-empty acceptanceCriteria. Architect: include non-empty plan, allowedWritePaths, "
+            "validationCommands, and boolean schemaOrApiChange; it may be true only for the authorized change policy."
+            if schema_or_api_allowed
+            else "PM: include non-empty acceptanceCriteria. Architect: include non-empty plan, allowedWritePaths, validationCommands, schemaOrApiChange=false."
+        ),
         "PM/architect: findings and blockers must be exactly []; do not restate required work as a finding or blocker.",
         "QA/review: evaluate every acceptance criterion; tests must cite non-empty validation or regression evidence; findings must be [] only when passed.",
         "QA/review: read the exact redacted patch from reviewEvidence.path with the read_file tool; do not use shell or command tools.",
@@ -804,17 +842,22 @@ def _accept_stage_checkpoint(
         return
 
     _validate_stage_structure(stage, evidence)
-    _reject_forbidden(json.dumps(evidence, ensure_ascii=False), f"{stage} checkpoint")
+    _reject_forbidden(json.dumps(evidence, ensure_ascii=False), f"{stage} checkpoint", contract)
     if stage == "pm":
         checkpoints["pm"] = receipt
         for dependent in ("architect", "engineer", "qa", "review"):
             checkpoints.pop(dependent, None)
         return
     if stage == "architect":
-        if "pm" not in checkpoints or evidence.get("schemaOrApiChange") is not False:
+        schema_or_api_change = evidence.get("schemaOrApiChange")
+        if (
+            "pm" not in checkpoints
+            or not isinstance(schema_or_api_change, bool)
+            or (schema_or_api_change and not _schema_or_api_change_allowed(contract))
+        ):
             raise BoundedDeliveryError("architect checkpoint dependency invalid")
         _validate_plan_scope(evidence, contract)
-        _validate_checkpoint_secondary(receipt, stage, "codex")
+        _validate_checkpoint_secondary(receipt, stage, "codex", contract)
         checkpoints["architect"] = receipt
         for dependent in ("engineer", "qa", "review"):
             checkpoints.pop(dependent, None)
@@ -823,7 +866,7 @@ def _accept_stage_checkpoint(
         engineer = checkpoints.get("engineer")
         if engineer is None or receipt.get("commitSha") != engineer.get("commitSha"):
             raise BoundedDeliveryError("qa checkpoint commit dependency invalid")
-        _validate_checkpoint_secondary(receipt, stage, "codex", allow_findings=True)
+        _validate_checkpoint_secondary(receipt, stage, "codex", contract, allow_findings=True)
         checkpoints.pop("qa", None)
         checkpoints.pop("review", None)
         if not _findings(evidence):
@@ -837,7 +880,7 @@ def _accept_stage_checkpoint(
             or receipt.get("commitSha") != engineer.get("commitSha")
         ):
             return
-        _validate_checkpoint_secondary(receipt, stage, "antigravity", allow_findings=True)
+        _validate_checkpoint_secondary(receipt, stage, "antigravity", contract, allow_findings=True)
         checkpoints.pop("review", None)
         if not _findings(evidence):
             checkpoints["review"] = receipt
@@ -847,6 +890,7 @@ def _validate_checkpoint_secondary(
     receipt: dict[str, Any],
     stage: str,
     provider: str,
+    contract: TrustedTaskContract,
     *,
     allow_findings: bool = False,
 ) -> None:
@@ -857,7 +901,7 @@ def _validate_checkpoint_secondary(
         or secondary.get("provider") != provider
     ):
         raise BoundedDeliveryError("checkpoint secondary review invalid")
-    payload = _validate_secondary_review(secondary, stage, provider)
+    payload = _validate_secondary_review(secondary, stage, provider, contract)
     if payload["blockers"] or (payload["findings"] and not allow_findings):
         raise BoundedDeliveryError("checkpoint secondary review did not approve")
 
@@ -1077,10 +1121,24 @@ def _validate_allowed_write_paths(paths: tuple[str, ...]) -> None:
             raise BoundedDeliveryError("allowedWritePaths contains a sensitive path")
 
 
+def _validate_change_policy_paths(contract: TrustedTaskContract) -> None:
+    normalized = [Path(raw_path).as_posix().rstrip("/") for raw_path in contract.allowed_write_paths]
+    if any(path == "prisma/schema.prisma" or path.endswith("/schema.prisma") for path in normalized):
+        if not contract.change_policy.schema_changes:
+            raise BoundedDeliveryError("schema write path requires changePolicy.schemaChanges")
+    if any("migrations" in Path(path).parts for path in normalized):
+        if not contract.change_policy.migration_artifacts:
+            raise BoundedDeliveryError("migration write path requires changePolicy.migrationArtifacts")
+    if any(any(part.lower() in {"fixture", "fixtures", "__fixtures__"} for part in Path(path).parts) for path in normalized):
+        if not contract.change_policy.fixture_data:
+            raise BoundedDeliveryError("fixture write path requires changePolicy.fixtureData")
+
+
 def _validate_secondary_review(
     secondary: dict[str, Any],
     stage: str,
     provider: str,
+    contract: TrustedTaskContract,
 ) -> dict[str, Any]:
     failure_prefix = f"{stage}-{provider}-read-only-review"
     content = secondary.get("content")
@@ -1110,6 +1168,7 @@ def _validate_secondary_review(
     _reject_forbidden(
         json.dumps(payload, ensure_ascii=False),
         f"{stage} {provider} review",
+        contract,
     )
     return payload
 
@@ -1150,10 +1209,23 @@ def _engineering_instruction(context: dict[str, Any], repairs: list[dict[str, An
     return json.dumps({"task": context["task"], "acceptanceCriteria": context["acceptanceCriteria"], "plan": context["plan"], "repairs": repairs}, ensure_ascii=False)
 
 
-def _reject_forbidden(value: str, label: str) -> None:
+def _schema_or_api_change_allowed(contract: TrustedTaskContract) -> bool:
+    return contract.change_policy.schema_changes or contract.change_policy.api_contract_changes
+
+
+def _reject_forbidden(value: str, label: str, contract: TrustedTaskContract | None = None) -> None:
     lowered = value.lower()
     if any(re.search(pattern, lowered) for pattern in FORBIDDEN_PATTERNS):
         raise PolicyValidationError(f"{label} contains a prohibited action or product-contract change")
+    policy = contract.change_policy if contract is not None else TaskChangePolicy()
+    if MIGRATION_ARTIFACT_PATTERN.search(lowered) and not policy.migration_artifacts:
+        raise PolicyValidationError(f"{label} contains an unauthorized migration artifact")
+    if SCHEMA_CHANGE_PATTERN.search(lowered) and not policy.schema_changes:
+        raise PolicyValidationError(f"{label} contains an unauthorized schema change")
+    if API_CONTRACT_CHANGE_PATTERN.search(lowered) and not policy.api_contract_changes:
+        raise PolicyValidationError(f"{label} contains an unauthorized API contract change")
+    if FIXTURE_DATA_PATTERN.search(lowered) and not policy.fixture_data:
+        raise PolicyValidationError(f"{label} contains unauthorized fixture data")
 
 
 def _validate_stage_structure(stage: str, payload: Any) -> None:
@@ -1199,6 +1271,38 @@ def _receipt_validation(result: ProviderResult, evidence: dict[str, Any]) -> dic
         validation.setdefault("kind", "stage-validation")
         validation["stopReason"] = stop_reason
     return validation
+
+
+def _optional_string_list(value: Any, label: str) -> list[str]:
+    if value is None:
+        return []
+    return _string_list(value, label)
+
+
+def _load_change_policy(value: Any) -> TaskChangePolicy:
+    if value is None:
+        return TaskChangePolicy()
+    if not isinstance(value, dict):
+        raise BoundedDeliveryError("changePolicy must be an object")
+    allowed_keys = {
+        "schemaChanges",
+        "apiContractChanges",
+        "migrationArtifacts",
+        "fixtureData",
+    }
+    if set(value) - allowed_keys:
+        raise BoundedDeliveryError("changePolicy contains unsupported fields")
+    if not all(isinstance(item, bool) for item in value.values()):
+        raise BoundedDeliveryError("changePolicy values must be booleans")
+    policy = TaskChangePolicy(
+        schema_changes=value.get("schemaChanges", False),
+        api_contract_changes=value.get("apiContractChanges", False),
+        migration_artifacts=value.get("migrationArtifacts", False),
+        fixture_data=value.get("fixtureData", False),
+    )
+    if policy.migration_artifacts and not policy.schema_changes:
+        raise BoundedDeliveryError("migrationArtifacts requires schemaChanges")
+    return policy
 
 
 def _string_list(value: Any, label: str) -> list[str]:

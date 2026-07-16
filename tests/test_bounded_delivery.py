@@ -962,6 +962,116 @@ class BoundedDeliveryTests(unittest.TestCase):
             with self.assertRaises(BoundedDeliveryError):
                 load_trusted_task_contract(path)
 
+    def test_task_contract_allows_explicit_code_only_schema_api_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(
+                Path(tmp),
+                "docs/safe.md",
+                instruction=(
+                    "Add a database schema change, API contract change, migration artifact, "
+                    "and deterministic fixture data without executing external operations"
+                ),
+                change_policy={
+                    "schemaChanges": True,
+                    "apiContractChanges": True,
+                    "migrationArtifacts": True,
+                    "fixtureData": True,
+                },
+            )
+
+            result = run_bounded_delivery(
+                _options(
+                    Path(tmp),
+                    root,
+                    contract_path,
+                    lambda role: _StageProvider(role, schema_or_api_change=True),
+                    _successful_engineering_attempt,
+                )
+            )
+
+            self.assertEqual(result["status"], "completed", result)
+
+    def test_schema_and_migration_paths_require_explicit_change_policy(self) -> None:
+        cases = (
+            ("prisma/schema.prisma", "schema write path"),
+            ("prisma/migrations/20260717_team/migration.sql", "migration write path"),
+            ("tests/fixtures/team.json", "fixture write path"),
+        )
+        for allowed_path, message in cases:
+            with self.subTest(allowed_path=allowed_path), tempfile.TemporaryDirectory() as tmp:
+                path = _write_contract(Path(tmp), allowed_path)
+                with self.assertRaisesRegex(BoundedDeliveryError, message):
+                    load_trusted_task_contract(path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_contract(
+                Path(tmp),
+                "prisma/migrations/20260717_team/migration.sql",
+                instruction="Add an approved migration artifact without executing it",
+                change_policy={
+                    "schemaChanges": True,
+                    "apiContractChanges": False,
+                    "migrationArtifacts": True,
+                    "fixtureData": False,
+                },
+            )
+            contract, _task_sha = load_trusted_task_contract(path)
+            self.assertTrue(contract.change_policy.migration_artifacts)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_contract(
+                Path(tmp),
+                "tests/fixtures/team.json",
+                instruction="Add deterministic fixture data for browser tests",
+                change_policy={
+                    "schemaChanges": False,
+                    "apiContractChanges": False,
+                    "migrationArtifacts": False,
+                    "fixtureData": True,
+                },
+            )
+            contract, _task_sha = load_trusted_task_contract(path)
+            self.assertTrue(contract.change_policy.fixture_data)
+
+    def test_explicit_change_policy_never_allows_migration_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_contract(
+                Path(tmp),
+                "docs/safe.md",
+                instruction="run a database migration",
+                change_policy={
+                    "schemaChanges": True,
+                    "apiContractChanges": True,
+                    "migrationArtifacts": True,
+                    "fixtureData": True,
+                },
+            )
+            with self.assertRaises(BoundedDeliveryError):
+                load_trusted_task_contract(path)
+
+    def test_architect_cannot_expand_default_contract_into_schema_or_api_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            result = run_bounded_delivery(
+                _options(
+                    Path(tmp),
+                    root,
+                    contract_path,
+                    lambda role: _StageProvider(role, schema_or_api_change=True),
+                    _successful_engineering_attempt,
+                )
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], "architect-requires-product-decision")
+            receipt = json.loads((Path(tmp) / "reports" / "02-architect.json").read_text(encoding="utf-8"))
+            self.assertTrue(receipt["providerSuccess"])
+            self.assertFalse(receipt["validationResult"]["success"])
+            self.assertEqual(receipt["validationResult"]["kind"], "policy-validation")
+
     def test_task_contract_rejects_database_seed_actions(self) -> None:
         for instruction in (
             "run database seed",
@@ -1041,9 +1151,16 @@ class BoundedDeliveryTests(unittest.TestCase):
 
 
 class _StageProvider(BaseProvider):
-    def __init__(self, role: str, qa_findings: list[dict[str, str]] | None = None) -> None:
+    def __init__(
+        self,
+        role: str,
+        qa_findings: list[dict[str, str]] | None = None,
+        *,
+        schema_or_api_change: bool = False,
+    ) -> None:
         self.role = role
         self.qa_findings = qa_findings or []
+        self.schema_or_api_change = schema_or_api_change
 
     def ready(self) -> bool:
         return True
@@ -1068,7 +1185,7 @@ class _StageProvider(BaseProvider):
                 "plan": ["Edit only docs/safe.md"],
                 "allowedWritePaths": ["docs/safe.md"],
                 "validationCommands": ["npm run lint", "npm run typecheck", "npm run test", "npm run build"],
-                "schemaOrApiChange": False,
+                "schemaOrApiChange": self.schema_or_api_change,
             })
         expected_provider = "antigravity" if self.role in {"product-manager", "architect", "delivery-qa"} else "codex"
         data: dict[str, object] = {"tokenUsage": 10, "selectedModel": "fake-model", "reasoningEffort": "high"}
@@ -1485,6 +1602,7 @@ def _write_contract(
     allowed_path: str,
     instruction: str = "Update the approved documentation only",
     validation_commands: list[str] | None = None,
+    change_policy: dict[str, bool] | None = None,
 ) -> Path:
     path = base / "task.json"
     path.write_text(json.dumps({
@@ -1497,6 +1615,7 @@ def _write_contract(
         "validationCommands": validation_commands or [
             "npm run lint", "npm run typecheck", "npm run test", "npm run build",
         ],
+        **({"changePolicy": change_policy} if change_policy is not None else {}),
     }), encoding="utf-8")
     return path
 
