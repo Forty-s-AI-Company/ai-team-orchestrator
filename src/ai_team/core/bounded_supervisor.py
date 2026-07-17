@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from ai_team.core.autonomous_backlog import discover_next_task
 from ai_team.core.cloud_resilience import (
     CloudModelRoute,
     CloudRecoveryState,
@@ -73,6 +74,8 @@ class ContinuousBoundedOptions:
     cloud_retry: RetrySettings = RetrySettings()
     local_continuity: LocalContinuitySettings = LocalContinuitySettings()
     trusted_dev: TrustedDevSettings = TrustedDevSettings()
+    autonomous_product_loop: bool = False
+    autonomous_scan_timeout_seconds: int = 180
     delivery_runner: Callable[[BoundedDeliveryOptions], dict[str, Any]] = run_bounded_delivery
     publisher: Callable[["ContinuousBoundedOptions", ContractEntry, dict[str, Any]], dict[str, Any]] | None = None
     sleeper: Callable[[float], None] = time.sleep
@@ -132,6 +135,33 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
             selected = _next_ready_contract(entries, completed)
             if selected is None:
                 pending_count = _pending_count(entries, completed)
+                autonomous_backlog: dict[str, Any] | None = None
+                if pending_count == 0 and options.autonomous_product_loop:
+                    try:
+                        autonomous_backlog = discover_next_task(
+                            project_path=options.project_path,
+                            contract_dir=options.contract_dir,
+                            state_path=options.state_path.with_name("autonomous-product-backlog.json"),
+                            provider=options.provider_for_role("product-manager"),
+                            timeout_seconds=options.autonomous_scan_timeout_seconds,
+                        )
+                    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                        autonomous_backlog = {
+                            "status": "discovery-failed",
+                            "diagnostic": str(redact_secrets(str(exc))),
+                        }
+                    if autonomous_backlog.get("status") == "task-created":
+                        state = _supervisor_state(
+                            prior,
+                            cycles,
+                            "planning-next-task",
+                            completed,
+                            queue_size=1,
+                            next_action="run-autonomous-contract",
+                            autonomous_backlog=autonomous_backlog,
+                        )
+                        _write_json(options.state_path, state)
+                        continue
                 state = _supervisor_state(
                     prior,
                     cycles,
@@ -141,6 +171,7 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                     stop_reason="dependency-resolution-stalled" if pending_count else None,
                     next_action="watch-contract-directory" if pending_count == 0 else "manual-review-required",
                     blocked_tasks=blocked_tasks,
+                    autonomous_backlog=autonomous_backlog,
                 )
                 _write_json(options.state_path, state)
                 if _must_stop(options, started):
@@ -729,6 +760,7 @@ def _supervisor_state(
     cloud_resilience: dict[str, Any] | None = None,
     continuity: dict[str, Any] | None = None,
     blocked_tasks: list[dict[str, Any]] | None = None,
+    autonomous_backlog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         # Version 2 adds cloudResilience and continuity while readers continue
@@ -761,6 +793,9 @@ def _supervisor_state(
         "providerBackoff": provider_backoff,
         "cloudResilience": cloud_resilience,
         "continuity": continuity,
+        "autonomousBacklog": redact_secrets(
+            autonomous_backlog if autonomous_backlog is not None else prior.get("autonomousBacklog")
+        ),
     }
 
 

@@ -578,12 +578,17 @@ def supervise(
     ci_wait_seconds: int,
     ci_poll_seconds: int,
     trusted_dev_autopilot: bool,
+    autonomous_product_loop: bool,
     role: str | None = None,
 ) -> None:
     settings = load_settings()
     selected_report_dir = Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "supervisor"
     if trusted_dev_autopilot and not bounded_delivery:
         raise WorkflowError("--trusted-dev-autopilot requires --bounded-delivery")
+    if autonomous_product_loop and not (bounded_delivery and trusted_dev_autopilot and not once):
+        raise WorkflowError(
+            "--autonomous-product-loop requires continuous --bounded-delivery with --trusted-dev-autopilot"
+        )
     if bounded_delivery:
         if delivery:
             raise WorkflowError("--bounded-delivery cannot be combined with legacy --delivery")
@@ -667,6 +672,7 @@ def supervise(
                         cloud_retry=cloud_retry,
                         local_continuity=local_continuity,
                         trusted_dev=trusted_dev,
+                        autonomous_product_loop=autonomous_product_loop,
                     )
                 )
             except (OSError, RuntimeError, ValueError) as exc:
@@ -893,6 +899,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable allowlisted development-only long-run execution with Git checkpoints",
     )
+    supervisor_parser.add_argument(
+        "--autonomous-product-loop",
+        action="store_true",
+        help="When the trusted task queue is empty, let a read-only PM generate one validated next task",
+    )
 
     staging_parser = subparsers.add_parser(
         "staging-operations",
@@ -1016,6 +1027,7 @@ def main() -> None:
                 args.ci_wait_seconds,
                 args.ci_poll_seconds,
                 args.trusted_dev_autopilot,
+                args.autonomous_product_loop,
                 args.role,
             )
         elif args.command == "staging-operations":
