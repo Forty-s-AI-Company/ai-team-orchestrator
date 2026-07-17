@@ -1050,6 +1050,38 @@ class BoundedDeliveryTests(unittest.TestCase):
             with self.assertRaises(BoundedDeliveryError):
                 load_trusted_task_contract(path)
 
+    def test_secondary_review_allows_policy_absence_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _SecondaryPolicyEvidenceProvider(role, proposes_change=False)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "completed", result)
+
+    def test_secondary_review_still_rejects_positive_policy_proposal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _SecondaryPolicyEvidenceProvider(role, proposes_change=True)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(
+                result["stopReason"],
+                "architect codex review contains an unauthorized migration artifact",
+            )
+
     def test_architect_cannot_expand_default_contract_into_schema_or_api_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -1386,6 +1418,39 @@ class _ReviewWithInvalidAntigravityProvider(_StageProvider):
                     "blockers": [],
                 }
             ),
+        }
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=result.content,
+            data={**result.data, "secondaryReview": secondary},
+        )
+
+
+class _SecondaryPolicyEvidenceProvider(_StageProvider):
+    def __init__(self, role: str, *, proposes_change: bool) -> None:
+        super().__init__(role)
+        self.proposes_change = proposes_change
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "architect":
+            return result
+        payload = json.loads(result.data["secondaryReview"]["content"])
+        payload["plan"] = [
+            (
+                "No schema, API contract, migration, or fixture data changes are present."
+                if not self.proposes_change
+                else "Add a migration artifact before implementation."
+            ),
+            "No schema changes are present.",
+            "No API contract changes are present.",
+            "No fixture data changes are present.",
+            "確認未產生 UI、schema、migration 或 fixture 變更。",
+        ]
+        secondary = {
+            **result.data["secondaryReview"],
+            "content": json.dumps(payload, ensure_ascii=False),
         }
         return ProviderResult(
             provider=result.provider,
