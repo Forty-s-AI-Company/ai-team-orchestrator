@@ -282,13 +282,18 @@ def _compact_prompt(
     if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
         task = values.get("task", "unknown")[:120]
         instruction = values.get("instruction", "unknown")
-        acceptance_criteria = _compact_json_array(
+        acceptance_criteria = _lossless_json_string_array(
             values.get("acceptance criteria", "[]"),
-            max_chars=300,
-            item_max_chars=64,
+            field_name="acceptance criteria",
         )
-        allowed_paths = _compact_json_array(values.get("allowed write paths", "[]"), max_chars=220)
-        validation_commands = _compact_json_array(values.get("validation commands", "[]"), max_chars=280)
+        allowed_paths = _lossless_json_string_array(
+            values.get("allowed write paths", "[]"),
+            field_name="allowed write paths",
+        )
+        validation_commands = _lossless_json_string_array(
+            values.get("validation commands", "[]"),
+            field_name="validation commands",
+        )
         change_policy = values.get("change policy", "{}")
         try:
             parsed_change_policy = json.loads(change_policy)
@@ -339,8 +344,8 @@ def _compact_prompt(
                 "Forbidden: edit, shell, execute migration or seed, deploy, payment, secrets, delete, or changes beyond ChangePolicy. "
                 f"{stage_requirements} Findings may be empty only when all criteria pass. "
                 f"Instruction={instruction}; ChangePolicy={change_policy}; AcceptanceCriteria={acceptance_criteria}; "
-                f"AllowedWritePaths={_compact_json_array(allowed_paths, max_chars=140)}; "
-                f"ValidationCommands={_compact_json_array(validation_commands, max_chars=180)}; "
+                f"AllowedWritePaths={allowed_paths}; "
+                f"ValidationCommands={validation_commands}; "
                 f"ImplementationEvidence={implementation_evidence}."
             )
         else:
@@ -382,21 +387,15 @@ def _compact_prompt(
     return f"{normalized[: limit - len(suffix)].rstrip()}{suffix}"
 
 
-def _compact_json_array(raw: str, *, max_chars: int, item_max_chars: int = 160) -> str:
-    """Return a bounded JSON array without leaving a truncated JSON fragment."""
+def _lossless_json_string_array(raw: str, *, field_name: str) -> str:
+    """Normalize a bounded string array without silently dropping security-relevant items."""
     try:
         value = json.loads(raw)
-    except json.JSONDecodeError:
-        return "[]"
-    if not isinstance(value, list):
-        return "[]"
-    items = [item[:item_max_chars] for item in value if isinstance(item, str)]
-    while items:
-        encoded = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
-        if len(encoded) <= max_chars:
-            return encoded
-        items.pop()
-    return "[]"
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"bounded delivery {field_name} must be a valid JSON array") from exc
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"bounded delivery {field_name} must be a JSON string array")
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _compact_implementation_evidence(raw: str) -> str:
