@@ -1322,6 +1322,25 @@ def _policy_mentions_are_only_absence_evidence(text: str, pattern: re.Pattern[st
                 is not None
             )
         )
+        english_contradiction = re.search(
+            r"\b(?:but|however|except|then|instead|yet|add|create|generate|write|modify|introduce|implement|apply|execute|run)\b",
+            after,
+        )
+        english_direct_absence = (
+            re.search(r"\b(?:no|without)\s+(?:(?:new|additional|database|schema|prisma|code)\s+)*$", before)
+            is not None
+            and re.match(r"^\s*(?:artifacts?|changes?|files?|paths?|data)?\b", after) is not None
+            and english_contradiction is None
+        )
+        english_post_absence = (
+            re.match(
+                r"^\s*(?:artifacts?|changes?|files?|paths?|data)?\s*(?:are|is|were|was)\s+not\s+"
+                r"(?:required|needed|present|included|added|modified|touched|created)\b",
+                after,
+            )
+            is not None
+            and english_contradiction is None
+        )
         english_negations = list(
             re.finditer(
                 r"\b(?:do not|does not|did not|must not|shall not|may not|cannot|can't|never)\b",
@@ -1364,6 +1383,8 @@ def _policy_mentions_are_only_absence_evidence(text: str, pattern: re.Pattern[st
             )
         if (
             not english_absence
+            and not english_direct_absence
+            and not english_post_absence
             and not english_prohibition
             and not chinese_absence
             and not chinese_prohibition

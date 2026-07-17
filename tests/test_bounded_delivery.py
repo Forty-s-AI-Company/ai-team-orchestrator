@@ -1129,6 +1129,24 @@ class BoundedDeliveryTests(unittest.TestCase):
                 "architect codex review contains an unauthorized migration artifact",
             )
 
+    def test_secondary_review_still_rejects_direct_absence_with_positive_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _SecondaryDirectMixedPolicyEvidenceProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(
+                result["stopReason"],
+                "architect codex review contains an unauthorized migration artifact",
+            )
+
     def test_architect_cannot_expand_default_contract_into_schema_or_api_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -1498,6 +1516,8 @@ class _SecondaryPolicyEvidenceProvider(_StageProvider):
             "不得處理任何付款或改動 schema。",
             "確認未涉及付款、schema、migration 或 fixture 變更。",
             "在不變更 schema 的前提下維持既有行為。",
+            "No migration artifacts.",
+            "Database migrations are not required.",
         ]
         secondary = {
             **result.data["secondaryReview"],
@@ -1544,6 +1564,28 @@ class _SecondaryMixedPolicyEvidenceProvider(_SecondaryPolicyEvidenceProvider):
             return result
         payload = json.loads(result.data["secondaryReview"]["content"])
         payload["plan"][0] = "本段未涉及 schema，接著新增 migration artifact。"
+        secondary = {
+            **result.data["secondaryReview"],
+            "content": json.dumps(payload, ensure_ascii=False),
+        }
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=result.content,
+            data={**result.data, "secondaryReview": secondary},
+        )
+
+
+class _SecondaryDirectMixedPolicyEvidenceProvider(_SecondaryPolicyEvidenceProvider):
+    def __init__(self, role: str) -> None:
+        super().__init__(role, proposes_change=False)
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "architect":
+            return result
+        payload = json.loads(result.data["secondaryReview"]["content"])
+        payload["plan"][0] = "No migration artifacts, but add one before implementation."
         secondary = {
             **result.data["secondaryReview"],
             "content": json.dumps(payload, ensure_ascii=False),
