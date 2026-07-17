@@ -1064,6 +1064,35 @@ class BoundedDeliveryTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "completed", result)
 
+    def test_primary_read_only_stage_allows_policy_prohibition_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _PrimaryPolicyEvidenceProvider(role, proposes_change=False)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "completed", result)
+
+    def test_primary_read_only_stage_rejects_mixed_policy_proposal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _PrimaryPolicyEvidenceProvider(role, proposes_change=True)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], "pm output contains an unauthorized migration artifact")
+
     def test_secondary_review_still_rejects_positive_policy_proposal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -1479,6 +1508,29 @@ class _SecondaryPolicyEvidenceProvider(_StageProvider):
             success=True,
             content=result.content,
             data={**result.data, "secondaryReview": secondary},
+        )
+
+
+class _PrimaryPolicyEvidenceProvider(_StageProvider):
+    def __init__(self, role: str, *, proposes_change: bool) -> None:
+        super().__init__(role)
+        self.proposes_change = proposes_change
+
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "pm":
+            return result
+        payload = json.loads(result.content)
+        payload["acceptanceCriteria"].append(
+            "Do not implement payment logic or perform any database schema changes."
+            if not self.proposes_change
+            else "Do not make database schema changes, but add a migration artifact."
+        )
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
         )
 
 
