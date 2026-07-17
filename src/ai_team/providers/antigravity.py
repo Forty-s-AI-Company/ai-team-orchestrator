@@ -286,11 +286,18 @@ def _compact_prompt(
         values[key.strip().lower()] = value.strip()
     if autonomous_discovery:
         normalized = (
-            f"{prompt.strip()}\n"
-            f"Runtime challenge={challenge}. Return JSON only with schema='ai-team-bounded-delivery/v1', "
-            "challenge, stage='pm', status='passed', findings=[], tests=[], blockers=[], backlogStatus='task' or "
-            "'ready', summary, and contract when backlogStatus='task'. Use the exact JSON key 'schema'; '$schema' "
-            "is invalid. No Markdown."
+            f"Bounded read-only stage=pm; Challenge={challenge}. "
+            "Return JSON only: schema='ai-team-bounded-delivery/v1', challenge, stage='pm', "
+            "status='passed', findings=[], tests=[], blockers=[]. "
+            "Use the exact JSON key 'schema'; '$schema' is invalid. No Markdown. "
+            "The JSON status MUST be exactly 'passed'; never use it for task state. "
+            "Read the repository only to choose one safe, independently testable next development task; do not edit, "
+            "run migrations or seeds, deploy, process payments, use secrets, touch real customer data, or make external "
+            "account changes. Add top-level backlogStatus='task' or 'ready', a short Chinese summary, and contract when "
+            "backlogStatus='task'. The contract must be schemaVersion=1, use an id beginning auto-, have no dependsOn, "
+            "use safe project-relative allowedWritePaths, and include npm run lint, npm run typecheck, npm run test, and "
+            "npm run build as validationCommands. "
+            f"Autonomous discovery policy: {prompt.strip()}"
         )
     elif isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
         task = values.get("task", "unknown")[:120]
