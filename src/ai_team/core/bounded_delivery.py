@@ -1326,16 +1326,34 @@ def _policy_mentions_are_only_absence_evidence(text: str, pattern: re.Pattern[st
             r"\b(?:but|however|except|then|instead|yet|add|create|generate|write|modify|introduce|implement|apply|execute|run)\b",
             after,
         )
-        english_direct_absence = (
-            re.search(r"\b(?:no|without)\s+(?:(?:new|additional|database|schema|prisma|code)\s+)*$", before)
-            is not None
-            and re.match(r"^\s*(?:artifacts?|changes?|files?|paths?|data)?\b", after) is not None
-            and english_contradiction is None
-        )
+        english_absence_governors = list(re.finditer(r"\b(?:no|without)\b", before))
+        english_direct_absence = False
+        if english_absence_governors:
+            absence_governor = english_absence_governors[-1]
+            scoped_text = before[absence_governor.end():]
+            english_direct_absence = (
+                len(scoped_text) <= 160
+                and re.fullmatch(
+                    r"(?:\s|[,/&-]|\b(?:new|additional|database|schema|prisma|code|api|contract|"
+                    r"changes?|updates?|migrations?|artifacts?|fixture|fake|sample|placeholder|"
+                    r"deterministic|data|and|or|nor)\b)*",
+                    scoped_text,
+                )
+                is not None
+                and english_contradiction is None
+            )
         english_post_absence = (
             re.match(
-                r"^\s*(?:artifacts?|changes?|files?|paths?|data)?\s*(?:are|is|were|was)\s+not\s+"
+                r"^\s*(?:artifacts?|changes?|files?|paths?|data)?\s*(?:(?:are|is|were|was)\s+)?not\s+"
                 r"(?:required|needed|present|included|added|modified|touched|created)\b",
+                after,
+            )
+            is not None
+            and english_contradiction is None
+        )
+        english_false_flag = (
+            re.match(
+                r"^\s*(?:[_\s-]*(?:artifacts?|changes?|files?|paths?|data))?\s*[:=]\s*false\b",
                 after,
             )
             is not None
@@ -1385,6 +1403,7 @@ def _policy_mentions_are_only_absence_evidence(text: str, pattern: re.Pattern[st
             not english_absence
             and not english_direct_absence
             and not english_post_absence
+            and not english_false_flag
             and not english_prohibition
             and not chinese_absence
             and not chinese_prohibition
