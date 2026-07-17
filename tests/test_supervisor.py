@@ -117,7 +117,7 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(qa["details"]["runtimeProvider"], "mock")
             self.assertFalse(qa["details"]["masqueradeAsCodexOrAntigravity"])
 
-    def test_handsfreecode_unavailable_recovery_is_external_required(self) -> None:
+    def test_handsfreecode_unavailable_is_classified_as_retryable_network_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
             root.mkdir()
@@ -140,9 +140,9 @@ class SupervisorTests(unittest.TestCase):
             report = json.loads(summary.report_paths[0].read_text(encoding="utf-8"))
             auto_cycle = next(stage for stage in report["stages"] if stage["name"] == "auto-cycle")
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertTrue(auto_cycle["ok"])
-            self.assertEqual(auto_cycle["details"]["errorType"], "external_required")
-            self.assertEqual(state["nextAction"], "external-required")
+            self.assertFalse(auto_cycle["ok"])
+            self.assertEqual(auto_cycle["details"]["errorType"], "network")
+            self.assertEqual(state["nextAction"], "manual-review")
 
     def test_codex_quota_fallback_uses_ollama_without_masquerade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

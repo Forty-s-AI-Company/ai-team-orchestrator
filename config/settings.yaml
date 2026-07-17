@@ -107,9 +107,9 @@ antigravity:
   executable: "/home/eden/.local/bin/agy"
   status_args: ["models"]
   quota_args: []
-  run_args: ["--model", "Gemini 3.5 Flash (Low)", "--print-timeout", "30s", "--mode", "plan", "--sandbox", "--print"]
-  timeout_seconds: 20
-  run_timeout_seconds: 40
+  run_args: ["--model", "Gemini 3.5 Flash (Low)", "--print-timeout", "120s", "--mode", "plan", "--sandbox", "--print"]
+  timeout_seconds: 45
+  run_timeout_seconds: 180
   execution_enabled: true
   # Bounded delivery preserves complete trusted instructions and fails closed
   # when task scope plus mandatory policy evidence exceeds this hard cap.

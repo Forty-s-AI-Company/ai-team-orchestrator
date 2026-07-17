@@ -262,6 +262,16 @@ class RoleRouterProvider(BaseProvider):
                         reasoning_effort=target.reasoning_effort,
                     )
                 )
+                if selected_cloud_route is not None:
+                    diagnostics = _provider_diagnostics(provider)
+                    unavailable = ProviderResult(
+                        provider=target.provider,
+                        success=False,
+                        error_type=_diagnostic_error_type(diagnostics),
+                        content="selected bounded provider route is not ready",
+                        data={"providerDiagnostics": diagnostics},
+                    )
+                    return self._with_profile_data(unavailable, target, attempts)
                 continue
             routed_request = _request_for_target(request, self.profile, target)
             result = provider.run(routed_request)
@@ -452,6 +462,18 @@ def _provider_diagnostics(provider: BaseProvider) -> dict[str, Any]:
         except Exception as exc:
             return {"provider": provider.name, "ready": False, "error": str(exc)}
     return {"provider": provider.name, "ready": _provider_ready(provider)}
+
+
+def _diagnostic_error_type(diagnostics: dict[str, Any]) -> ProviderErrorType:
+    value = diagnostics.get("errorType")
+    try:
+        if value is not None:
+            return ProviderErrorType(str(value))
+    except ValueError:
+        pass
+    if diagnostics.get("failClosed") is True:
+        return ProviderErrorType.AUTH
+    return ProviderErrorType.EXTERNAL_REQUIRED
 
 
 def _with_route_data(result: ProviderResult, attempts: list[ProviderRouteAttempt]) -> ProviderResult:
