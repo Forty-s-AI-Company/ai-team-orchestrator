@@ -187,7 +187,11 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
     try:
         receipt_payloads = _load_receipt_payloads(context["receipts"])
         context["tokenUsage"] = _recovered_token_usage(receipt_payloads)
-        checkpoints = _recover_stage_checkpoints(receipt_payloads, contract)
+        checkpoints = _recover_stage_checkpoints(
+            receipt_payloads,
+            contract,
+            project_wide_writes=options.trusted_dev.enabled,
+        )
     except BoundedDeliveryError as exc:
         return _stop(options, context, str(exc), "receipt-integrity")
     if context["tokenUsage"] > options.limits.max_token_usage:
@@ -225,8 +229,18 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
         plan = _required_strings(architect, "plan")
         context["plan"] = plan
         context["planAllowedWritePaths"] = _required_strings(architect, "allowedWritePaths")
+        # In explicitly allowlisted trusted-development mode the contract paths
+        # remain useful planning guidance, but they are no longer a hard file
+        # boundary inside the disposable worktree. Candidate-file inspection,
+        # secret checks, validation, and production gates still apply.
+        engineering_write_scope = (
+            None
+            if options.trusted_dev.enabled
+            else tuple(context["planAllowedWritePaths"])
+        )
+        context["trustedDevProjectWideWrites"] = options.trusted_dev.enabled
 
-        repairs = _recover_repairs(prior, task_sha, tuple(context["planAllowedWritePaths"]))
+        repairs = _recover_repairs(prior, task_sha, engineering_write_scope)
         if repairs:
             context["repairs"] = repairs
 
@@ -238,7 +252,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 options,
                 prior,
                 task_sha=task_sha,
-                allowed_write_paths=tuple(context["planAllowedWritePaths"]),
+                allowed_write_paths=engineering_write_scope,
                 expected_commit=evidence["commitSha"],
                 expected_changed_files=evidence["changedFiles"],
                 expected_run_receipt=evidence.get("runReceipt"),
@@ -266,7 +280,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             findings = _findings(qa) + _findings(review)
             if not findings:
                 return _complete(options, context)
-            if not _findings_are_attributable(findings, tuple(context["planAllowedWritePaths"])):
+            if not _findings_are_attributable(findings, engineering_write_scope):
                 return _stop(options, context, "unattributed-or-out-of-scope-finding", "qa-review")
             if len(repairs) >= options.limits.max_repair_attempts:
                 return _stop(options, context, "max-repair-attempts-reached", "qa-review")
@@ -277,7 +291,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 options,
                 prior,
                 task_sha=task_sha,
-                allowed_write_paths=tuple(context["planAllowedWritePaths"]),
+                allowed_write_paths=engineering_write_scope,
                 expected_commit=None,
                 expected_changed_files=prior.get("changedFiles"),
                 expected_run_receipt=prior.get("runReceipt"),
@@ -312,7 +326,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             )
             failure = _engineering_failure(
                 attempt,
-                tuple(context["planAllowedWritePaths"]),
+                engineering_write_scope,
             )
             if not _add_tokens(options, context, attempt.provider_result) and failure is None:
                 failure = ("token-budget-exhausted", "engineer", "policy-validation")
@@ -332,7 +346,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             _write_state(options, "running", "engineer", context)
             if failure is not None:
                 reason, stage, _kind = failure
-                if _is_repairable_validation_failure(failure, attempt, tuple(context["planAllowedWritePaths"])):
+                if _is_repairable_validation_failure(failure, attempt, engineering_write_scope):
                     if len(repairs) >= options.limits.max_repair_attempts:
                         return _stop(options, context, "max-repair-attempts-reached", "validation")
                     repairs.append(_validation_repair_evidence(attempt))
@@ -348,7 +362,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             findings = _findings(qa) + _findings(review)
             if not findings:
                 return _complete(options, context)
-            if not _findings_are_attributable(findings, tuple(context["planAllowedWritePaths"])):
+            if not _findings_are_attributable(findings, engineering_write_scope):
                 return _stop(options, context, "unattributed-or-out-of-scope-finding", "qa-review")
             if len(repairs) >= options.limits.max_repair_attempts:
                 return _stop(options, context, "max-repair-attempts-reached", "qa-review")
@@ -516,7 +530,8 @@ def _default_engineering_executor(
             workspace_allowlist=options.workspace_allowlist, receipt_dir=options.report_dir / "isolated",
             worktree_parent=options.project_path.resolve().parent, dry_run=False, run_mode="run-agent",
             keep_worktree=True, auto_commit=True, commit_message=f"fix: {contract.title}",
-            task_instruction=instruction, allowed_write_paths=list(contract.allowed_write_paths),
+            task_instruction=instruction,
+            allowed_write_paths=(None if options.trusted_dev.enabled else list(contract.allowed_write_paths)),
             validation_commands=[*contract.validation_commands, "git diff --check"], require_validation=True,
             reuse_worktree_path=reusable_worktree,
             trusted_dev=options.trusted_dev,
@@ -642,7 +657,7 @@ def _review_patch_evidence(root: Path, context: dict[str, Any]) -> dict[str, Any
 
 def _engineering_failure(
     attempt: EngineeringAttempt,
-    allowed_write_paths: tuple[str, ...],
+    allowed_write_paths: tuple[str, ...] | None,
 ) -> tuple[str, str, str] | None:
     if not _native_engineer_success(attempt.provider_result):
         return _provider_stop_reason(attempt.provider_result), "engineer", "provider-execution"
@@ -665,7 +680,7 @@ def _engineering_failure(
 def _is_repairable_validation_failure(
     failure: tuple[str, str, str],
     attempt: EngineeringAttempt,
-    allowed_write_paths: tuple[str, ...],
+    allowed_write_paths: tuple[str, ...] | None,
 ) -> bool:
     _reason, stage, kind = failure
     return (
@@ -832,6 +847,8 @@ def _recovered_token_usage(receipts: list[dict[str, Any]]) -> int:
 def _recover_stage_checkpoints(
     receipts: list[dict[str, Any]],
     contract: TrustedTaskContract,
+    *,
+    project_wide_writes: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Recover only fully attested, dependency-ordered stage successes."""
     checkpoints: dict[str, dict[str, Any]] = {}
@@ -855,7 +872,12 @@ def _recover_stage_checkpoints(
         if not (provider_success and validation_success and stop_reason in {None, ""}):
             continue
         try:
-            _accept_stage_checkpoint(checkpoints, receipt, contract)
+            _accept_stage_checkpoint(
+                checkpoints,
+                receipt,
+                contract,
+                project_wide_writes=project_wide_writes,
+            )
         except (BoundedDeliveryError, KeyError, TypeError, ValueError) as exc:
             raise BoundedDeliveryError("receipt-checkpoint-invalid") from exc
     return checkpoints
@@ -865,6 +887,8 @@ def _accept_stage_checkpoint(
     checkpoints: dict[str, dict[str, Any]],
     receipt: dict[str, Any],
     contract: TrustedTaskContract,
+    *,
+    project_wide_writes: bool = False,
 ) -> None:
     stage = receipt["stage"]
     expected_providers = (
@@ -895,7 +919,11 @@ def _accept_stage_checkpoint(
             or not all(isinstance(item, str) and item for item in changed_files)
             or not _paths_within(
                 changed_files,
-                tuple(checkpoints["architect"]["evidence"]["allowedWritePaths"]),
+                (
+                    None
+                    if project_wide_writes
+                    else tuple(checkpoints["architect"]["evidence"]["allowedWritePaths"])
+                ),
             )
         ):
             raise BoundedDeliveryError("engineer checkpoint attestation invalid")
@@ -977,7 +1005,7 @@ def _validate_checkpoint_secondary(
 def _recover_repairs(
     prior: dict[str, Any],
     task_sha: str,
-    allowed_write_paths: tuple[str, ...],
+    allowed_write_paths: tuple[str, ...] | None,
 ) -> list[dict[str, Any]]:
     if prior.get("taskSha") != task_sha or prior.get("repairs") is None:
         return []
@@ -1015,7 +1043,7 @@ def _validated_resume_worktree(
     prior: dict[str, Any],
     *,
     task_sha: str,
-    allowed_write_paths: tuple[str, ...],
+    allowed_write_paths: tuple[str, ...] | None,
     expected_commit: str | None,
     expected_changed_files: Any,
     expected_run_receipt: Any,
@@ -1335,12 +1363,19 @@ def _findings(payload: dict[str, Any]) -> list[dict[str, str]]:
     return normalized
 
 
-def _findings_are_attributable(findings: list[dict[str, str]], allowed: tuple[str, ...]) -> bool:
+def _findings_are_attributable(
+    findings: list[dict[str, str]],
+    allowed: tuple[str, ...] | None,
+) -> bool:
     return all(_paths_within([finding["path"]], allowed) for finding in findings)
 
 
-def _paths_within(paths: list[str], allowed: tuple[str, ...]) -> bool:
-    roots = tuple(Path(item).as_posix().rstrip("/") for item in allowed)
+def _paths_within(paths: list[str], allowed: tuple[str, ...] | None) -> bool:
+    roots = (
+        tuple(Path(item).as_posix().rstrip("/") for item in allowed)
+        if allowed is not None
+        else None
+    )
     normalized: list[str] = []
     for value in paths:
         if not isinstance(value, str):
@@ -1349,14 +1384,29 @@ def _paths_within(paths: list[str], allowed: tuple[str, ...]) -> bool:
         if path.is_absolute() or not value or ".." in path.parts or "." in path.parts:
             return False
         normalized.append(path.as_posix().rstrip("/"))
-    return all(
+    return roots is None or all(
         any(path == root or path.startswith(f"{root}/") for root in roots)
         for path in normalized
     )
 
 
 def _engineering_instruction(context: dict[str, Any], repairs: list[dict[str, Any]]) -> str:
-    return json.dumps({"task": context["task"], "acceptanceCriteria": context["acceptanceCriteria"], "plan": context["plan"], "repairs": repairs}, ensure_ascii=False)
+    project_wide_writes = context.get("trustedDevProjectWideWrites") is True
+    return json.dumps({
+        "task": context["task"],
+        "acceptanceCriteria": context["acceptanceCriteria"],
+        "plan": context["plan"],
+        "repairs": repairs,
+        "executionPolicy": {
+            "trustedDevelopment": project_wide_writes,
+            "writeScope": "entire-disposable-project-worktree" if project_wide_writes else "task-contract-paths",
+            "instruction": (
+                "You may modify any project file needed to complete and validate this task."
+                if project_wide_writes
+                else "Modify only the task contract's allowed write paths."
+            ),
+        },
+    }, ensure_ascii=False)
 
 
 def _schema_or_api_change_allowed(contract: TrustedTaskContract) -> bool:

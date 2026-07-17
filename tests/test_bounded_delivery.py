@@ -256,6 +256,40 @@ class BoundedDeliveryTests(unittest.TestCase):
                 stop_reason="engineering-diff-outside-allowed-paths",
             )
 
+    def test_trusted_dev_allows_project_wide_cross_file_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def cross_file_fix(contract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
+                self.assertIn("entire-disposable-project-worktree", instruction)
+                return EngineeringAttempt(
+                    provider_result=ProviderResult(
+                        provider="codex",
+                        success=True,
+                        content="implementation complete",
+                        data={"tokenUsage": 20},
+                    ),
+                    worktree_path=root,
+                    changed_files=["src/related-action.ts"],
+                    validation={"success": True},
+                    commit_sha="fake-commit",
+                )
+
+            result = run_bounded_delivery(
+                _options(
+                    Path(tmp),
+                    root,
+                    contract_path,
+                    _provider_for_role,
+                    cross_file_fix,
+                    trusted_dev=TrustedDevSettings(enabled=True),
+                )
+            )
+
+            self.assertEqual(result["status"], "completed", result)
+            self.assertEqual(result["changedFiles"], ["src/related-action.ts"])
+
     def test_engineering_commit_missing_receipt_is_not_stage_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -1915,6 +1949,7 @@ def _options(
     engineering_executor,
     *,
     max_token_usage: int = 1000,
+    trusted_dev: TrustedDevSettings = TrustedDevSettings(),
 ) -> BoundedDeliveryOptions:
     def execute_in_project(contract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
         attempt = engineering_executor(contract, instruction, provider, iteration)
@@ -1971,6 +2006,7 @@ def _options(
             max_token_usage=max_token_usage,
             timeout_seconds=30,
         ),
+        trusted_dev=trusted_dev,
         engineering_executor=execute_in_project,
     )
 
