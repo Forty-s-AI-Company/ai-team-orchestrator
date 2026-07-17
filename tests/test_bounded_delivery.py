@@ -1518,6 +1518,9 @@ class _SecondaryPolicyEvidenceProvider(_StageProvider):
             "在不變更 schema 的前提下維持既有行為。",
             "No migration artifacts.",
             "Database migrations are not required.",
+            "No schema/API/migration changes.",
+            "Change policy confirms migration_artifacts=false.",
+            "Database migration not needed.",
         ]
         secondary = {
             **result.data["secondaryReview"],
