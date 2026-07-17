@@ -18,6 +18,7 @@ from ai_team.core.bounded_delivery import (
     run_bounded_delivery,
 )
 from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderRequest, ProviderResult
+from ai_team.core.trusted_dev import TrustedDevSettings
 
 
 class BoundedDeliveryTests(unittest.TestCase):
@@ -934,6 +935,62 @@ class BoundedDeliveryTests(unittest.TestCase):
                 expected_changed_files=["docs/safe.md"],
                 expected_run_receipt=str(run_receipt),
                 expected_executor_receipt=str(executor_receipt),
+                allow_dirty=True,
+            )
+
+            self.assertEqual(resumed, worktree.resolve())
+
+    def test_trusted_resume_accepts_in_scope_partial_initialized_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = _init_project(base / "project")
+            source_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            worktree = base / "resume-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(worktree), source_sha],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            target = worktree / "docs" / "safe.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("partial provider edit\n", encoding="utf-8")
+            contract_path = _write_contract(base, "docs/safe.md")
+            options = BoundedDeliveryOptions(
+                project_path=root,
+                task_contract_path=contract_path,
+                provider_for_role=_provider_for_role,
+                workspace_allowlist=[str(base)],
+                report_dir=base / "reports",
+                state_path=base / "state.json",
+                trusted_dev=TrustedDevSettings(enabled=True),
+            )
+            prior = {
+                "taskSha": "task-sha",
+                "worktreePath": str(worktree.resolve()),
+                "worktreeInitialized": True,
+                "worktreeBaseSha": source_sha,
+                "commitSha": source_sha,
+                "changedFiles": [],
+                "runReceipt": None,
+                "executorReceipt": None,
+            }
+
+            resumed = _validated_resume_worktree(
+                options,
+                prior,
+                task_sha="task-sha",
+                allowed_write_paths=("docs/safe.md",),
+                expected_commit=None,
+                expected_changed_files=[],
+                expected_run_receipt=None,
+                expected_executor_receipt=None,
                 allow_dirty=True,
             )
 

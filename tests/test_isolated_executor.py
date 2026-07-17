@@ -383,6 +383,40 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertEqual(payload["workflow"], "bug-fix-loop")
             self.assertTrue(payload["gitPolicy"]["allowed"], payload["gitPolicy"]["reasons"])
 
+    def test_worktree_ready_callback_runs_before_provider_execution(self) -> None:
+        class CallbackAwareProvider(BaseProvider):
+            name = "callback-aware"
+
+            def ready(self) -> bool:
+                return True
+
+            def run(self, request: ProviderRequest) -> ProviderResult:
+                self.assert_ready(request.project_root)
+                return ProviderResult(provider=self.name, success=True, content="ready")
+
+            def assert_ready(self, root: Path) -> None:
+                if callbacks != [root]:
+                    raise AssertionError("worktree callback did not run before provider")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+            callbacks: list[Path] = []
+
+            result = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=CallbackAwareProvider(),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                on_worktree_ready=callbacks.append,
+            )
+
+            self.assertEqual(callbacks, [result.worktree_path])
+
     def test_isolated_executor_rejects_read_only_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from ai_team.core.git_policy import evaluate_git_action, inspect_candidate_files
@@ -70,6 +70,7 @@ def run_in_disposable_worktree(
     require_validation: bool = False,
     reuse_worktree_path: Path | None = None,
     trusted_dev: TrustedDevSettings = TrustedDevSettings(),
+    on_worktree_ready: Callable[[Path], None] | None = None,
 ) -> IsolatedRunResult:
     source = load_project(source_project_path, allowlist=workspace_allowlist)
     workflow = load_workflow(workflow_name)
@@ -92,6 +93,8 @@ def run_in_disposable_worktree(
             raise ValueError("reused worktree does not belong to the source repository")
     else:
         worktree_path = create_disposable_worktree(source, worktree_parent=worktree_parent)
+    if on_worktree_ready is not None:
+        on_worktree_ready(worktree_path)
     executor_receipt: Path | None = None
     try:
         loaded = load_project(worktree_path, allowlist=workspace_allowlist)

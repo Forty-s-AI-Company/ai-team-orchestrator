@@ -204,6 +204,8 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             "runReceipt",
             "executorReceipt",
             "repairs",
+            "worktreeInitialized",
+            "worktreeBaseSha",
         ):
             if key in prior:
                 context[key] = prior[key]
@@ -284,8 +286,23 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             )
 
         _write_state(options, "running", "engineer", context)
+        def checkpoint_worktree(path: Path) -> None:
+            loaded_worktree = load_project(path, allowlist=options.workspace_allowlist)
+            context.update({
+                "worktreePath": str(path.resolve()),
+                "worktreeInitialized": True,
+                "worktreeBaseSha": loaded_worktree.commit_sha,
+                "commitSha": loaded_worktree.commit_sha,
+                "changedFiles": list_changed_files(loaded_worktree.root),
+                "runReceipt": None,
+                "executorReceipt": None,
+            })
+            _write_state(options, "running", "engineer", context)
+
         engineering_executor = options.engineering_executor or _default_engineering_executor(
-            options, reusable_worktree=reusable_worktree
+            options,
+            reusable_worktree=reusable_worktree,
+            on_worktree_ready=checkpoint_worktree,
         )
         for iteration in range(1, options.limits.max_iterations + 1):
             instruction = _engineering_instruction(context, repairs)
@@ -310,6 +327,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 "validation": attempt.validation,
                 "runReceipt": str(attempt.run_receipt) if attempt.run_receipt else None,
                 "executorReceipt": str(attempt.executor_receipt) if attempt.executor_receipt else None,
+                "worktreeInitialized": False,
             })
             _write_state(options, "running", "engineer", context)
             if failure is not None:
@@ -488,6 +506,7 @@ def _default_engineering_executor(
     options: BoundedDeliveryOptions,
     *,
     reusable_worktree: Path | None = None,
+    on_worktree_ready: Callable[[Path], None] | None = None,
 ) -> Callable[[TrustedTaskContract, str, BaseProvider, int], EngineeringAttempt]:
 
     def execute(contract: TrustedTaskContract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
@@ -501,6 +520,7 @@ def _default_engineering_executor(
             validation_commands=[*contract.validation_commands, "git diff --check"], require_validation=True,
             reuse_worktree_path=reusable_worktree,
             trusted_dev=options.trusted_dev,
+            on_worktree_ready=on_worktree_ready,
         )
         reusable_worktree = result.worktree_path
         validation = result.commit_result.get("validation") or {"success": False}
@@ -1021,6 +1041,28 @@ def _validated_resume_worktree(
             raise ValueError("resume state has invalid changed files")
         if not _paths_within(expected_changed_files, allowed_write_paths):
             raise ValueError("resume state contains out-of-scope changes")
+        initialized_resume = bool(
+            options.trusted_dev.enabled
+            and prior.get("worktreeInitialized") is True
+            and expected_commit is None
+            and allow_dirty
+        )
+        if initialized_resume:
+            base_sha = prior.get("worktreeBaseSha")
+            if (
+                not isinstance(base_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
+                or loaded.commit_sha != base_sha
+                or prior.get("commitSha") != base_sha
+                or expected_run_receipt is not None
+                or expected_executor_receipt is not None
+            ):
+                raise ValueError("initialized worktree state is not bound to its clean base")
+            # The provider may have been interrupted after making an in-scope
+            # partial edit but before it could issue receipts. Trusted-dev may
+            # continue that candidate; normal policy/secret/validation gates
+            # still run before any commit or publication.
+            return path
         for key, value in (
             ("runReceipt", expected_run_receipt),
             ("executorReceipt", expected_executor_receipt),
