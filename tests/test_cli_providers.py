@@ -245,6 +245,45 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("exact JSON key 'schema'", prompt)
         self.assertIn("'$schema' is invalid", prompt)
 
+    def test_antigravity_autonomous_discovery_uses_native_backlog_schema(self) -> None:
+        prompt = _compact_prompt(
+            "Inspect the repository and choose one safe task.",
+            1200,
+            challenge="challenge-auto",
+            autonomous_discovery=True,
+        )
+        request = ProviderRequest(
+            workflow="autonomous-product-discovery",
+            prompt="ignored after compaction",
+            project_root=Path.cwd(),
+            metadata={"writeAccess": False},
+        )
+        result = _validate_response(
+            ProviderResult(
+                provider="antigravity",
+                success=True,
+                content=json.dumps(
+                    {
+                        "schema": "ai-team-autonomous-backlog/v1",
+                        "challenge": "challenge-auto",
+                        "status": "ready",
+                        "summary": "目前沒有可安全自動執行的下一步。",
+                        "findings": [],
+                        "tests": [],
+                        "blockers": [],
+                    }
+                ),
+            ),
+            request,
+            "challenge-auto",
+            None,
+        )
+
+        self.assertIn("schema='ai-team-autonomous-backlog/v1'", prompt)
+        self.assertIn("Runtime challenge=challenge-auto", prompt)
+        self.assertTrue(result.success, result.content)
+        self.assertEqual(result.data["responseSchema"], "ai-team-autonomous-backlog/v1")
+
     def test_antigravity_bounded_review_uses_delivery_schema(self) -> None:
         prompt = _compact_prompt(
             "Task: Review a bounded diff\nInstruction: Inspect only",
@@ -465,6 +504,31 @@ class CliProviderTests(unittest.TestCase):
                     "reviewPatch": review_patch,
                     "reviewPatchSha": hashlib.sha256(review_patch.encode()).hexdigest(),
                 },
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
+        self.assertIn("read-only filesystem sandbox", result.content)
+
+    def test_antigravity_autonomous_discovery_requires_read_only_filesystem_sandbox(self) -> None:
+        provider = AntigravityProvider(
+            AntigravitySettings(
+                executable=sys.executable,
+                status_args=["--version"],
+                quota_args=[],
+                run_args=["-c", "print('must-not-run')"],
+                execution_enabled=True,
+            )
+        )
+
+        result = provider.run(
+            ProviderRequest(
+                workflow="autonomous-product-discovery",
+                prompt="Inspect only.",
+                project_root=Path.cwd(),
+                run_mode="run-agent",
+                metadata={"writeAccess": False},
             )
         )
 

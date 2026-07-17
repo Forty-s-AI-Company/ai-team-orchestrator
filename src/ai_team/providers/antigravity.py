@@ -132,6 +132,7 @@ class AntigravityProvider(BaseProvider):
         workspace_root: Path,
     ) -> ProviderResult:
         bounded_stage = request.metadata.get("boundedStage")
+        autonomous_discovery = request.workflow == "autonomous-product-discovery"
         try:
             prompt = _compact_prompt(
                 request.prompt,
@@ -139,6 +140,7 @@ class AntigravityProvider(BaseProvider):
                 challenge=challenge,
                 probe_path=probe[0] if probe else None,
                 bounded_stage=bounded_stage,
+                autonomous_discovery=autonomous_discovery,
             )
         except ValueError as exc:
             return ProviderResult(
@@ -213,7 +215,9 @@ class AntigravityProvider(BaseProvider):
             ),
             run_timeout_seconds=min(cli_settings.run_timeout_seconds, remaining),
         )
-        if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
+        if autonomous_discovery or (
+            isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}
+        ):
             sandboxed = _read_only_sandbox_settings(
                 cli_settings,
                 self.settings.read_only_sandbox_executable,
@@ -227,7 +231,7 @@ class AntigravityProvider(BaseProvider):
                     provider=self.name,
                     success=False,
                     error_type=ProviderErrorType.INVALID_RESPONSE,
-                    content="bounded Antigravity stage requires a configured read-only filesystem sandbox",
+                    content="read-only Antigravity workflow requires a configured read-only filesystem sandbox",
                     data={
                         "providerNative": True,
                         "boundedStage": bounded_stage,
@@ -272,6 +276,7 @@ def _compact_prompt(
     challenge: str,
     probe_path: str | None = None,
     bounded_stage: Any = None,
+    autonomous_discovery: bool = False,
 ) -> str:
     values: dict[str, str] = {}
     for line in prompt.splitlines():
@@ -279,7 +284,14 @@ def _compact_prompt(
             continue
         key, value = line.split(":", 1)
         values[key.strip().lower()] = value.strip()
-    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
+    if autonomous_discovery:
+        normalized = (
+            f"{prompt.strip()}\n"
+            f"Runtime challenge={challenge}. Return JSON only with schema='ai-team-autonomous-backlog/v1', "
+            "challenge, status='task' or 'ready', summary, findings=[], tests=[], blockers=[], and contract "
+            "when status='task'. Use the exact JSON key 'schema'; '$schema' is invalid. No Markdown."
+        )
+    elif isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
         task = values.get("task", "unknown")[:120]
         instruction = values.get("instruction", "unknown")
         acceptance_criteria = _lossless_json_string_array(
@@ -381,7 +393,9 @@ def _compact_prompt(
     limit = min(8192, max(240, max_chars))
     if len(normalized) <= limit:
         return normalized
-    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
+    if autonomous_discovery or (
+        isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}
+    ):
         raise ValueError("bounded delivery prompt exceeds the configured lossless prompt limit")
     suffix = " [truncated]"
     return f"{normalized[: limit - len(suffix)].rstrip()}{suffix}"
@@ -631,7 +645,10 @@ def _validate_response(
     if not result.success:
         return replace(result, data=base_data)
     bounded_stage = request.metadata.get("boundedStage")
-    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
+    autonomous_discovery = request.workflow == "autonomous-product-discovery"
+    if autonomous_discovery:
+        expected_schema = "ai-team-autonomous-backlog/v1"
+    elif isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
         expected_schema = "ai-team-bounded-delivery/v1"
     else:
         expected_schema = "ai-team-repository-smoke/v1" if request.workflow == "provider-smoke" else "ai-team-antigravity/v1"
@@ -712,7 +729,11 @@ def _payload_is_valid(
         )
     if not isinstance(payload.get("status"), str):
         return False
-    return expected_schema != "ai-team-bounded-delivery/v1" or payload.get("stage") == bounded_stage
+    if expected_schema == "ai-team-bounded-delivery/v1":
+        return payload.get("stage") == bounded_stage
+    if expected_schema == "ai-team-autonomous-backlog/v1":
+        return payload.get("status") in {"task", "ready"}
+    return True
 
 
 def _timeout_result(request: ProviderRequest, diagnostics: dict[str, Any], message: str) -> ProviderResult:
