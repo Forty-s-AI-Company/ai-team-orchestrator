@@ -12,11 +12,21 @@ from ai_team.core.project_loader import LoadedProject
 SECRET_PATTERNS = [
     re.compile(rb"sk-[A-Za-z0-9_\-]{10,}"),
     re.compile(rb"(?i)Bearer\s+[A-Za-z0-9_\-.]+"),
-    re.compile(
-        rb"(?i)(api[_-]?key|token|secret|password|hash[_-]?key|hash[_-]?iv)\s*[:=]\s*"
-        rb"(?!(?:string|number|boolean|unknown|never|any|object|bigint|symbol)\b)([^\s,;]+)"
-    ),
 ]
+
+SECRET_ASSIGNMENT_PATTERN = re.compile(
+    rb"(?i)(api[_-]?key|token|secret|password|hash[_-]?key|hash[_-]?iv)\s*[:=]\s*"
+    rb"(?!(?:string|number|boolean|unknown|never|any|object|bigint|symbol)\b)([^\s,;]+)"
+)
+SAFE_SECRET_PLACEHOLDER_MARKERS = (
+    b"dummy",
+    b"example",
+    b"fake",
+    b"mock",
+    b"placeholder",
+    b"test",
+)
+RUNTIME_VALUE_PATTERN = re.compile(rb"[A-Za-z_$][A-Za-z0-9_$.]*(?:\([^\r\n]*\))?")
 
 RUNTIME_ARTIFACT_MARKERS = {
     ".venv",
@@ -204,4 +214,19 @@ def _contains_candidate_secret(project_root: Path, relative: Path, path: Path) -
             return None
     else:
         return None
-    return any(pattern.search(data) for pattern in SECRET_PATTERNS)
+    if any(pattern.search(data) for pattern in SECRET_PATTERNS):
+        return True
+    return any(_is_secret_assignment(match.group(2)) for match in SECRET_ASSIGNMENT_PATTERN.finditer(data))
+
+
+def _is_secret_assignment(raw_value: bytes) -> bool:
+    """Reject literal secret material while allowing references and explicit test placeholders."""
+    value = raw_value.strip()
+    quoted = len(value) >= 2 and value[:1] in {b'"', b"'", b"`"}
+    normalized = value.strip(b'"\'`').lower()
+    if any(marker in normalized for marker in SAFE_SECRET_PLACEHOLDER_MARKERS):
+        return False
+    runtime_value = value[1:-1].strip() if value.startswith(b"{") and value.endswith(b"}") else value
+    if not quoted and RUNTIME_VALUE_PATTERN.fullmatch(runtime_value):
+        return False
+    return True
