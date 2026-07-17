@@ -61,6 +61,10 @@ def discover_next_task(
                 "writeRequired": False,
                 "writeAccess": False,
                 "projectRevision": revision,
+                # Antigravity natively validates this audited PM envelope;
+                # the backlog-specific fields remain at the envelope's top
+                # level so they cannot disappear inside an optional wrapper.
+                "boundedStage": "pm",
             },
         )
     )
@@ -143,8 +147,9 @@ def _discovery_prompt(revision: str) -> str:
         "The task must be safe for a disposable development worktree and must not require a human business decision.",
         "Never propose production deployment, live payments, secrets, real customer data, destructive actions, or external account changes.",
         "If the project is release-candidate ready or no safe/clear coding task exists, return status=ready.",
-        "Return one JSON object only with schema=ai-team-autonomous-backlog/v1 and the runtime-supplied challenge,",
-        "status=task|ready, a short Chinese summary, and empty findings/tests/blockers arrays.",
+        "Return the provider-native PM envelope with schema=ai-team-bounded-delivery/v1, stage=pm,",
+        "the runtime-supplied challenge, status=passed, and empty findings/tests/blockers arrays.",
+        "Also provide backlogStatus=task|ready and a short Chinese summary at the top level.",
         "For status=task, contract must be a schemaVersion=1 trusted task contract with source.kind=trusted-contract,",
         "a lowercase hyphenated id beginning with auto-, no dependsOn, safe project-relative allowedWritePaths,",
         "and validationCommands containing npm run lint, npm run typecheck, npm run test, and npm run build.",
@@ -160,6 +165,13 @@ def _parse_payload(content: str) -> dict[str, Any]:
         value = json.loads(content)
     except json.JSONDecodeError as exc:
         raise ValueError("autonomous PM did not return JSON") from exc
+    if isinstance(value, dict) and value.get("schema") == "ai-team-bounded-delivery/v1":
+        value = {
+            "schema": SCHEMA,
+            "status": value.get("backlogStatus"),
+            "summary": value.get("summary"),
+            "contract": value.get("contract"),
+        }
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
         raise ValueError("autonomous PM returned an invalid schema")
     status = value.get("status")

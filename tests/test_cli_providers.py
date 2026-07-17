@@ -245,7 +245,7 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("exact JSON key 'schema'", prompt)
         self.assertIn("'$schema' is invalid", prompt)
 
-    def test_antigravity_autonomous_discovery_uses_native_backlog_schema(self) -> None:
+    def test_antigravity_autonomous_discovery_uses_native_pm_schema(self) -> None:
         prompt = _compact_prompt(
             "Inspect the repository and choose one safe task.",
             1200,
@@ -256,7 +256,7 @@ class CliProviderTests(unittest.TestCase):
             workflow="autonomous-product-discovery",
             prompt="ignored after compaction",
             project_root=Path.cwd(),
-            metadata={"writeAccess": False},
+            metadata={"boundedStage": "pm", "writeAccess": False},
         )
         result = _validate_response(
             ProviderResult(
@@ -264,9 +264,11 @@ class CliProviderTests(unittest.TestCase):
                 success=True,
                 content=json.dumps(
                     {
-                        "schema": "ai-team-autonomous-backlog/v1",
+                        "schema": "ai-team-bounded-delivery/v1",
                         "challenge": "challenge-auto",
-                        "status": "ready",
+                        "stage": "pm",
+                        "status": "passed",
+                        "backlogStatus": "ready",
                         "summary": "目前沒有可安全自動執行的下一步。",
                         "findings": [],
                         "tests": [],
@@ -279,10 +281,10 @@ class CliProviderTests(unittest.TestCase):
             None,
         )
 
-        self.assertIn("schema='ai-team-autonomous-backlog/v1'", prompt)
+        self.assertIn("schema='ai-team-bounded-delivery/v1'", prompt)
         self.assertIn("Runtime challenge=challenge-auto", prompt)
         self.assertTrue(result.success, result.content)
-        self.assertEqual(result.data["responseSchema"], "ai-team-autonomous-backlog/v1")
+        self.assertEqual(result.data["responseSchema"], "ai-team-bounded-delivery/v1")
 
     def test_antigravity_bounded_review_uses_delivery_schema(self) -> None:
         prompt = _compact_prompt(

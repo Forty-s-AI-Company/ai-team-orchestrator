@@ -287,9 +287,10 @@ def _compact_prompt(
     if autonomous_discovery:
         normalized = (
             f"{prompt.strip()}\n"
-            f"Runtime challenge={challenge}. Return JSON only with schema='ai-team-autonomous-backlog/v1', "
-            "challenge, status='task' or 'ready', summary, findings=[], tests=[], blockers=[], and contract "
-            "when status='task'. Use the exact JSON key 'schema'; '$schema' is invalid. No Markdown."
+            f"Runtime challenge={challenge}. Return JSON only with schema='ai-team-bounded-delivery/v1', "
+            "challenge, stage='pm', status='passed', findings=[], tests=[], blockers=[], backlogStatus='task' or "
+            "'ready', summary, and contract when backlogStatus='task'. Use the exact JSON key 'schema'; '$schema' "
+            "is invalid. No Markdown."
         )
     elif isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
         task = values.get("task", "unknown")[:120]
@@ -646,10 +647,10 @@ def _validate_response(
         return replace(result, data=base_data)
     bounded_stage = request.metadata.get("boundedStage")
     autonomous_discovery = request.workflow == "autonomous-product-discovery"
-    if autonomous_discovery:
-        expected_schema = "ai-team-autonomous-backlog/v1"
-    elif isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
+    if isinstance(bounded_stage, str) and bounded_stage in {"pm", "architect", "qa", "review"}:
         expected_schema = "ai-team-bounded-delivery/v1"
+    elif autonomous_discovery:
+        expected_schema = "ai-team-autonomous-backlog/v1"
     else:
         expected_schema = "ai-team-repository-smoke/v1" if request.workflow == "provider-smoke" else "ai-team-antigravity/v1"
     matches = [

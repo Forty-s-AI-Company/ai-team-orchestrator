@@ -76,7 +76,33 @@ class AutonomousBacklogTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "task-created", result)
             self.assertEqual(provider.last_request.workflow, "autonomous-product-discovery")
-            self.assertNotIn("boundedStage", provider.last_request.metadata)
+            self.assertEqual(provider.last_request.metadata["boundedStage"], "pm")
+
+    def test_accepts_native_pm_envelope_with_top_level_backlog_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = {
+                "schema": "ai-team-bounded-delivery/v1",
+                "stage": "pm",
+                "status": "passed",
+                "challenge": "runtime-owned",
+                "findings": [],
+                "tests": [],
+                "blockers": [],
+                "backlogStatus": "task",
+                "summary": "補上可驗證的無障礙 smoke 測試。",
+                "contract": _task_payload()["contract"],
+            }
+
+            result = discover_next_task(
+                project_path=root,
+                contract_dir=root / "contracts",
+                state_path=root / "backlog.json",
+                provider=_DiscoveryProvider(payload),
+                timeout_seconds=30,
+            )
+
+            self.assertEqual(result["status"], "task-created", result)
 
     def test_rejects_generated_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
