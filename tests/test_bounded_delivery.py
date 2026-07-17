@@ -1467,6 +1467,8 @@ class _SecondaryPolicyEvidenceProvider(_StageProvider):
             "確認未產生 UI、schema、migration 或 fixture 變更。",
             "確保不涉及付款、schema、migration 或 fixture data。",
             "不得處理任何付款或改動 schema。",
+            "確認未涉及付款、schema、migration 或 fixture 變更。",
+            "在不變更 schema 的前提下維持既有行為。",
         ]
         secondary = {
             **result.data["secondaryReview"],
@@ -1489,7 +1491,7 @@ class _SecondaryMixedPolicyEvidenceProvider(_SecondaryPolicyEvidenceProvider):
         if request.metadata["boundedStage"] != "architect":
             return result
         payload = json.loads(result.data["secondaryReview"]["content"])
-        payload["plan"][0] = "本段不涉及 schema，但接著新增 migration artifact。"
+        payload["plan"][0] = "本段未涉及 schema，接著新增 migration artifact。"
         secondary = {
             **result.data["secondaryReview"],
             "content": json.dumps(payload, ensure_ascii=False),

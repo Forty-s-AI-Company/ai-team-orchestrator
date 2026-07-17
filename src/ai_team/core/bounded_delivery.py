@@ -1321,11 +1321,28 @@ def _policy_mentions_are_only_absence_evidence(text: str, pattern: re.Pattern[st
             re.search(r"(?:未產生|未新增|未修改|未包含|沒有|不含|並未|無)", before) is not None
             and re.search(r"(?:變更|artifact|檔案|路徑|資料)", after) is not None
         )
-        chinese_prohibition = (
-            re.search(r"(?:不涉及|不得(?!不)|不可|禁止|無需)[^。！？；\n]{0,120}$", before)
-            is not None
-            and re.search(r"(?:但|卻|然而|不過|反而)", before) is None
+        chinese_negations = list(
+            re.finditer(
+                r"(?:未(?:涉及|產生|新增|修改|包含|變更|改動|建立|執行)"
+                r"|不(?:涉及|含|變更|改動|新增|修改|產生|建立|執行)"
+                r"|不得(?!不)|不可|禁止|無需)",
+                before,
+            )
         )
+        chinese_prohibition = False
+        if chinese_negations:
+            negation = chinese_negations[-1]
+            scoped_text = before[negation.end():]
+            explicit_governor = negation.group() in {"不得", "不可", "禁止", "無需"}
+            chinese_prohibition = (
+                len(scoped_text) <= 120
+                and re.search(r"(?:但|卻|然而|不過|反而)", scoped_text) is None
+                and (
+                    explicit_governor
+                    or re.search(r"(?:新增|修改|產生|建立|執行|加入|寫入|改動|變更)", scoped_text)
+                    is None
+                )
+            )
         if not english_absence and not chinese_absence and not chinese_prohibition:
             return False
     return True
