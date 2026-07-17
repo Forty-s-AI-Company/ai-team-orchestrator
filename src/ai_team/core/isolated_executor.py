@@ -449,13 +449,13 @@ def prepare_dependency_link(
             # removed packages would remain. Rebuild once, then reuse it for
             # later repair attempts in this disposable worktree.
             shutil.rmtree(target_modules)
-            shutil.copytree(source_modules, target_modules, symlinks=True)
+            _copy_dependency_tree(source_modules, target_modules)
             _write_dependency_copy_marker(target_modules, source_root)
             return target_modules
         # A provider self-check can create an incomplete cache-only node_modules
         # directory. Merge the trusted source dependencies into a private tree
         # so its mere existence cannot suppress dependency preparation.
-        shutil.copytree(source_modules, target_modules, symlinks=True, dirs_exist_ok=True)
+        _copy_dependency_tree(source_modules, target_modules)
         return target_modules
     if os.name == "nt":
         result = subprocess.run(
@@ -471,7 +471,7 @@ def prepare_dependency_link(
             # Next.js Turbopack rejects a top-level node_modules symlink that
             # resolves outside the project root. A private validation copy also
             # prevents generators such as Prisma from mutating primary deps.
-            shutil.copytree(source_modules, target_modules, symlinks=True)
+            _copy_dependency_tree(source_modules, target_modules)
         except Exception:
             if target_modules.exists():
                 shutil.rmtree(target_modules)
@@ -481,6 +481,45 @@ def prepare_dependency_link(
         return target_modules
     target_modules.symlink_to(source_modules, target_is_directory=True)
     return target_modules
+
+
+def _copy_dependency_tree(source_modules: Path, target_modules: Path) -> None:
+    """Create a private dependency tree using the fastest safe local copier."""
+    target_existed = target_modules.exists()
+    if os.name != "nt" and shutil.which("cp"):
+        target_modules.mkdir(parents=True, exist_ok=True)
+        try:
+            completed = subprocess.run(
+                [
+                    "cp",
+                    "-a",
+                    "--reflink=auto",
+                    f"{source_modules}/.",
+                    str(target_modules),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            if not target_existed and target_modules.exists():
+                shutil.rmtree(target_modules)
+            raise
+        if completed.returncode == 0:
+            return
+        if not target_existed and target_modules.exists():
+            shutil.rmtree(target_modules)
+        raise OSError(
+            f"dependency copy failed with exit code {completed.returncode}: "
+            f"{str(redact_secrets(completed.stderr))[-2000:]}"
+        )
+    shutil.copytree(
+        source_modules,
+        target_modules,
+        symlinks=True,
+        dirs_exist_ok=True,
+    )
 
 
 def _dependency_fingerprint(source_root: Path) -> str:
