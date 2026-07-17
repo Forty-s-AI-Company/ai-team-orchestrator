@@ -284,6 +284,7 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("schema='ai-team-bounded-delivery/v1'", prompt)
         self.assertIn("Challenge=challenge-auto", prompt)
         self.assertIn("JSON status MUST be exactly 'passed'", prompt)
+        self.assertIn("non-empty id, title, instruction", prompt)
         self.assertTrue(result.success, result.content)
         self.assertEqual(result.data["responseSchema"], "ai-team-bounded-delivery/v1")
 

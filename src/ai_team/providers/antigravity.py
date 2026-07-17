@@ -295,7 +295,8 @@ def _compact_prompt(
             "run migrations or seeds, deploy, process payments, use secrets, touch real customer data, or make external "
             "account changes. Add top-level backlogStatus='task' or 'ready', a short Chinese summary, and contract when "
             "backlogStatus='task'. The contract must be schemaVersion=1, use an id beginning auto-, have no dependsOn, "
-            "use safe project-relative allowedWritePaths, and include npm run lint, npm run typecheck, npm run test, and "
+            "and include non-empty id, title, instruction, allowedWritePaths, validationCommands, and changePolicy. "
+            "Use safe project-relative allowedWritePaths and include npm run lint, npm run typecheck, npm run test, and "
             "npm run build as validationCommands. "
             f"Autonomous discovery policy: {prompt.strip()}"
         )
