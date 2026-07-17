@@ -298,7 +298,16 @@ class RoleRouterProvider(BaseProvider):
                 break
             if write_required:
                 return self._with_profile_data(result, target, attempts)
-            if result.error_type not in self._FALLBACK_ERRORS:
+            # Autonomous backlog discovery has no write capability and its
+            # output is validated again as a trusted task contract. A model's
+            # malformed planning envelope is therefore safe to retry on the
+            # role's declared fallback; ordinary delivery stages remain
+            # fail-closed on invalid responses.
+            autonomous_invalid_response = (
+                request.workflow == "autonomous-product-discovery"
+                and result.error_type == ProviderErrorType.INVALID_RESPONSE
+            )
+            if result.error_type not in self._FALLBACK_ERRORS and not autonomous_invalid_response:
                 return self._with_profile_data(result, target, attempts)
 
         if selected_target is None or selected_result is None:

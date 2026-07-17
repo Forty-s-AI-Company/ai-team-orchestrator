@@ -256,6 +256,38 @@ class RouterProviderTests(unittest.TestCase):
         self.assertEqual(result.error_type, ProviderErrorType.INVALID_RESPONSE)
         self.assertEqual(fallback.requests, [])
 
+    def test_role_router_falls_back_on_invalid_autonomous_backlog_response(self) -> None:
+        fallback = _RecordingProvider("codex", _result("codex", True))
+        router = RoleRouterProvider(
+            RoleRoutingProfile(
+                role="product-manager",
+                primary=RouteTarget("antigravity", "Gemini 3.5 Flash (High)", "high"),
+                fallbacks=(RouteTarget("codex", "gpt-5.6-terra", "medium"),),
+            ),
+            {
+                "antigravity": _StaticProvider(
+                    "antigravity",
+                    ready=True,
+                    result=_result("antigravity", False, ProviderErrorType.INVALID_RESPONSE),
+                ),
+                "codex": fallback,
+            },
+        )
+
+        result = router.run(
+            ProviderRequest(
+                workflow="autonomous-product-discovery",
+                prompt="read only",
+                project_root=Path.cwd(),
+                metadata={"writeRequired": False, "writeAccess": False},
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "codex")
+        self.assertTrue(result.data["fallbackUsed"])
+        self.assertEqual(len(fallback.requests), 1)
+
     def test_role_router_preserves_quota_failure_when_no_fallback_succeeds(self) -> None:
         router = RoleRouterProvider(
             RoleRoutingProfile(
