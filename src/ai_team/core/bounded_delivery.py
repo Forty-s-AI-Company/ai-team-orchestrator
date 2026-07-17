@@ -1165,8 +1165,8 @@ def _validate_secondary_review(
         if not tests:
             raise BoundedDeliveryError(f"{failure_prefix}-tests-missing")
     _findings(payload)
-    _reject_forbidden(
-        json.dumps(payload, ensure_ascii=False),
+    _reject_forbidden_review_payload(
+        payload,
         f"{stage} {provider} review",
         contract,
     )
@@ -1213,19 +1213,117 @@ def _schema_or_api_change_allowed(contract: TrustedTaskContract) -> bool:
     return contract.change_policy.schema_changes or contract.change_policy.api_contract_changes
 
 
-def _reject_forbidden(value: str, label: str, contract: TrustedTaskContract | None = None) -> None:
+def _reject_forbidden(
+    value: str,
+    label: str,
+    contract: TrustedTaskContract | None = None,
+    *,
+    allow_negated_review_evidence: bool = False,
+) -> None:
     lowered = value.lower()
     if any(re.search(pattern, lowered) for pattern in FORBIDDEN_PATTERNS):
         raise PolicyValidationError(f"{label} contains a prohibited action or product-contract change")
     policy = contract.change_policy if contract is not None else TaskChangePolicy()
-    if MIGRATION_ARTIFACT_PATTERN.search(lowered) and not policy.migration_artifacts:
+    if (
+        MIGRATION_ARTIFACT_PATTERN.search(lowered)
+        and not policy.migration_artifacts
+        and not (
+            allow_negated_review_evidence
+            and _policy_mentions_are_only_absence_evidence(lowered, MIGRATION_ARTIFACT_PATTERN)
+        )
+    ):
         raise PolicyValidationError(f"{label} contains an unauthorized migration artifact")
-    if SCHEMA_CHANGE_PATTERN.search(lowered) and not policy.schema_changes:
+    if (
+        SCHEMA_CHANGE_PATTERN.search(lowered)
+        and not policy.schema_changes
+        and not (
+            allow_negated_review_evidence
+            and _policy_mentions_are_only_absence_evidence(lowered, SCHEMA_CHANGE_PATTERN)
+        )
+    ):
         raise PolicyValidationError(f"{label} contains an unauthorized schema change")
-    if API_CONTRACT_CHANGE_PATTERN.search(lowered) and not policy.api_contract_changes:
+    if (
+        API_CONTRACT_CHANGE_PATTERN.search(lowered)
+        and not policy.api_contract_changes
+        and not (
+            allow_negated_review_evidence
+            and _policy_mentions_are_only_absence_evidence(lowered, API_CONTRACT_CHANGE_PATTERN)
+        )
+    ):
         raise PolicyValidationError(f"{label} contains an unauthorized API contract change")
-    if FIXTURE_DATA_PATTERN.search(lowered) and not policy.fixture_data:
+    if (
+        FIXTURE_DATA_PATTERN.search(lowered)
+        and not policy.fixture_data
+        and not (
+            allow_negated_review_evidence
+            and _policy_mentions_are_only_absence_evidence(lowered, FIXTURE_DATA_PATTERN)
+        )
+    ):
         raise PolicyValidationError(f"{label} contains unauthorized fixture data")
+
+
+def _reject_forbidden_review_payload(
+    payload: Any,
+    label: str,
+    contract: TrustedTaskContract,
+) -> None:
+    """Validate every review string while allowing narrow absence assertions.
+
+    Independent reviewers commonly cite scope evidence such as "no migration
+    changes are present". That sentence is evidence that the deny-by-default
+    policy held, not a request to create the artifact. Positive proposals,
+    mixed statements, and prohibited actions still fail closed.
+    """
+    for value in _iter_string_values(payload):
+        _reject_forbidden(
+            value,
+            label,
+            contract,
+            allow_negated_review_evidence=True,
+        )
+
+
+def _iter_string_values(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_string_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_string_values(item)
+
+
+def _policy_mentions_are_only_absence_evidence(text: str, pattern: re.Pattern[str]) -> bool:
+    sentence_boundaries = ".!?;\n。！？；"
+    for match in pattern.finditer(text):
+        start = max(text.rfind(boundary, 0, match.start()) for boundary in sentence_boundaries) + 1
+        ends = [text.find(boundary, match.end()) for boundary in sentence_boundaries]
+        end = min((position for position in ends if position >= 0), default=len(text))
+        before = text[start:match.start()]
+        after = text[match.end():end]
+        english_absence = (
+            re.search(r"\b(?:no|without)\b", before) is not None
+            and (
+                re.search(
+                    r"\b(?:changes?|artifacts?|files?|paths?|data)\b.{0,40}\b(?:are|is|were|was)?\s*(?:present|included|added|modified|touched|created)\b",
+                    after,
+                )
+                is not None
+                or re.search(
+                    r"^\s*(?:are|is|were|was)\s+(?:present|included|added|modified|touched|created)\b",
+                    after,
+                )
+                is not None
+            )
+        )
+        chinese_absence = (
+            re.search(r"(?:未產生|未新增|未修改|未包含|沒有|不含|並未|無)", before) is not None
+            and re.search(r"(?:變更|artifact|檔案|路徑|資料)", after) is not None
+        )
+        if not english_absence and not chinese_absence:
+            return False
+    return True
 
 
 def _validate_stage_structure(stage: str, payload: Any) -> None:
