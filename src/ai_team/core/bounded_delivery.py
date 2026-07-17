@@ -1321,7 +1321,12 @@ def _policy_mentions_are_only_absence_evidence(text: str, pattern: re.Pattern[st
             re.search(r"(?:未產生|未新增|未修改|未包含|沒有|不含|並未|無)", before) is not None
             and re.search(r"(?:變更|artifact|檔案|路徑|資料)", after) is not None
         )
-        if not english_absence and not chinese_absence:
+        chinese_prohibition = (
+            re.search(r"(?:不涉及|不得(?!不)|不可|禁止|無需)[^。！？；\n]{0,120}$", before)
+            is not None
+            and re.search(r"(?:但|卻|然而|不過|反而)", before) is None
+        )
+        if not english_absence and not chinese_absence and not chinese_prohibition:
             return False
     return True
 
