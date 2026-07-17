@@ -122,15 +122,19 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 )
                 _write_json(options.state_path, state)
                 return state
-            selected = next((entry for entry in entries if entry.task_sha not in completed), None)
+            blocked_tasks = _blocked_tasks(entries, completed)
+            selected = _next_ready_contract(entries, completed)
             if selected is None:
+                pending_count = _pending_count(entries, completed)
                 state = _supervisor_state(
                     prior,
                     cycles,
-                    "idle",
+                    "idle" if pending_count == 0 else "attention-required",
                     completed,
-                    queue_size=0,
-                    next_action="watch-contract-directory",
+                    queue_size=pending_count,
+                    stop_reason="dependency-resolution-stalled" if pending_count else None,
+                    next_action="watch-contract-directory" if pending_count == 0 else "manual-review-required",
+                    blocked_tasks=blocked_tasks,
                 )
                 _write_json(options.state_path, state)
                 if _must_stop(options, started):
@@ -240,6 +244,7 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 current=selected,
                 next_action="bounded-delivery",
                 cloud_resilience=cloud_recovery.as_dict() if cloud_recovery else None,
+                blocked_tasks=blocked_tasks,
             )
             _write_json(options.state_path, running)
             try:
@@ -451,6 +456,7 @@ def discover_contracts(contract_dir: Path) -> list[ContractEntry]:
             raise ValueError(f"duplicate trusted task id: {contract.id}")
         ids.add(contract.id)
         entries.append(ContractEntry(resolved, contract, task_sha))
+    _validate_contract_dependencies(entries)
     return entries
 
 
@@ -609,6 +615,7 @@ def _supervisor_state(
     provider_backoff: dict[str, Any] | None = None,
     cloud_resilience: dict[str, Any] | None = None,
     continuity: dict[str, Any] | None = None,
+    blocked_tasks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         # Version 2 adds cloudResilience and continuity while readers continue
@@ -625,12 +632,16 @@ def _supervisor_state(
                 "id": current.contract.id,
                 "taskSha": current.task_sha,
                 "contractPath": str(current.path),
+                "dependsOn": list(current.contract.depends_on),
             }
             if current
             else None
         ),
         "stopReason": stop_reason,
         "nextAction": next_action,
+        "blockedTasks": redact_secrets(
+            blocked_tasks if blocked_tasks is not None else prior.get("blockedTasks", [])
+        ),
         "delivery": _result_summary(delivery_result),
         "publication": publication,
         "diagnostic": diagnostic,
@@ -906,6 +917,67 @@ def _sync_primary(project_path: Path, branch: str | None) -> str:
 def _slug(value: str) -> str:
     safe = "".join(character.lower() if character.isalnum() else "-" for character in value)
     return "-".join(part for part in safe.split("-") if part)[:80] or "task"
+
+
+def _validate_contract_dependencies(entries: list[ContractEntry]) -> None:
+    by_id = {entry.contract.id: entry for entry in entries}
+    for entry in entries:
+        missing = [dependency for dependency in entry.contract.depends_on if dependency not in by_id]
+        if missing:
+            raise ValueError(
+                f"trusted task contract {entry.contract.id} has unknown dependencies: {', '.join(missing)}"
+            )
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(task_id: str) -> None:
+        if task_id in visiting:
+            raise ValueError("trusted task contract dependencies contain a cycle")
+        if task_id in visited:
+            return
+        visiting.add(task_id)
+        for dependency in by_id[task_id].contract.depends_on:
+            visit(dependency)
+        visiting.remove(task_id)
+        visited.add(task_id)
+
+    for task_id in by_id:
+        visit(task_id)
+
+
+def _completed_contract_ids(entries: list[ContractEntry], completed: set[str]) -> set[str]:
+    return {entry.contract.id for entry in entries if entry.task_sha in completed}
+
+
+def _next_ready_contract(entries: list[ContractEntry], completed: set[str]) -> ContractEntry | None:
+    completed_ids = _completed_contract_ids(entries, completed)
+    return next(
+        (
+            entry
+            for entry in entries
+            if entry.task_sha not in completed
+            and set(entry.contract.depends_on).issubset(completed_ids)
+        ),
+        None,
+    )
+
+
+def _blocked_tasks(entries: list[ContractEntry], completed: set[str]) -> list[dict[str, Any]]:
+    completed_ids = _completed_contract_ids(entries, completed)
+    return [
+        {
+            "id": entry.contract.id,
+            "taskSha": entry.task_sha,
+            "dependsOn": list(entry.contract.depends_on),
+            "unmetDependencies": [
+                dependency for dependency in entry.contract.depends_on if dependency not in completed_ids
+            ],
+        }
+        for entry in entries
+        if entry.task_sha not in completed
+        and not set(entry.contract.depends_on).issubset(completed_ids)
+    ]
 
 
 def _pending_count(entries: list[ContractEntry], completed: set[str]) -> int:

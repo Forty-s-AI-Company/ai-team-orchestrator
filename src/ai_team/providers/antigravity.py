@@ -289,6 +289,18 @@ def _compact_prompt(
         )
         allowed_paths = _compact_json_array(values.get("allowed write paths", "[]"), max_chars=220)
         validation_commands = _compact_json_array(values.get("validation commands", "[]"), max_chars=280)
+        change_policy = values.get("change policy", "{}")
+        try:
+            parsed_change_policy = json.loads(change_policy)
+        except json.JSONDecodeError:
+            parsed_change_policy = {}
+        schema_or_api_allowed = bool(
+            isinstance(parsed_change_policy, dict)
+            and (
+                parsed_change_policy.get("schema_changes") is True
+                or parsed_change_policy.get("api_contract_changes") is True
+            )
+        )
         implementation_evidence = _compact_implementation_evidence(
             values.get("implementation evidence", "{}")
         )
@@ -302,7 +314,12 @@ def _compact_prompt(
                 "Do not inspect the repository, execute the task, or call tools. "
                 "Produce only a bounded plan from the trusted task and acceptance criteria. "
                 "Include non-empty plan, allowedWritePaths, validationCommands arrays and "
-                "schemaOrApiChange=false. Do not expand paths or commands beyond the task."
+                + (
+                    "a boolean schemaOrApiChange that may be true only for the authorized ChangePolicy. "
+                    if schema_or_api_allowed
+                    else "schemaOrApiChange=false. "
+                )
+                + "Do not expand paths or commands beyond the task."
             ),
             "qa": (
                 "Read the exact patch at reviewEvidence.path with the read_file tool, never a command tool; "
@@ -319,9 +336,9 @@ def _compact_prompt(
                 "Return JSON only: schema='ai-team-bounded-delivery/v1', challenge, stage, "
                 "status='passed', findings=[], tests=['evidence citation'], blockers=[]. "
                 "Use the exact JSON key 'schema'; '$schema' is invalid. No Markdown. "
-                "Forbidden: edit, shell, migrate, seed, deploy, payment, secrets, delete, schema/API change. "
+                "Forbidden: edit, shell, execute migration or seed, deploy, payment, secrets, delete, or changes beyond ChangePolicy. "
                 f"{stage_requirements} Findings may be empty only when all criteria pass. "
-                f"Instruction={instruction}; AcceptanceCriteria={acceptance_criteria}; "
+                f"Instruction={instruction}; ChangePolicy={change_policy}; AcceptanceCriteria={acceptance_criteria}; "
                 f"AllowedWritePaths={_compact_json_array(allowed_paths, max_chars=140)}; "
                 f"ValidationCommands={_compact_json_array(validation_commands, max_chars=180)}; "
                 f"ImplementationEvidence={implementation_evidence}."
@@ -333,8 +350,8 @@ def _compact_prompt(
                 "status='passed', findings=[], tests=[], blockers=[]. "
                 "Use the exact JSON key 'schema'; '$schema' is invalid. No Markdown. "
                 "findings and blockers MUST be exactly []; never restate required work as a finding or blocker. "
-                "Forbidden: edit, shell, migrate, seed, deploy, payment, secrets, data deletion, schema/API changes. "
-                f"{stage_requirements} Task={task}; Instruction={instruction}; "
+                "Forbidden: edit, shell, execute migration or seed, deploy, payment, secrets, data deletion, or changes beyond ChangePolicy. "
+                f"{stage_requirements} Task={task}; Instruction={instruction}; ChangePolicy={change_policy}; "
                 f"AllowedWritePaths={allowed_paths}; ValidationCommands={validation_commands}; "
                 f"ImplementationEvidence={implementation_evidence}."
             )

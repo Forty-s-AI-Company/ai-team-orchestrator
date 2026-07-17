@@ -317,6 +317,24 @@ class CliProviderTests(unittest.TestCase):
         self.assertIn("Produce only a bounded plan", prompt)
         self.assertIn("schemaOrApiChange=false", prompt)
 
+    def test_antigravity_architect_prompt_preserves_authorized_change_policy(self) -> None:
+        prompt = _compact_prompt(
+            "\n".join(
+                (
+                    "Task: Implement an approved data slice",
+                    "Instruction: Add the approved schema and API code",
+                    'Change policy: {"schema_changes": true, "api_contract_changes": true, "migration_artifacts": true, "fixture_data": true}',
+                )
+            ),
+            1800,
+            challenge="challenge-authorized-change",
+            bounded_stage="architect",
+        )
+
+        self.assertIn("may be true only for the authorized ChangePolicy", prompt)
+        self.assertIn('ChangePolicy={"schema_changes": true', prompt)
+        self.assertNotIn("schemaOrApiChange=false", prompt)
+
     def test_antigravity_bounded_prompts_preserve_the_complete_instruction(self) -> None:
         instruction = "Begin exact contract. " + ("bounded detail " * 40) + "TAIL_REQUIREMENT_MUST_SURVIVE"
         source = "\n".join(

@@ -646,8 +646,10 @@ read-only Codex second opinion), Codex Engineer in a disposable worktree,
 deterministic validation plus `git diff --check`, Antigravity delivery QA, and
 Codex review (with optional Antigravity second opinion). It records a redacted
 receipt per stage and never itself invokes GitHub publication, migration, seed,
-deploy, payment, secret, destructive-data, schema/API-contract, or force-push
-actions. The continuous supervisor may publish only after that cycle completes
+deploy, payment, secret, destructive-data, or force-push actions. Schema/API
+code changes, migration artifacts, and deterministic fixture data remain denied
+unless the trusted contract explicitly opts into the exact code-only change
+type. The continuous supervisor may publish only after that cycle completes
 with deterministic evidence and all GitHub gates pass.
 
 Start with exactly one cycle. `--execute` and `--once` select the single-task
@@ -662,7 +664,14 @@ cat > /tmp/trusted-task.json <<'JSON'
   "source": {"kind": "github-issue", "reference": "owner/repo#123"},
   "instruction": "Implement only the documented issue acceptance criteria.",
   "allowedWritePaths": ["src/example.ts", "src/example.test.ts"],
-  "validationCommands": ["npm run lint", "npm run typecheck", "npm run test", "npm run build"]
+  "validationCommands": ["npm run lint", "npm run typecheck", "npm run test", "npm run build"],
+  "dependsOn": [],
+  "changePolicy": {
+    "schemaChanges": false,
+    "apiContractChanges": false,
+    "migrationArtifacts": false,
+    "fixtureData": false
+  }
 }
 JSON
 
@@ -691,9 +700,12 @@ ai-team supervise /home/eden/projects/CelebrateDeal \
   --max-token-usage 180000 --stage-timeout-seconds 300
 ```
 
-The supervisor processes `*.json` contracts in filename order, records each
-completed task SHA, and watches the directory for new work without rerunning an
-unchanged contract. Each successful task must retain its bounded-delivery
+The supervisor processes dependency-ready `*.json` contracts in filename order,
+records each completed task SHA, exposes unmet `dependsOn` edges in
+`blockedTasks`, and watches the directory for new work without rerunning an
+unchanged contract. Unknown dependencies and dependency cycles stop fail closed.
+This allows a complete Epic backlog—including blocked UI work—to remain visible
+before its data and API prerequisites finish. Each successful task must retain its bounded-delivery
 receipt and deterministic validation hash before the GitHub executor may push,
 open a PR, wait for CI, merge, and fast-forward the clean primary worktree.
 Provider timeouts and network failures are retried after the configured
@@ -704,6 +716,14 @@ remain in supervisor state, so restarting the process cannot bypass the wait.
 Invalid contracts, unsafe findings, other provider failures, failed CI,
 publication evidence mismatches, or dirty primary state stop fail closed with
 an `attention-required` state.
+
+`changePolicy` is deny-by-default. `schemaChanges` is required before
+`prisma/schema.prisma` may be in scope; `migrationArtifacts` additionally permits
+tracked migration files but never permits running them; `apiContractChanges`
+permits an Architect to attest a bounded API contract change; and `fixtureData`
+records authorization for deterministic non-production test/demo data. Actual
+migration or seed execution, deployment, real payment, secret access, and
+destructive operations remain prohibited regardless of these flags.
 
 Quota responses are returned after the first provider-native attempt. They are
 not retried immediately inside the same stage; the continuous supervisor owns
