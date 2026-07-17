@@ -19,7 +19,7 @@ handsfreecode:
   session_key_file: "~/.handsfreecode/session-api-key.txt"
   ready_path: "/ready"
   task_run_path: "/api/tasks/run"
-  timeout_seconds: 30
+  timeout_seconds: 1200
   default_runtime_provider: "ollama"
   allowed_models: ["qwen2.5-coder:7b"]
   # Ollama qwen2.5-coder:7b has no provider-native reasoning-effort switch.
@@ -40,7 +40,7 @@ codex:
   timeout_seconds: 45
   # High-reasoning write cycles need enough time to inspect, edit, and verify
   # a bounded diff; outer delivery limits still cap iterations and token use.
-  run_timeout_seconds: 600
+  run_timeout_seconds: 1200
   execution_enabled: true
   # Exact names exposed by the installed WSL Codex CLI. Profiles may select
   # only these names and the four audited reasoning levels below.
@@ -55,8 +55,8 @@ codex:
   allowed_reasoning_efforts: ["low", "medium", "high", "xhigh"]
 
 # The bounded delivery supervisor owns retry and fallback decisions for the
-# Engineer.  Do not add a cross-provider write fallback here: all three routes
-# remain the audited WSL Codex CLI in the same disposable worktree policy.
+# Engineer. Each selected route still runs alone inside the same disposable
+# worktree policy; HandsFreeCode/Ollama is the last local fallback.
 providers:
   codex_engineer:
     models:
@@ -69,6 +69,10 @@ providers:
       - name: "gpt-5.6-luna"
         reasoning: medium
         priority: 60
+      - provider: handsfreecode
+        name: "qwen2.5-coder:7b"
+        reasoning: default
+        priority: 40
     retry:
       max_attempts_per_model: 2
       initial_delay_seconds: 60
@@ -126,7 +130,8 @@ antigravity:
 
 routing:
   # Role profiles are deliberately explicit. Automatic routes never include
-  # OpenHands or mock, and write workflows never cross-provider fallback.
+  # OpenHands or mock. Write fallback is selected only by the persistent
+  # bounded supervisor, never implicitly inside a provider call.
   roles:
     product-manager:
       primary:
@@ -168,6 +173,9 @@ routing:
         - provider: codex
           model: "gpt-5.6-luna"
           reasoning_effort: medium
+        - provider: handsfreecode
+          model: "qwen2.5-coder:7b"
+          reasoning_effort: default
       allow_write: true
 
     reviewer:

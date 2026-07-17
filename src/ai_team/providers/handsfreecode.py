@@ -113,10 +113,16 @@ class HandsFreeCodeProvider(BaseProvider):
 
         ready_result = self.diagnostics()
         if not ready_result.get("ready"):
+            diagnostics_error = ready_result.get("errorType")
+            error_type = (
+                diagnostics_error
+                if isinstance(diagnostics_error, ProviderErrorType)
+                else ProviderErrorType.EXTERNAL_REQUIRED
+            )
             return ProviderResult(
                 provider=self.name,
                 success=False,
-                error_type=ProviderErrorType.EXTERNAL_REQUIRED,
+                error_type=error_type,
                 content=str(ready_result.get("message") or "HandsFreeCode is not ready"),
                 data={
                     "runMode": request.run_mode,
@@ -161,7 +167,10 @@ class HandsFreeCodeProvider(BaseProvider):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(http_request, timeout=request.timeout_seconds) as response:
+            with urllib.request.urlopen(
+                http_request,
+                timeout=request.timeout_seconds or self.settings.timeout_seconds,
+            ) as response:
                 response_body = response.read().decode("utf-8", errors="replace")
                 data = _decode_json(response_body)
                 ids = _extract_ids(data)
@@ -228,14 +237,19 @@ class HandsFreeCodeProvider(BaseProvider):
         return f"{base}{suffix}"
 
     def _task_payload(self, request: ProviderRequest) -> dict[str, Any]:
+        write_access = bool(
+            request.run_mode == "run-agent"
+            and request.metadata.get("writeRequired") is True
+            and request.metadata.get("writeAccess") is True
+        )
         return {
             "projectPath": str(request.project_root),
             "workflow": request.workflow,
             "prompt": _safe_prompt_for_runtime(request.prompt),
             "provider": self.settings.default_runtime_provider,
             "mode": request.run_mode,
-            "maxIterations": 1,
-            "writeAccess": False,
+            "maxIterations": 2 if write_access else 1,
+            "writeAccess": write_access,
             "metadata": {
                 **request.metadata,
                 "source": "ai-team-orchestrator",

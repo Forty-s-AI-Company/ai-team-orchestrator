@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from ai_team.core.project_loader import LoadedProject
+
 
 ALLOWED_TEST_DATABASE_COMMANDS = {"npm run db:migrate:deploy"}
 LOOPBACK_DATABASE_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -89,6 +91,23 @@ def validate_test_database_url(url: str, settings: TestDatabaseSettings) -> None
         for suffix in settings.required_database_suffixes
     ):
         raise ValueError("trusted-dev database name must end in an approved development/test suffix")
+
+
+def validate_trusted_dev_project(project: LoadedProject) -> None:
+    safety = project.profile.safety
+    if project.profile.project.stage != "development":
+        raise ValueError("trusted-dev-autopilot requires project.stage=development")
+    if any((
+        safety.allow_deploy,
+        safety.allow_database_migration,
+        safety.allow_database_seed,
+        safety.allow_destructive_commands,
+    )):
+        raise ValueError(
+            "trusted-dev-autopilot requires deploy, production database, seed, and destructive permissions to remain disabled"
+        )
+    if not safety.require_disposable_worktree_for_writes:
+        raise ValueError("trusted-dev-autopilot requires disposable worktrees for writes")
 
 
 def _test_database_settings(raw: dict[str, Any]) -> TestDatabaseSettings:

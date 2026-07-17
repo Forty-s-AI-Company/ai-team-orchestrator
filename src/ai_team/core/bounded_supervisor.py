@@ -30,6 +30,7 @@ from ai_team.core.bounded_delivery import (
 from ai_team.core.ci_monitor import monitor_pull_request
 from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action
 from ai_team.core.project_loader import load_project
+from ai_team.core.trusted_dev import TrustedDevSettings
 from ai_team.providers.base import BaseProvider, redact_secrets
 
 
@@ -71,6 +72,7 @@ class ContinuousBoundedOptions:
     cloud_routes: tuple[CloudModelRoute, ...] = ()
     cloud_retry: RetrySettings = RetrySettings()
     local_continuity: LocalContinuitySettings = LocalContinuitySettings()
+    trusted_dev: TrustedDevSettings = TrustedDevSettings()
     delivery_runner: Callable[[BoundedDeliveryOptions], dict[str, Any]] = run_bounded_delivery
     publisher: Callable[["ContinuousBoundedOptions", ContractEntry, dict[str, Any]], dict[str, Any]] | None = None
     sleeper: Callable[[float], None] = time.sleep
@@ -84,6 +86,10 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
     _acquire_lock(lock_path)
     started = options.monotonic()
     cycles = 0
+    prior: dict[str, Any] = {}
+    completed: set[str] = set()
+    entries: list[ContractEntry] = []
+    selected: ContractEntry | None = None
     try:
         while True:
             cycles += 1
@@ -261,6 +267,7 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                         report_dir=task_dir / "receipts",
                         state_path=task_state,
                         limits=options.limits,
+                        trusted_dev=options.trusted_dev,
                     )
                 )
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
@@ -406,6 +413,13 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                     options.sleeper(options.interval_minutes * 60)
                     continue
 
+            cleanup = (
+                cleanup_completed_worktree(options, effective_result)
+                if publication is not None and publication.get("success") is True
+                else {"attempted": False, "success": True, "reason": "publication-not-completed"}
+            )
+            if publication is not None:
+                publication = {**publication, "worktreeCleanup": cleanup}
             completed.add(selected.task_sha)
             state = _supervisor_state(
                 running,
@@ -421,6 +435,23 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
             _write_json(options.state_path, state)
             if _must_stop(options, started):
                 return state
+    except KeyboardInterrupt:
+        try:
+            latest = _read_supervisor_state(options.state_path)
+        except (OSError, ValueError):
+            latest = prior
+        state = _supervisor_state(
+            latest,
+            cycles,
+            "stopped",
+            completed,
+            queue_size=_pending_count(entries, completed),
+            current=selected,
+            stop_reason="operator-interrupted",
+            next_action="resume-supervisor",
+        )
+        _write_json(options.state_path, state)
+        return state
     finally:
         lock_path.unlink(missing_ok=True)
 
@@ -577,6 +608,88 @@ def publish_and_merge(
         "githubResult": merge.as_dict(),
         "prCreation": pr_result,
     }
+
+
+def cleanup_completed_worktree(
+    options: ContinuousBoundedOptions,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove only a clean, merged disposable worktree from this repository."""
+    if not options.trusted_dev.cleanup_worktree_after_merge:
+        return {"attempted": False, "success": True, "reason": "cleanup-disabled"}
+    value = result.get("worktreePath")
+    if not isinstance(value, str) or not value:
+        return {"attempted": False, "success": False, "reason": "worktree-path-missing"}
+    worktree = Path(value).resolve()
+    try:
+        primary = load_project(options.project_path, allowlist=options.workspace_allowlist)
+        loaded = load_project(worktree, allowlist=options.workspace_allowlist)
+        if (
+            worktree == primary.root
+            or not loaded.is_disposable_worktree()
+            or _git_common_directory(primary.root) != _git_common_directory(loaded.root)
+        ):
+            return {
+                "attempted": False,
+                "success": False,
+                "reason": "worktree-identity-invalid",
+            }
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=worktree,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if status.returncode != 0 or status.stdout.strip():
+            return {
+                "attempted": False,
+                "success": False,
+                "reason": "worktree-not-clean",
+            }
+        removed = subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree)],
+            cwd=primary.root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if removed.returncode != 0:
+            return {
+                "attempted": True,
+                "success": False,
+                "reason": "worktree-remove-failed",
+                "diagnostic": str(redact_secrets(removed.stderr))[-2000:],
+            }
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        return {
+            "attempted": True,
+            "success": False,
+            "reason": "worktree-cleanup-exception",
+            "diagnostic": str(redact_secrets(str(exc)))[:2000],
+        }
+    return {
+        "attempted": True,
+        "success": True,
+        "reason": "merged-worktree-removed",
+    }
+
+
+def _git_common_directory(root: Path) -> Path:
+    value = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if value.returncode != 0 or not value.stdout.strip():
+        raise ValueError("cannot resolve Git common directory")
+    path = Path(value.stdout.strip())
+    return path.resolve() if path.is_absolute() else (root / path).resolve()
 
 
 def _validate_options(options: ContinuousBoundedOptions) -> None:

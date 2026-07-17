@@ -12,6 +12,7 @@ from ai_team.core.bounded_delivery import (
     BoundedDeliveryOptions,
     DeliveryLimits,
     EngineeringAttempt,
+    _engineering_failure,
     _validated_resume_worktree,
     load_trusted_task_contract,
     run_bounded_delivery,
@@ -20,6 +21,36 @@ from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderRequ
 
 
 class BoundedDeliveryTests(unittest.TestCase):
+    def test_local_ollama_engineer_requires_native_write_attestation(self) -> None:
+        valid = EngineeringAttempt(
+            provider_result=ProviderResult(
+                provider="handsfreecode",
+                success=True,
+                data={"runtimeProvider": "ollama", "writeAccess": True},
+            ),
+            worktree_path=Path("/tmp/worktree"),
+            changed_files=["docs/safe.md"],
+            validation={"success": True},
+            commit_sha="a" * 40,
+        )
+        invalid = EngineeringAttempt(
+            provider_result=ProviderResult(
+                provider="handsfreecode",
+                success=True,
+                data={"runtimeProvider": "ollama", "writeAccess": False},
+            ),
+            worktree_path=Path("/tmp/worktree"),
+            changed_files=["docs/safe.md"],
+            validation={"success": True},
+            commit_sha="a" * 40,
+        )
+
+        self.assertIsNone(_engineering_failure(valid, ("docs/safe.md",)))
+        self.assertEqual(
+            _engineering_failure(invalid, ("docs/safe.md",))[2],
+            "provider-execution",
+        )
+
     def test_allows_project_declared_additional_validation_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project", additional_validation=["npm run e2e:smoke"])

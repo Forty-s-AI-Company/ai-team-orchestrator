@@ -430,6 +430,34 @@ class HandsFreeCodeProviderTests(unittest.TestCase):
         finally:
             server.close()
 
+    def test_handsfreecode_ollama_write_requires_explicit_run_agent_metadata(self) -> None:
+        server = _FakeHandsFreeCodeServer(runtime_provider="ollama")
+        try:
+            provider = HandsFreeCodeProvider(
+                HandsFreeCodeSettings(
+                    base_url=server.base_url,
+                    default_runtime_provider="ollama",
+                ),
+                session_key="test-session",
+            )
+            result = provider.run(
+                ProviderRequest(
+                    workflow="bug-fix-loop",
+                    prompt="implement the bounded task",
+                    project_root=Path.cwd(),
+                    run_mode="run-agent",
+                    metadata={"writeRequired": True, "writeAccess": True},
+                )
+            )
+
+            self.assertTrue(result.success)
+            self.assertTrue(server.last_post_body["writeAccess"])
+            self.assertEqual(server.last_post_body["maxIterations"], 2)
+            self.assertTrue(result.data["writeAccess"])
+            self.assertEqual(result.data["runtimeProvider"], "ollama")
+        finally:
+            server.close()
+
     def test_handsfreecode_read_only_agent_maps_to_run_agent_without_write_access(self) -> None:
         server = _FakeHandsFreeCodeServer(runtime_provider="ollama")
         try:

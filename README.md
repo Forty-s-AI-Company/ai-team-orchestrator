@@ -136,15 +136,16 @@ The current profiles are:
 | --- | --- | --- |
 | Product Manager | Antigravity Gemini 3.5 Flash (High) | Codex gpt-5.6-terra, medium |
 | Architect | Antigravity Gemini 3.1 Pro (High) | Codex gpt-5.6-sol, high fallback and second opinion |
-| Engineer | Codex gpt-5.6-terra, high | Persistent Terra → Sol → Luna fallback, same Codex provider only |
+| Engineer | Codex gpt-5.6-terra, high | Persistent Terra → Sol → Luna → HandsFreeCode/Ollama qwen2.5-coder fallback |
 | Reviewer | Codex gpt-5.6-sol, xhigh | Antigravity Gemini 3.1 Pro (High) mandatory second opinion |
 | QA Engineer | HandsFreeCode / qwen2.5-coder:7b, provider default | none in read-only-agent mode |
 | Delivery QA | Antigravity Gemini 3.1 Pro (High) | Codex gpt-5.6-sol, xhigh mandatory second QA |
 | Project Analyst | HandsFreeCode / qwen2.5-coder:7b, provider default | none in read-only-agent mode |
 
-Fallback is limited to provider availability failures. Invalid or unvalidated
-model output fails closed. Write workflows never cross-provider fallback, and
-second opinions are always forced to read-only metadata. Receipts record the
+Fallback is limited to supervisor-classified provider availability failures.
+Invalid or unvalidated model output fails closed. Each write attempt is bound
+to one selected provider and the same disposable worktree; providers never
+switch implicitly mid-attempt. Second opinions are always forced to read-only metadata. Receipts record the
 role, selected model, reasoning effort, fallback chain, and redacted secondary
 review without changing the existing schema version.
 
@@ -155,11 +156,13 @@ state file. It treats temporary rate limits, capacity errors, timeouts,
 connection resets, and HTTP 429/502/503/504-style failures differently from
 authentication, billing, code-validation, and infrastructure failures.
 
-- Engineer cloud route order is Codex `gpt-5.6-terra` (`high`) →
-  `gpt-5.6-sol` (`medium`) → `gpt-5.6-luna` (`medium`).
+- Engineer route order is Codex `gpt-5.6-terra` (`high`) →
+  `gpt-5.6-sol` (`medium`) → `gpt-5.6-luna` (`medium`) → local
+  HandsFreeCode/Ollama `qwen2.5-coder:7b` (`default`).
 - Each model has an independent retry count, exponential backoff with jitter,
   circuit state, cooldown, and probe timestamp. A write worktree never changes
-  provider; the fallback models are all the same audited Codex CLI provider.
+  provider route. The local route is accepted only when its native receipt
+  attests `runtimeProvider=ollama` and `writeAccess=true`.
 - A temporary error first retries the same model within its configured budget;
   only then does the supervisor open that model circuit and select the next
   model. A successful low-cost readiness probe closes a circuit. At a safe
@@ -700,6 +703,35 @@ ai-team supervise /home/eden/projects/CelebrateDeal \
   --max-token-usage 180000 --stage-timeout-seconds 300
 ```
 
+For the allowlisted test-site workflow, add the explicit trusted development
+profile and supply only a loopback development database URL:
+
+```bash
+export AI_TEAM_TEST_DATABASE_URL='postgresql://USER:PASSWORD@127.0.0.1:54329/celebratedeal_dev'
+
+ai-team supervise /home/eden/projects/CelebrateDeal \
+  --provider auto --bounded-delivery --trusted-dev-autopilot \
+  --task-contract-dir /home/eden/.local/share/ai-team/CelebrateDeal/contracts \
+  --execute --github-execute --auto-merge \
+  --allow-unreviewed-development-merge \
+  --interval-minutes 15 --max-iterations 6 --max-repair-attempts 4 \
+  --max-token-usage 360000 --stage-timeout-seconds 1200
+```
+
+`--trusted-dev-autopilot` is double opt-in: the CLI flag is required and the
+exact project path must appear in `trusted_dev_autopilot.enabled_projects`.
+It also requires `project.stage=development`, disposable worktrees, and all
+production deploy/database/seed/destructive flags to remain `false`.
+
+In this mode, provider quota/auth/network failure skips the expensive
+lint/build/E2E suite. A successful edit runs only the fixed loopback test-DB
+bootstrap, then deterministic validation. Failed validation may create a
+clearly labelled WIP Git checkpoint so the next repair or process restart can
+continue from the same clean HEAD. Next.js dependencies are copied once per
+worktree and reused while the package manifest/lock fingerprint is unchanged.
+After a CI-green merge the clean disposable worktree is removed. Ctrl-C writes
+a resumable `stopped` state instead of leaving a misleading `running` state.
+
 The supervisor processes dependency-ready `*.json` contracts in filename order,
 records each completed task SHA, exposes unmet `dependsOn` edges in
 `blockedTasks`, and watches the directory for new work without rerunning an
@@ -719,7 +751,10 @@ an `attention-required` state.
 
 `changePolicy` is deny-by-default. `schemaChanges` is required before
 `prisma/schema.prisma` may be in scope; `migrationArtifacts` additionally permits
-tracked migration files but never permits running them; `apiContractChanges`
+tracked migration files. Normal bounded delivery never runs them; the explicit
+trusted-development profile may apply them only through the fixed
+`npm run db:migrate:deploy` command against an operator-supplied loopback
+database whose name ends in `_dev` or `_test`. `apiContractChanges`
 permits an Architect to attest a bounded API contract change; and `fixtureData`
 records authorization for deterministic non-production test/demo data. Actual
 migration or seed execution, deployment, real payment, secret access, and

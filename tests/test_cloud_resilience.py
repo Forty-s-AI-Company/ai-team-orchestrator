@@ -89,6 +89,10 @@ class CloudResilienceTests(unittest.TestCase):
             (routes[0].provider, routes[0].model, routes[0].reasoning_effort, routes[0].priority),
             ("codex", "gpt-5.6-terra", "high", 100),
         )
+        self.assertEqual(
+            (routes[-1].provider, routes[-1].model, routes[-1].reasoning_effort),
+            ("handsfreecode", "qwen2.5-coder:7b", "default"),
+        )
 
     def test_preferred_terra_is_probed_and_resumed_after_cooldown(self) -> None:
         recovery = CloudRecoveryState(

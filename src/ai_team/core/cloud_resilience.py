@@ -123,10 +123,16 @@ def load_resilience_settings(settings: dict[str, Any]) -> tuple[tuple[CloudModel
     for index, item in enumerate(raw_models):
         if not isinstance(item, dict):
             continue
+        provider = item.get("provider", "codex")
         model, reasoning = item.get("name"), item.get("reasoning")
         priority = item.get("priority")
-        if isinstance(model, str) and isinstance(reasoning, str) and isinstance(priority, int):
-            routes.append(CloudModelRoute("codex", model, reasoning, priority))
+        if (
+            provider in {"codex", "handsfreecode"}
+            and isinstance(model, str)
+            and isinstance(reasoning, str)
+            and isinstance(priority, int)
+        ):
+            routes.append(CloudModelRoute(provider, model, reasoning, priority))
     if not routes:
         routes = list(default_engineer_routes())
     routes.sort(key=lambda route: route.priority, reverse=True)
@@ -361,6 +367,9 @@ class SelectedCloudRouteProvider(BaseProvider):
         self.supports_read_only_agent = getattr(provider, "supports_read_only_agent", False)
 
     def ready(self) -> bool:
+        route_ready = getattr(self.provider, "ready_for_route", None)
+        if callable(route_ready):
+            return bool(route_ready(self.route.as_dict()))
         return self.provider.ready()
 
     def run(self, request: ProviderRequest) -> ProviderResult:

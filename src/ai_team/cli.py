@@ -21,6 +21,10 @@ from ai_team.core.receipts import write_run_receipt
 from ai_team.core.routing_config import ROLE_CHOICES, load_role_profile
 from ai_team.core.staging_operations import run_staging_operations
 from ai_team.core.supervisor import SupervisorOptions, run_supervisor
+from ai_team.core.trusted_dev import (
+    load_trusted_dev_settings,
+    validate_trusted_dev_project,
+)
 from ai_team.providers import (
     AntigravityProvider,
     AntigravitySettings,
@@ -573,10 +577,13 @@ def supervise(
     allow_unreviewed_development_merge: bool,
     ci_wait_seconds: int,
     ci_poll_seconds: int,
+    trusted_dev_autopilot: bool,
     role: str | None = None,
 ) -> None:
     settings = load_settings()
     selected_report_dir = Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "supervisor"
+    if trusted_dev_autopilot and not bounded_delivery:
+        raise WorkflowError("--trusted-dev-autopilot requires --bounded-delivery")
     if bounded_delivery:
         if delivery:
             raise WorkflowError("--bounded-delivery cannot be combined with legacy --delivery")
@@ -588,12 +595,43 @@ def supervise(
             raise WorkflowError("bounded delivery never accepts legacy auto-commit or GitHub action flags")
         if dry_run:
             raise WorkflowError("bounded delivery requires explicit --execute")
+        resolved_project = Path(project_path).resolve()
+        try:
+            trusted_dev = load_trusted_dev_settings(
+                settings,
+                resolved_project,
+                requested=trusted_dev_autopilot,
+            )
+        except ValueError as exc:
+            raise WorkflowError(str(exc)) from None
+        if trusted_dev.enabled:
+            loaded = load_project(
+                resolved_project,
+                allowlist=workspace_allowlist(settings),
+            )
+            try:
+                validate_trusted_dev_project(loaded)
+            except ValueError as exc:
+                raise WorkflowError(str(exc)) from None
         limits = DeliveryLimits(
             max_iterations=max_iterations,
             max_repair_attempts=max_repair_attempts,
             max_token_usage=max_token_usage,
             timeout_seconds=stage_timeout_seconds,
         )
+        if trusted_dev.enabled:
+            limits = DeliveryLimits(
+                max_iterations=max(limits.max_iterations, trusted_dev.min_iterations),
+                max_repair_attempts=max(
+                    limits.max_repair_attempts,
+                    trusted_dev.min_repair_attempts,
+                ),
+                max_token_usage=max(limits.max_token_usage, trusted_dev.min_token_usage),
+                timeout_seconds=max(
+                    limits.timeout_seconds,
+                    trusted_dev.min_stage_timeout_seconds,
+                ),
+            )
         if min(limits.max_iterations, limits.max_repair_attempts, limits.max_token_usage, limits.timeout_seconds) < 1:
             raise WorkflowError("bounded delivery limits must all be positive")
         if not once:
@@ -610,7 +648,7 @@ def supervise(
                 cloud_routes, cloud_retry, local_continuity = load_resilience_settings(settings)
                 result = run_continuous_bounded_delivery(
                     ContinuousBoundedOptions(
-                        project_path=Path(project_path).resolve(),
+                        project_path=resolved_project,
                         contract_dir=Path(task_contract_dir).resolve(),
                         provider_for_role=lambda selected_role: build_provider("auto", settings, selected_role),
                         workspace_allowlist=workspace_allowlist(settings),
@@ -628,6 +666,7 @@ def supervise(
                         cloud_routes=cloud_routes,
                         cloud_retry=cloud_retry,
                         local_continuity=local_continuity,
+                        trusted_dev=trusted_dev,
                     )
                 )
             except (OSError, RuntimeError, ValueError) as exc:
@@ -643,13 +682,14 @@ def supervise(
         selected_state_path = Path(state_path).resolve() if state_path else selected_report_dir / "bounded-delivery-state.json"
         result = run_bounded_delivery(
             BoundedDeliveryOptions(
-                project_path=Path(project_path).resolve(),
+                project_path=resolved_project,
                 task_contract_path=Path(task_contract).resolve(),
                 provider_for_role=lambda selected_role: build_provider("auto", settings, selected_role),
                 workspace_allowlist=workspace_allowlist(settings),
                 report_dir=selected_report_dir / "bounded-delivery",
                 state_path=selected_state_path,
                 limits=limits,
+                trusted_dev=trusted_dev,
             )
         )
         print(json.dumps(redact_secrets(result), indent=2, default=str))
@@ -848,6 +888,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     supervisor_parser.add_argument("--ci-wait-seconds", type=int, default=900)
     supervisor_parser.add_argument("--ci-poll-seconds", type=int, default=10)
+    supervisor_parser.add_argument(
+        "--trusted-dev-autopilot",
+        action="store_true",
+        help="Enable allowlisted development-only long-run execution with Git checkpoints",
+    )
 
     staging_parser = subparsers.add_parser(
         "staging-operations",
@@ -970,6 +1015,7 @@ def main() -> None:
                 args.allow_unreviewed_development_merge,
                 args.ci_wait_seconds,
                 args.ci_poll_seconds,
+                args.trusted_dev_autopilot,
                 args.role,
             )
         elif args.command == "staging-operations":

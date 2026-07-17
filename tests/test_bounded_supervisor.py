@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -13,14 +14,97 @@ from ai_team.core.cloud_resilience import LocalContinuitySettings, RetrySettings
 from ai_team.core.bounded_supervisor import (
     ContinuousBoundedOptions,
     _sync_primary,
+    cleanup_completed_worktree,
     discover_contracts,
     publish_and_merge,
     run_continuous_bounded_delivery,
 )
+from ai_team.core.trusted_dev import TrustedDevSettings
 from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
 
 
 class ContinuousBoundedSupervisorTests(unittest.TestCase):
+    def test_keyboard_interrupt_persists_resumable_stopped_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            state_path = root / "state.json"
+
+            result = run_continuous_bounded_delivery(
+                ContinuousBoundedOptions(
+                    project_path=root,
+                    contract_dir=contracts,
+                    provider_for_role=lambda _role: _NoopProvider(),
+                    workspace_allowlist=[tmp],
+                    report_dir=root / "reports",
+                    state_path=state_path,
+                    once=False,
+                    github_execute=True,
+                    auto_merge=True,
+                    sleeper=lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()),
+                )
+            )
+
+            self.assertEqual(result["status"], "stopped")
+            self.assertEqual(result["stopReason"], "operator-interrupted")
+            self.assertEqual(result["nextAction"], "resume-supervisor")
+            self.assertFalse(state_path.with_suffix(".json.lock").exists())
+
+    def test_cleanup_removes_only_clean_disposable_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "AI Team Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            profile = root / ".ai-team" / "project.yaml"
+            profile.parent.mkdir()
+            profile.write_text(
+                """project:
+  name: cleanup-test
+  stage: development
+repository:
+  protected_branches: [main, master]
+safety:
+  allow_git_push: false
+  allow_deploy: false
+  allow_database_migration: false
+  allow_database_seed: false
+  allow_destructive_commands: false
+""",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", ".ai-team/project.yaml"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
+            worktree = Path(tmp) / "worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(worktree), "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            contracts = Path(tmp) / "contracts"
+            contracts.mkdir()
+            options = ContinuousBoundedOptions(
+                project_path=root,
+                contract_dir=contracts,
+                provider_for_role=lambda _role: _NoopProvider(),
+                workspace_allowlist=[tmp],
+                report_dir=Path(tmp) / "reports",
+                state_path=Path(tmp) / "state.json",
+                trusted_dev=TrustedDevSettings(cleanup_worktree_after_merge=True),
+            )
+
+            result = cleanup_completed_worktree(
+                options,
+                {"worktreePath": str(worktree)},
+            )
+
+            self.assertTrue(result["success"], result)
+            self.assertTrue(result["attempted"])
+            self.assertFalse(worktree.exists())
+
     def test_cloud_fallback_creates_checkpoint_then_resumes_preferred_model(self) -> None:
         """A temporary model outage must not permanently block the queue."""
 

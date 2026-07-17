@@ -115,7 +115,6 @@ class RouterProvider(BaseProvider):
             data={"routeAttempts": [attempt.as_dict() for attempt in attempts]},
         )
 
-
 @dataclass(frozen=True)
 class RouteTarget:
     provider: str
@@ -169,6 +168,17 @@ class RoleRouterProvider(BaseProvider):
             for target in (self.profile.primary, *self.profile.fallbacks)
             if target.provider in self.providers
         )
+
+    def ready_for_route(self, route: object) -> bool:
+        """Probe only the exact supervisor-selected Engineer route."""
+        target = _bounded_cloud_target(
+            route,
+            (self.profile.primary, *self.profile.fallbacks),
+        )
+        if target is None or self.profile.role != "engineer" or not self.profile.allow_write:
+            return False
+        provider = self.providers.get(target.provider)
+        return provider is not None and _provider_ready(provider)
 
     def diagnostics(self) -> dict[str, Any]:
         targets = (self.profile.primary, *self.profile.fallbacks)

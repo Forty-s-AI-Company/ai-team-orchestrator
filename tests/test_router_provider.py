@@ -16,6 +16,41 @@ from ai_team.providers.base import BaseProvider
 
 
 class RouterProviderTests(unittest.TestCase):
+    def test_engineer_route_probe_checks_only_selected_provider(self) -> None:
+        router = RoleRouterProvider(
+            RoleRoutingProfile(
+                role="engineer",
+                primary=RouteTarget("codex", "gpt-5.6-terra", "high"),
+                fallbacks=(
+                    RouteTarget("handsfreecode", "qwen2.5-coder:7b", "default"),
+                ),
+                allow_write=True,
+            ),
+            {
+                "codex": _StaticProvider(
+                    "codex",
+                    ready=False,
+                    result=_result("codex", False, ProviderErrorType.NETWORK),
+                ),
+                "handsfreecode": _StaticProvider(
+                    "handsfreecode",
+                    ready=True,
+                    result=_result("handsfreecode", True),
+                ),
+            },
+        )
+
+        self.assertFalse(router.ready_for_route({
+            "provider": "codex",
+            "model": "gpt-5.6-terra",
+            "reasoningEffort": "high",
+        }))
+        self.assertTrue(router.ready_for_route({
+            "provider": "handsfreecode",
+            "model": "qwen2.5-coder:7b",
+            "reasoningEffort": "default",
+        }))
+
     def test_router_selects_first_ready_successful_provider(self) -> None:
         router = RouterProvider(
             [

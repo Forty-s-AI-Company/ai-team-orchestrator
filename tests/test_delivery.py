@@ -26,6 +26,21 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(args.task_contract, "task.json")
         self.assertEqual(args.max_iterations, 2)
         self.assertEqual(args.max_repair_attempts, 1)
+        self.assertFalse(args.trusted_dev_autopilot)
+
+    def test_trusted_development_autopilot_flag_is_explicit(self) -> None:
+        args = build_parser().parse_args([
+            "supervise",
+            "project",
+            "--bounded-delivery",
+            "--trusted-dev-autopilot",
+            "--task-contract",
+            "task.json",
+            "--once",
+            "--execute",
+        ])
+
+        self.assertTrue(args.trusted_dev_autopilot)
 
     def test_continuous_bounded_delivery_flags_are_parsed(self) -> None:
         args = build_parser().parse_args([

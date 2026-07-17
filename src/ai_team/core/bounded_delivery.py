@@ -18,7 +18,7 @@ from ai_team.core.isolated_executor import (
     run_in_disposable_worktree,
 )
 from ai_team.core.project_loader import load_project
-from ai_team.core.trusted_dev import TrustedDevSettings
+from ai_team.core.trusted_dev import TrustedDevSettings, validate_trusted_dev_project
 from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderRequest, ProviderResult, redact_secrets
 
 
@@ -158,6 +158,8 @@ def load_trusted_task_contract(path: Path) -> tuple[TrustedTaskContract, str]:
 def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
     contract, task_sha = load_trusted_task_contract(options.task_contract_path)
     project = load_project(options.project_path, allowlist=options.workspace_allowlist)
+    if options.trusted_dev.enabled:
+        validate_trusted_dev_project(project)
     _validate_contract_validation_commands(project, contract)
     prior = _read_json(options.state_path)
     context: dict[str, Any] = {
@@ -622,7 +624,7 @@ def _engineering_failure(
     attempt: EngineeringAttempt,
     allowed_write_paths: tuple[str, ...],
 ) -> tuple[str, str, str] | None:
-    if not _native_success(attempt.provider_result, "codex"):
+    if not _native_engineer_success(attempt.provider_result):
         return _provider_stop_reason(attempt.provider_result), "engineer", "provider-execution"
     # Scope is a hard policy boundary. Check it before considering a failed
     # validation repair so out-of-scope writes can never enter the repair loop.
@@ -720,6 +722,8 @@ def _write_receipt(options: BoundedDeliveryOptions, context: dict[str, Any], sta
         "outerRunMode": "bounded-delivery", "runtimeMode": result.data.get("runtimeMode", "run-agent"),
         "writeAccess": stage == "engineer", "inputTaskSha": context["taskSha"], "taskSha": context["taskSha"],
         "provider": result.provider, "selectedModel": result.data.get("selectedModel"),
+        "runtimeProvider": result.data.get("runtimeProvider"),
+        "nativeWriteAccess": result.data.get("writeAccess"),
         "reasoningEffort": result.data.get("reasoningEffort"), "tokenUsage": result.data.get("tokenUsage", 0),
         "providerSuccess": result.success, "errorType": result.error_type,
         "validationResult": _receipt_validation(result, evidence),
@@ -843,8 +847,12 @@ def _accept_stage_checkpoint(
     contract: TrustedTaskContract,
 ) -> None:
     stage = receipt["stage"]
-    expected_provider = "antigravity" if stage in {"pm", "architect", "qa"} else "codex"
-    if receipt.get("provider") != expected_provider:
+    expected_providers = (
+        {"antigravity"}
+        if stage in {"pm", "architect", "qa"}
+        else ({"codex", "handsfreecode"} if stage == "engineer" else {"codex"})
+    )
+    if receipt.get("provider") not in expected_providers:
         raise BoundedDeliveryError("checkpoint provider mismatch")
     evidence = receipt.get("evidence")
     if not isinstance(evidence, dict):
@@ -871,6 +879,11 @@ def _accept_stage_checkpoint(
             )
         ):
             raise BoundedDeliveryError("engineer checkpoint attestation invalid")
+        if receipt.get("provider") == "handsfreecode" and (
+            receipt.get("runtimeProvider") != "ollama"
+            or receipt.get("nativeWriteAccess") is not True
+        ):
+            raise BoundedDeliveryError("engineer local checkpoint attestation invalid")
         checkpoints["engineer"] = receipt
         checkpoints.pop("qa", None)
         checkpoints.pop("review", None)
@@ -1123,6 +1136,17 @@ def _write_state(options: BoundedDeliveryOptions, status: str, stage: str, conte
 
 def _native_success(result: ProviderResult, expected_provider: str) -> bool:
     return result.success and result.provider == expected_provider and result.provider != "mock"
+
+
+def _native_engineer_success(result: ProviderResult) -> bool:
+    if _native_success(result, "codex"):
+        return True
+    return bool(
+        result.success
+        and result.provider == "handsfreecode"
+        and result.data.get("runtimeProvider") == "ollama"
+        and result.data.get("writeAccess") is True
+    )
 
 
 def _provider_stop_reason(result: ProviderResult) -> str:
