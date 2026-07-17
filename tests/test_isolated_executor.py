@@ -809,6 +809,76 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertFalse(result.success)
             self.assertIn("secret-like content", " ".join(result.reasons))
 
+    def test_github_executor_allows_runtime_csrf_token_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            source_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (root / "page.tsx").write_text(
+                "const element = <Form csrfToken={csrf.token} />;\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "page.tsx"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "runtime reference"], cwd=root, check=True, capture_output=True)
+            make_disposable_worktree_marker(root)
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
+            receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+            receipt_payload["sourceCommitSha"] = source_sha
+            receipt.write_text(json.dumps(receipt_payload), encoding="utf-8")
+
+            result = execute_github_action(
+                loaded,
+                GitHubExecutionOptions(
+                    action="pr",
+                    dry_run=True,
+                    validation_log_hash=VALIDATION_HASH,
+                    receipt_path=receipt,
+                    test_evidence_hash=TEST_HASH,
+                ),
+            )
+
+            self.assertTrue(result.success, result.reasons)
+
+    def test_github_executor_allows_explicit_test_token_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root, allow_git_push=True)
+            source_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (root / "component.test.tsx").write_text(
+                'const props = { csrfToken: "csrf-test-token" };\n',
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "component.test.tsx"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "test placeholder"], cwd=root, check=True, capture_output=True)
+            make_disposable_worktree_marker(root)
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+            receipt = write_valid_receipt(root, loaded)
+            receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+            receipt_payload["sourceCommitSha"] = source_sha
+            receipt.write_text(json.dumps(receipt_payload), encoding="utf-8")
+
+            result = execute_github_action(
+                loaded,
+                GitHubExecutionOptions(
+                    action="pr",
+                    dry_run=True,
+                    validation_log_hash=VALIDATION_HASH,
+                    receipt_path=receipt,
+                    test_evidence_hash=TEST_HASH,
+                ),
+            )
+
+            self.assertTrue(result.success, result.reasons)
+
     def test_github_executor_does_not_flag_unchanged_fixture_secret(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

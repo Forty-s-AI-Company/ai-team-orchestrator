@@ -10,20 +10,13 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ai_team.core.github_gate import evaluate_github_action
-from ai_team.core.git_policy import inspect_candidate_files
+from ai_team.core.git_policy import contains_secret_material, inspect_candidate_files
 from ai_team.core.project_loader import LoadedProject
 from ai_team.providers.base import redact_secrets
 
 
 SAFE_BRANCH_RE = re.compile(r"[^A-Za-z0-9._/-]+")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
-SECRET_SCAN_PATTERNS = [
-    re.compile(r"sk-[A-Za-z0-9_\-]{10,}"),
-    re.compile(r"(?i)Bearer\s+[A-Za-z0-9_\-.]+"),
-    re.compile(r"(?i)(api[_-]?key|token|secret|password|hash[_-]?key|hash[_-]?iv)\s*[:=]\s*([^\s,;]+)"),
-]
-
-
 class CommandRunner(Protocol):
     def __call__(
         self,
@@ -360,10 +353,8 @@ def scan_commit_for_secrets(
     ]
     for relative in changed_files:
         added_text = _added_lines(project_root, relative, source_sha)
-        for pattern in SECRET_SCAN_PATTERNS:
-            if pattern.search(added_text[:1_000_000]):
-                reasons.append(f"secret-like content in changed file: {relative}")
-                break
+        if contains_secret_material(added_text[:1_000_000].encode("utf-8")):
+            reasons.append(f"secret-like content in changed file: {relative}")
     payload = {"changedFiles": changed_files, "blocked": bool(reasons), "reasons": reasons}
     return {
         **payload,

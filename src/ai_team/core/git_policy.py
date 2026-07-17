@@ -214,6 +214,15 @@ def _contains_candidate_secret(project_root: Path, relative: Path, path: Path) -
             return None
     else:
         return None
+    return contains_secret_material(data)
+
+
+def contains_secret_material(data: bytes) -> bool:
+    """Return whether source bytes contain literal secret material.
+
+    This is the single fail-closed classifier shared by candidate-file and
+    committed-diff scans so publication cannot apply weaker or stale rules.
+    """
     if any(pattern.search(data) for pattern in SECRET_PATTERNS):
         return True
     return any(_is_secret_assignment(match.group(2)) for match in SECRET_ASSIGNMENT_PATTERN.finditer(data))
