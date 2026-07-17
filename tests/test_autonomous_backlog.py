@@ -121,6 +121,24 @@ class AutonomousBacklogTests(unittest.TestCase):
             self.assertEqual(result["status"], "contract-rejected", result)
             self.assertFalse(list((root / "contracts").glob("*.json")))
 
+    def test_normalizes_a_model_task_identifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = _task_payload()
+            payload["contract"]["id"] = "Accessibility Audit!"
+
+            result = discover_next_task(
+                project_path=root,
+                contract_dir=root / "contracts",
+                state_path=root / "backlog.json",
+                provider=_DiscoveryProvider(payload),
+                timeout_seconds=30,
+            )
+
+            self.assertEqual(result["status"], "task-created", result)
+            contract, _ = load_trusted_task_contract(Path(result["contractPath"]))
+            self.assertEqual(contract.id, "auto-accessibility-audit")
+
 
 class _DiscoveryProvider(BaseProvider):
     name = "antigravity"

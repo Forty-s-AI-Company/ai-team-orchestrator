@@ -195,13 +195,12 @@ def _write_validated_contract(
     contract_dir.mkdir(parents=True, exist_ok=True)
     if contract_dir.is_symlink() or not contract_dir.is_dir():
         raise ValueError("autonomous contract directory is invalid")
-    task_id = raw_contract.get("id")
-    if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id) or not task_id.startswith("auto-"):
-        raise ValueError("autonomous task id must begin with auto- and use lowercase hyphens")
     if raw_contract.get("dependsOn") not in (None, []):
         raise ValueError("autonomous tasks may not declare dependencies")
 
     sanitized = dict(raw_contract)
+    task_id = _normalize_task_id(sanitized.get("id"), sanitized)
+    sanitized["id"] = task_id
     sanitized["source"] = {
         "kind": "trusted-contract",
         "reference": f"autonomous project scan at {revision}",
@@ -226,6 +225,25 @@ def _write_validated_contract(
     finally:
         temporary.unlink(missing_ok=True)
     return final_path, task_sha, task_id
+
+
+def _normalize_task_id(raw_id: Any, contract: dict[str, Any]) -> str:
+    """Make a model-proposed label safe for the trusted contract filename.
+
+    IDs are bookkeeping only; the validated title and instruction remain the
+    actual task content. A deterministic hash fallback also prevents one
+    malformed label from stalling the autonomous loop.
+    """
+    raw = raw_id if isinstance(raw_id, str) else ""
+    normalized = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    if normalized and not normalized.startswith("auto-"):
+        normalized = f"auto-{normalized}"
+    if TASK_ID_PATTERN.fullmatch(normalized):
+        return normalized
+    fingerprint = hashlib.sha256(
+        json.dumps(contract, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"auto-task-{fingerprint}"
 
 
 def _project_revision(project_path: Path) -> str:
