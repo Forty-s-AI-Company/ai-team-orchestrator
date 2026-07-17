@@ -12,6 +12,7 @@ from ai_team.core.bounded_delivery import (
     BoundedDeliveryOptions,
     DeliveryLimits,
     EngineeringAttempt,
+    _validated_resume_worktree,
     load_trusted_task_contract,
     run_bounded_delivery,
 )
@@ -823,6 +824,89 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertEqual(second["status"], "attention-required")
             self.assertEqual(second["stopReason"], "receipt-checkpoint-invalid")
             self.assertEqual(calls, 1)
+
+    def test_resume_accepts_clean_attested_failed_validation_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = _init_project(base / "project")
+            source_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            worktree = base / "resume-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(worktree), source_sha],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            target = worktree / "docs" / "safe.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("checkpointed candidate\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", "docs/safe.md"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "checkpoint: failed validation candidate"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+            )
+            checkpoint_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            reports = base / "reports"
+            reports.mkdir()
+            run_receipt = reports / "run.json"
+            executor_receipt = reports / "executor.json"
+            run_receipt.write_text("{}", encoding="utf-8")
+            executor_receipt.write_text(
+                json.dumps({
+                    "schemaVersion": 1,
+                    "sourceProjectPath": str(root.resolve()),
+                    "sourceCommitSha": source_sha,
+                    "worktreePath": str(worktree.resolve()),
+                    "worktreeCommitSha": checkpoint_sha,
+                    "keepWorktree": True,
+                }),
+                encoding="utf-8",
+            )
+            contract_path = _write_contract(base, "docs/safe.md")
+            options = BoundedDeliveryOptions(
+                project_path=root,
+                task_contract_path=contract_path,
+                provider_for_role=_provider_for_role,
+                workspace_allowlist=[str(base)],
+                report_dir=reports,
+                state_path=base / "state.json",
+            )
+            prior = {
+                "taskSha": "task-sha",
+                "worktreePath": str(worktree.resolve()),
+                "commitSha": checkpoint_sha,
+                "changedFiles": ["docs/safe.md"],
+                "runReceipt": str(run_receipt),
+                "executorReceipt": str(executor_receipt),
+            }
+
+            resumed = _validated_resume_worktree(
+                options,
+                prior,
+                task_sha="task-sha",
+                allowed_write_paths=("docs/safe.md",),
+                expected_commit=None,
+                expected_changed_files=["docs/safe.md"],
+                expected_run_receipt=str(run_receipt),
+                expected_executor_receipt=str(executor_receipt),
+                allow_dirty=True,
+            )
+
+            self.assertEqual(resumed, worktree.resolve())
 
     def test_resume_fails_closed_when_attested_worktree_is_dirty_outside_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

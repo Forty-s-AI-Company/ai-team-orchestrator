@@ -15,10 +15,12 @@ from ai_team.core.isolated_executor import (
     _validation_env,
     prepare_dependency_link,
     remove_dependency_link,
-    run_validation_commands,
     run_in_disposable_worktree,
+    run_test_database_bootstrap,
+    run_validation_commands,
 )
 from ai_team.core.project_loader import load_project
+from ai_team.core.trusted_dev import TestDatabaseSettings, TrustedDevSettings
 from ai_team.providers import MockProvider
 from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
 from ai_team.providers.write_smoke import WriteSmokeProvider
@@ -88,6 +90,32 @@ def write_valid_receipt(root: Path, loaded) -> Path:
 
 
 class IsolatedExecutorTests(unittest.TestCase):
+    def test_trusted_next_dependencies_are_reused_until_manifest_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            worktree = root / "worktree"
+            source_module = source / "node_modules" / "sample" / "index.js"
+            source_module.parent.mkdir(parents=True)
+            source_module.write_text("source\n", encoding="utf-8")
+            (source / "package.json").write_text("{}\n", encoding="utf-8")
+            worktree.mkdir()
+            (worktree / "package.json").write_text(
+                json.dumps({"dependencies": {"next": "16.2.10"}}),
+                encoding="utf-8",
+            )
+
+            prepared = prepare_dependency_link(worktree, source, reuse_existing=True)
+            copied_module = prepared / "sample" / "index.js"
+            copied_module.write_text("generated in worktree\n", encoding="utf-8")
+            second = prepare_dependency_link(worktree, source, reuse_existing=True)
+
+            self.assertEqual(second, prepared)
+            self.assertEqual(
+                copied_module.read_text(encoding="utf-8"),
+                "generated in worktree\n",
+            )
+
     def test_next_dependencies_are_copied_inside_disposable_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -195,6 +223,23 @@ class IsolatedExecutorTests(unittest.TestCase):
 
         self.assertEqual(env["CI"], "1")
         self.assertNotIn("NODE_ENV", env)
+
+    def test_test_database_bootstrap_rejects_non_loopback_target(self) -> None:
+        settings = TestDatabaseSettings(
+            enabled=True,
+            bootstrap_commands=("npm run db:migrate:deploy",),
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"AI_TEAM_TEST_DATABASE_URL": "postgresql://user:pass@db.example.com/app_dev"},
+            clear=False,
+        ), patch("ai_team.core.isolated_executor.run_validation_commands") as runner:
+            result, environment = run_test_database_bootstrap(Path(tmp), settings)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["stopReason"], "test-database-target-rejected")
+        self.assertEqual(environment, {})
+        runner.assert_not_called()
 
     def test_validation_out_of_scope_mutation_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -627,6 +672,69 @@ class IsolatedExecutorTests(unittest.TestCase):
             self.assertIn("provider validation failed", result.commit_result["reason"])
             self.assertFalse(result.github_result["success"])
             self.assertFalse(result.github_result["attempted"])
+
+    def test_provider_failure_skips_expensive_deterministic_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+            with patch("ai_team.core.isolated_executor.run_validation_commands") as validator:
+                result = run_in_disposable_worktree(
+                    source_project_path=root,
+                    provider=_WritingFailureProvider("notes/partial.md", "partial output\n"),
+                    workflow_name="bug-fix-loop",
+                    workspace_allowlist=[tmp],
+                    receipt_dir=Path(tmp) / "receipts",
+                    worktree_parent=Path(tmp),
+                    keep_worktree=True,
+                    auto_commit=True,
+                    validation_commands=["npm run build"],
+                    require_validation=True,
+                )
+
+            validator.assert_not_called()
+            validation = result.commit_result["validation"]
+            self.assertEqual(validation["kind"], "provider-execution")
+            self.assertTrue(validation["skippedDeterministicValidation"])
+
+    def test_trusted_validation_failure_creates_reusable_git_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+            failing_validation = Path(tmp) / "fail-validation.py"
+            failing_validation.write_text("raise SystemExit(1)\n", encoding="utf-8")
+            result = run_in_disposable_worktree(
+                source_project_path=root,
+                provider=_WritingProvider("notes/change.md", "work in progress\n"),
+                workflow_name="bug-fix-loop",
+                workspace_allowlist=[tmp],
+                receipt_dir=Path(tmp) / "receipts",
+                worktree_parent=Path(tmp),
+                keep_worktree=True,
+                auto_commit=True,
+                allowed_write_paths=["notes/change.md"],
+                validation_commands=[f"{sys.executable} {failing_validation}"],
+                require_validation=True,
+                trusted_dev=TrustedDevSettings(
+                    enabled=True,
+                    checkpoint_on_validation_failure=True,
+                ),
+            )
+
+            self.assertTrue(result.commit_result["committed"], result.commit_result)
+            self.assertTrue(result.commit_result["checkpoint"])
+            self.assertFalse(result.commit_result["validationPassed"])
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=result.worktree_path,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+                "",
+            )
 
     def test_github_gate_push_without_policy_is_external_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

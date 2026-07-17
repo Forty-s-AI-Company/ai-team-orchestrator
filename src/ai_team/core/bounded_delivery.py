@@ -13,10 +13,12 @@ from typing import Any, Callable
 
 from ai_team.core.isolated_executor import (
     IsolatedRunResult,
+    list_committed_files_since,
     list_changed_files,
     run_in_disposable_worktree,
 )
 from ai_team.core.project_loader import load_project
+from ai_team.core.trusted_dev import TrustedDevSettings
 from ai_team.providers.base import BaseProvider, ProviderErrorType, ProviderRequest, ProviderResult, redact_secrets
 
 
@@ -48,6 +50,7 @@ SECONDARY_PROVIDER_BY_STAGE = {"architect": "codex", "qa": "codex", "review": "a
 RECEIPT_FILE_PATTERN = re.compile(r"^(\d+)-(pm|architect|engineer|qa|review)\.json$")
 REVIEW_EVIDENCE_PATH = "/tmp/ai-team-review-evidence/patch.diff"
 MAX_REVIEW_PATCH_BYTES = 512_000
+REPAIRABLE_VALIDATION_KINDS = {"deterministic-validation", "test-database-bootstrap"}
 
 
 class BoundedDeliveryError(ValueError):
@@ -109,6 +112,7 @@ class BoundedDeliveryOptions:
     report_dir: Path
     state_path: Path
     limits: DeliveryLimits = DeliveryLimits()
+    trusted_dev: TrustedDevSettings = TrustedDevSettings()
     engineering_executor: Callable[[TrustedTaskContract, str, BaseProvider, int], EngineeringAttempt] | None = None
 
 
@@ -186,6 +190,21 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
         return _stop(options, context, str(exc), "receipt-integrity")
     if context["tokenUsage"] > options.limits.max_token_usage:
         return _stop(options, context, "token-budget-exhausted", "policy-or-provider")
+    if prior.get("taskSha") == task_sha:
+        # Keep the last attested engineering location in every running state.
+        # If the process is interrupted during PM/architect recovery, the next
+        # process can still validate and reuse the same disposable worktree.
+        for key in (
+            "worktreePath",
+            "commitSha",
+            "changedFiles",
+            "validation",
+            "runReceipt",
+            "executorReceipt",
+            "repairs",
+        ):
+            if key in prior:
+                context[key] = prior[key]
     _write_state(options, "running", "pm", context)
     try:
         pm_checkpoint = checkpoints.get("pm")
@@ -194,6 +213,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
         )
         acceptance = _required_strings(pm, "acceptanceCriteria")
         context["acceptanceCriteria"] = acceptance
+        _write_state(options, "running", "architect", context)
         architect_checkpoint = checkpoints.get("architect")
         architect = architect_checkpoint["evidence"] if architect_checkpoint else _run_stage(
             options, project.root, "architect", context, contract
@@ -230,10 +250,12 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 "executorReceipt": evidence.get("executorReceipt"),
             })
             qa_checkpoint = checkpoints.get("qa")
+            _write_state(options, "running", "qa", context)
             qa = qa_checkpoint["evidence"] if qa_checkpoint else _run_stage(
                 options, reusable_worktree, "qa", context, contract
             )
             review_checkpoint = checkpoints.get("review") if qa_checkpoint else None
+            _write_state(options, "running", "review", context)
             review = review_checkpoint["evidence"] if review_checkpoint else _run_stage(
                 options, reusable_worktree, "review", context, contract
             )
@@ -259,6 +281,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 allow_dirty=True,
             )
 
+        _write_state(options, "running", "engineer", context)
         engineering_executor = options.engineering_executor or _default_engineering_executor(
             options, reusable_worktree=reusable_worktree
         )
@@ -286,6 +309,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 "runReceipt": str(attempt.run_receipt) if attempt.run_receipt else None,
                 "executorReceipt": str(attempt.executor_receipt) if attempt.executor_receipt else None,
             })
+            _write_state(options, "running", "engineer", context)
             if failure is not None:
                 reason, stage, _kind = failure
                 if _is_repairable_validation_failure(failure, attempt, tuple(context["planAllowedWritePaths"])):
@@ -293,10 +317,13 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                         return _stop(options, context, "max-repair-attempts-reached", "validation")
                     repairs.append(_validation_repair_evidence(attempt))
                     context["repairs"] = repairs
+                    _write_state(options, "running", "engineer", context)
                     continue
                 return _stop(options, context, reason, stage)
 
+            _write_state(options, "running", "qa", context)
             qa = _run_stage(options, attempt.worktree_path, "qa", context, contract)
+            _write_state(options, "running", "review", context)
             review = _run_stage(options, attempt.worktree_path, "review", context, contract)
             findings = _findings(qa) + _findings(review)
             if not findings:
@@ -471,6 +498,7 @@ def _default_engineering_executor(
             task_instruction=instruction, allowed_write_paths=list(contract.allowed_write_paths),
             validation_commands=[*contract.validation_commands, "git diff --check"], require_validation=True,
             reuse_worktree_path=reusable_worktree,
+            trusted_dev=options.trusted_dev,
         )
         reusable_worktree = result.worktree_path
         validation = result.commit_result.get("validation") or {"success": False}
@@ -620,13 +648,15 @@ def _is_repairable_validation_failure(
     _reason, stage, kind = failure
     return (
         stage == "validation"
-        and kind == "deterministic-validation"
+        and kind in REPAIRABLE_VALIDATION_KINDS
         and bool(attempt.changed_files)
         and _paths_within(attempt.changed_files, allowed_write_paths)
     )
 
 
 def _validation_repair_evidence(attempt: EngineeringAttempt) -> dict[str, Any]:
+    validation_kind = attempt.validation.get("kind")
+    kind = validation_kind if validation_kind in REPAIRABLE_VALIDATION_KINDS else "deterministic-validation"
     failed_commands: list[dict[str, Any]] = []
     commands = attempt.validation.get("commands")
     if isinstance(commands, list):
@@ -644,12 +674,12 @@ def _validation_repair_evidence(attempt: EngineeringAttempt) -> dict[str, Any]:
             if len(failed_commands) >= 4:
                 break
     evidence = {
-        "kind": "deterministic-validation",
+        "kind": kind,
         "changedFiles": attempt.changed_files,
         "failedCommands": failed_commands,
     }
     return {
-        "kind": "deterministic-validation",
+        "kind": kind,
         "findingSha": _sha(evidence),
         "evidence": evidence,
     }
@@ -933,7 +963,10 @@ def _recover_repairs(
                 raise BoundedDeliveryError("resume-repair-state-invalid")
         elif isinstance(item.get("evidence"), dict):
             evidence = item["evidence"]
-            if evidence.get("kind") != "deterministic-validation" or item["findingSha"] != _sha(evidence):
+            if (
+                evidence.get("kind") not in REPAIRABLE_VALIDATION_KINDS
+                or item["findingSha"] != _sha(evidence)
+            ):
                 raise BoundedDeliveryError("resume-repair-state-invalid")
             changed_files = evidence.get("changedFiles")
             if not isinstance(changed_files, list) or not _paths_within(changed_files, allowed_write_paths):
@@ -986,7 +1019,26 @@ def _validated_resume_worktree(
                 raise ValueError("committed resume target is not clean at the attested commit")
             if prior.get("changedFiles") != expected_changed_files:
                 raise ValueError("committed resume state does not match its receipt")
-        elif not allow_dirty or sorted(changed_files) != sorted(expected_changed_files):
+        elif not allow_dirty:
+            raise ValueError("dirty resume target is not allowed")
+        elif sorted(changed_files) == sorted(expected_changed_files):
+            pass
+        elif not changed_files and isinstance(prior.get("commitSha"), str):
+            # Trusted-dev checkpoints commit a failed-but-useful candidate.
+            # Reuse it only when the isolated executor receipt binds the clean
+            # HEAD to the original source and the cumulative file set matches.
+            if prior["commitSha"] != loaded.commit_sha:
+                raise ValueError("checkpoint resume commit does not match worktree HEAD")
+            source_sha = _checkpoint_source_sha(
+                Path(str(expected_executor_receipt)),
+                source_root=source.root,
+                worktree_root=loaded.root,
+                worktree_commit=loaded.commit_sha,
+            )
+            committed_files = list_committed_files_since(loaded.root, source_sha)
+            if sorted(committed_files) != sorted(expected_changed_files):
+                raise ValueError("checkpoint resume files do not match the attested state")
+        else:
             raise ValueError("dirty resume target does not match its attested state")
         return path
     except (BoundedDeliveryError, OSError, subprocess.SubprocessError, ValueError) as exc:
@@ -1018,6 +1070,33 @@ def _is_attested_report_file(report_dir: Path, value: Any) -> bool:
     except ValueError:
         return False
     return path.is_file()
+
+
+def _checkpoint_source_sha(
+    executor_receipt: Path,
+    *,
+    source_root: Path,
+    worktree_root: Path,
+    worktree_commit: str | None,
+) -> str:
+    try:
+        payload = json.loads(executor_receipt.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("checkpoint executor receipt is invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("checkpoint executor receipt is invalid")
+    source_sha = payload.get("sourceCommitSha")
+    if (
+        payload.get("schemaVersion") != 1
+        or payload.get("sourceProjectPath") != str(source_root)
+        or payload.get("worktreePath") != str(worktree_root)
+        or payload.get("worktreeCommitSha") != worktree_commit
+        or payload.get("keepWorktree") is not True
+        or not isinstance(source_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+    ):
+        raise ValueError("checkpoint executor receipt does not attest this worktree")
+    return source_sha
 
 
 def _add_tokens(options: BoundedDeliveryOptions, context: dict[str, Any], result: ProviderResult) -> bool:

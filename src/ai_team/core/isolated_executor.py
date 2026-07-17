@@ -17,7 +17,23 @@ from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_
 from ai_team.core.orchestrator import Orchestrator, WorkflowRunResult, load_workflow
 from ai_team.core.project_loader import LoadedProject, load_project
 from ai_team.core.receipts import write_run_receipt
-from ai_team.providers.base import BaseProvider, redact_secrets
+from ai_team.core.trusted_dev import (
+    TestDatabaseSettings,
+    TrustedDevSettings,
+    validate_test_database_url,
+)
+from ai_team.providers.base import (
+    BaseProvider,
+    ProviderErrorType,
+    ProviderResult,
+    redact_secrets,
+)
+
+CHECKPOINTABLE_VALIDATION_KINDS = {
+    "deterministic-validation",
+    "execution-environment",
+    "test-database-bootstrap",
+}
 
 
 @dataclass(frozen=True)
@@ -53,6 +69,7 @@ def run_in_disposable_worktree(
     validation_commands: list[str] | None = None,
     require_validation: bool = False,
     reuse_worktree_path: Path | None = None,
+    trusted_dev: TrustedDevSettings = TrustedDevSettings(),
 ) -> IsolatedRunResult:
     source = load_project(source_project_path, allowlist=workspace_allowlist)
     workflow = load_workflow(workflow_name)
@@ -81,7 +98,11 @@ def run_in_disposable_worktree(
         if loaded.is_branch_protected():
             raise ValueError("disposable worktree resolved to a protected branch")
 
-        dependency_link = prepare_dependency_link(loaded.root, source.root)
+        dependency_link = prepare_dependency_link(
+            loaded.root,
+            source.root,
+            reuse_existing=trusted_dev.preserve_dependency_tree,
+        )
         try:
             # The write provider must see the same controlled dependency tree
             # used by deterministic validation. This is also what makes local
@@ -94,18 +115,37 @@ def run_in_disposable_worktree(
                 task_instruction=task_instruction,
             )
             candidate_before_validation = capture_candidate_snapshot(loaded.root)
-            validation_result = run_validation_commands(
-                loaded.root,
-                validation_commands or [],
-                require_nonempty=require_validation,
-                dependency_root=(
-                    loaded.root
-                    if (loaded.root / "node_modules").exists()
-                    else source.root
-                ),
+            dependency_root = (
+                loaded.root
+                if (loaded.root / "node_modules").exists()
+                else source.root
             )
+            database_environment: dict[str, str] = {}
+            if result.provider_result.success:
+                bootstrap_result, database_environment = run_test_database_bootstrap(
+                    loaded.root,
+                    trusted_dev.test_database,
+                    dependency_root=dependency_root,
+                )
+                validation_result = (
+                    run_validation_commands(
+                        loaded.root,
+                        validation_commands or [],
+                        require_nonempty=require_validation,
+                        dependency_root=dependency_root,
+                        environment_overrides=database_environment,
+                    )
+                    if bootstrap_result["success"]
+                    else bootstrap_result
+                )
+            else:
+                # A quota/auth/network/provider failure cannot be repaired by
+                # burning several more minutes on lint, build, and browser E2E.
+                validation_result = provider_failure_validation_result(result.provider_result)
             candidate_after_validation = capture_candidate_snapshot(loaded.root)
-            changed_files = candidate_after_validation["files"]
+            pending_files = candidate_after_validation["files"]
+            committed_files = list_committed_files_since(loaded.root, source.commit_sha)
+            changed_files = sorted(set(committed_files) | set(pending_files))
             git_policy = inspect_candidate_policy(loaded, changed_files, allowed_write_paths)
             if candidate_before_validation["hash"] != candidate_after_validation["hash"]:
                 validation_result = validation_mutation_result(
@@ -114,22 +154,66 @@ def run_in_disposable_worktree(
                     after=candidate_after_validation,
                 )
         finally:
-            remove_dependency_link(dependency_link)
+            if not trusted_dev.preserve_dependency_tree:
+                remove_dependency_link(dependency_link)
         effective_validation_hash = validation_log_hash or validation_result["hash"]
         effective_test_hash = test_evidence_hash or validation_result["hash"]
         try:
+            checkpoint = bool(
+                trusted_dev.enabled
+                and trusted_dev.checkpoint_on_validation_failure
+                and result.provider_result.success
+                and not validation_result["success"]
+                and validation_result.get("kind") in CHECKPOINTABLE_VALIDATION_KINDS
+            )
+            selected_commit_message = (
+                f"checkpoint(ai-team): {commit_message or default_commit_message(workflow_name)}"
+                if checkpoint
+                else commit_message or default_commit_message(workflow_name)
+            )
             commit_result = maybe_commit_changed_files(
                 loaded,
-                changed_files=changed_files,
+                changed_files=pending_files,
                 git_policy=git_policy,
                 enabled=(
                     auto_commit
                     and result.provider_result.success
-                    and bool(changed_files)
-                    and validation_result["success"]
+                    and bool(pending_files)
+                    and (validation_result["success"] or checkpoint)
                 ),
-                commit_message=commit_message or default_commit_message(workflow_name),
+                commit_message=selected_commit_message,
             )
+            if commit_result.get("committed"):
+                commit_result.update({
+                    "checkpoint": checkpoint,
+                    "validationPassed": validation_result["success"],
+                })
+            elif (
+                auto_commit
+                and result.provider_result.success
+                and validation_result["success"]
+                and not pending_files
+                and committed_files
+                and git_policy.get("allowed")
+                and loaded.commit_sha
+            ):
+                # A previous failed-validation checkpoint may become valid
+                # after a test-database repair without requiring another edit.
+                commit_result = {
+                    "attempted": False,
+                    "committed": True,
+                    "commitSha": loaded.commit_sha,
+                    "message": "reuse validated development checkpoint",
+                    "stagedFiles": [],
+                    "checkpoint": False,
+                    "reusedCheckpoint": True,
+                    "validationPassed": True,
+                    "validationResult": {
+                        "success": True,
+                        "kind": "git-commit",
+                        "stopReason": None,
+                    },
+                }
         except (OSError, subprocess.SubprocessError) as exc:
             # Fail closed even if a future Git call in the commit path was not
             # converted to an explicit operation result yet.
@@ -141,7 +225,7 @@ def run_in_disposable_worktree(
         # Bounded delivery consumes this attested result rather than inferring
         # validation success from a commit alone.
         commit_result = {**commit_result, "validation": validation_result}
-        if auto_commit and (
+        if auto_commit and not commit_result.get("committed") and (
             not result.provider_result.success or not changed_files or not validation_result["success"]
         ):
             commit_result = {
@@ -155,6 +239,12 @@ def run_in_disposable_worktree(
                     "stopReason": validation_result.get("stopReason", "deterministic-validation-failed"),
                 },
             }
+        changed_files = sorted(
+            set(list_committed_files_since(loaded.root, source.commit_sha))
+            | set(list_changed_files(loaded.root))
+        )
+        git_policy["changedFiles"] = changed_files
+        git_policy["scopeCheck"] = inspect_write_scope(changed_files, allowed_write_paths)
         run_receipt = write_run_receipt(
             loaded,
             result,
@@ -227,6 +317,14 @@ def list_changed_files(project_root: Path) -> list[str]:
         if path:
             files.append(path)
     return files
+
+
+def list_committed_files_since(project_root: Path, source_sha: str | None) -> list[str]:
+    """Return files committed inside a reusable worktree after its source SHA."""
+    if not source_sha:
+        return []
+    result = _run_git(project_root, ["diff", "--name-only", f"{source_sha}..HEAD"])
+    return sorted({line.strip() for line in result.stdout.splitlines() if line.strip()})
 
 
 def capture_candidate_snapshot(project_root: Path) -> dict[str, Any]:
@@ -324,7 +422,12 @@ def inspect_write_scope(changed_files: list[str], allowed_write_paths: list[str]
     }
 
 
-def prepare_dependency_link(worktree_root: Path, source_root: Path) -> Path | None:
+def prepare_dependency_link(
+    worktree_root: Path,
+    source_root: Path,
+    *,
+    reuse_existing: bool = False,
+) -> Path | None:
     source_modules = source_root / "node_modules"
     target_modules = worktree_root / "node_modules"
     if not source_modules.is_dir():
@@ -333,7 +436,22 @@ def prepare_dependency_link(worktree_root: Path, source_root: Path) -> Path | No
         raise ValueError("disposable worktree dependency path must not be a pre-existing symlink")
     if target_modules.exists() and not target_modules.is_dir():
         raise ValueError("disposable worktree dependency path must be a directory")
+    requires_local_tree = _requires_local_dependency_tree(worktree_root)
     if target_modules.is_dir():
+        if (
+            reuse_existing
+            and requires_local_tree
+            and _dependency_copy_is_current(target_modules, source_root)
+        ):
+            return target_modules
+        if reuse_existing and requires_local_tree:
+            # A changed lockfile makes an incremental merge unsafe because
+            # removed packages would remain. Rebuild once, then reuse it for
+            # later repair attempts in this disposable worktree.
+            shutil.rmtree(target_modules)
+            shutil.copytree(source_modules, target_modules, symlinks=True)
+            _write_dependency_copy_marker(target_modules, source_root)
+            return target_modules
         # A provider self-check can create an incomplete cache-only node_modules
         # directory. Merge the trusted source dependencies into a private tree
         # so its mere existence cannot suppress dependency preparation.
@@ -348,7 +466,7 @@ def prepare_dependency_link(worktree_root: Path, source_root: Path) -> Path | No
             timeout=30,
         )
         return target_modules if result.returncode == 0 and target_modules.exists() else None
-    if _requires_local_dependency_tree(worktree_root):
+    if requires_local_tree:
         try:
             # Next.js Turbopack rejects a top-level node_modules symlink that
             # resolves outside the project root. A private validation copy also
@@ -358,9 +476,50 @@ def prepare_dependency_link(worktree_root: Path, source_root: Path) -> Path | No
             if target_modules.exists():
                 shutil.rmtree(target_modules)
             raise
+        if reuse_existing:
+            _write_dependency_copy_marker(target_modules, source_root)
         return target_modules
     target_modules.symlink_to(source_modules, target_is_directory=True)
     return target_modules
+
+
+def _dependency_fingerprint(source_root: Path) -> str:
+    digest = hashlib.sha256()
+    for name in ("package.json", "package-lock.json", "npm-shrinkwrap.json"):
+        path = source_root / name
+        if not path.is_file() or path.is_symlink():
+            continue
+        digest.update(name.encode("utf-8"))
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _dependency_copy_is_current(target_modules: Path, source_root: Path) -> bool:
+    marker = target_modules / ".ai-team-dependency-copy.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return payload == {
+        "sourceRoot": str(source_root.resolve()),
+        "fingerprint": _dependency_fingerprint(source_root),
+    }
+
+
+def _write_dependency_copy_marker(target_modules: Path, source_root: Path) -> None:
+    marker = target_modules / ".ai-team-dependency-copy.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "sourceRoot": str(source_root.resolve()),
+                "fingerprint": _dependency_fingerprint(source_root),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _requires_local_dependency_tree(project_root: Path) -> bool:
@@ -397,12 +556,15 @@ def run_validation_commands(
     *,
     require_nonempty: bool = False,
     dependency_root: Path | None = None,
+    environment_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if require_nonempty and not commands:
         payload: dict[str, Any] = {
             "success": False,
             "commands": [],
             "reason": "trusted write tasks require at least one validation command",
+            "kind": "policy-validation",
+            "stopReason": "validation-command-required",
         }
         payload["hash"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
         return payload
@@ -424,7 +586,7 @@ def run_validation_commands(
                 capture_output=True,
                 text=True,
                 timeout=900,
-                env=_validation_env(dependency_root),
+                env=_validation_env(dependency_root, environment_overrides),
             )
             result = {
                 "command": command,
@@ -460,13 +622,21 @@ def run_validation_commands(
             "kind": "execution-environment",
             "stopReason": "validation-command-timeout",
         })
+    elif not payload["success"]:
+        payload.update({
+            "kind": "deterministic-validation",
+            "stopReason": "deterministic-validation-failed",
+        })
     payload["hash"] = hashlib.sha256(
         json.dumps(redact_secrets(payload), sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
     return redact_secrets(payload)
 
 
-def _validation_env(dependency_root: Path | None) -> dict[str, str]:
+def _validation_env(
+    dependency_root: Path | None,
+    environment_overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
     allowed = {
         "APPDATA", "COMSPEC", "HOME", "LOCALAPPDATA", "PATHEXT", "PATH",
         "PROGRAMDATA", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "WINDIR",
@@ -476,7 +646,98 @@ def _validation_env(dependency_root: Path | None) -> dict[str, str]:
         dependency_bin = dependency_root / "node_modules" / ".bin"
         env["PATH"] = f"{dependency_bin}{os.pathsep}{env.get('PATH', '')}"
     env["CI"] = "1"
+    for key, value in (environment_overrides or {}).items():
+        if key not in {"DATABASE_URL", "DIRECT_URL"}:
+            raise ValueError(f"validation environment override is not allowlisted: {key}")
+        env[key] = value
     return env
+
+
+def run_test_database_bootstrap(
+    project_root: Path,
+    settings: TestDatabaseSettings,
+    *,
+    dependency_root: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Migrate only an explicitly supplied loopback development database."""
+    if not settings.enabled:
+        return _hashed_result({"success": True, "commands": [], "disabled": True}), {}
+    database_url = os.environ.get(settings.url_env, "").strip()
+    if not database_url:
+        return (
+            _hashed_result({
+                "success": False,
+                "commands": [],
+                "kind": "test-database-bootstrap",
+                "stopReason": "test-database-url-missing",
+                "reason": f"required environment variable is missing: {settings.url_env}",
+            }),
+            {},
+        )
+    try:
+        validate_test_database_url(database_url, settings)
+    except ValueError as exc:
+        return (
+            _hashed_result({
+                "success": False,
+                "commands": [],
+                "kind": "test-database-bootstrap",
+                "stopReason": "test-database-target-rejected",
+                "reason": str(exc),
+            }),
+            {},
+        )
+    environment = {"DATABASE_URL": database_url, "DIRECT_URL": database_url}
+    result = run_validation_commands(
+        project_root,
+        list(settings.bootstrap_commands),
+        require_nonempty=True,
+        dependency_root=dependency_root,
+        environment_overrides=environment,
+    )
+    if not result["success"]:
+        result = _hashed_result({
+            **result,
+            "success": False,
+            "kind": "test-database-bootstrap",
+            "stopReason": "test-database-bootstrap-failed",
+        })
+    return result, environment
+
+
+def provider_failure_validation_result(provider_result: ProviderResult) -> dict[str, Any]:
+    stop_reasons = {
+        ProviderErrorType.AUTH: "provider-auth-failed",
+        ProviderErrorType.TIMEOUT: "provider-timeout",
+        ProviderErrorType.NETWORK: "provider-network-failed",
+        ProviderErrorType.RATE_LIMIT: "provider-quota-exhausted",
+        ProviderErrorType.EXTERNAL_REQUIRED: "provider-external-action-required",
+        ProviderErrorType.INVALID_RESPONSE: "provider-invalid-response",
+        ProviderErrorType.UNKNOWN: "provider-execution-failed",
+    }
+    return _hashed_result({
+        "success": False,
+        "commands": [],
+        "kind": "provider-execution",
+        "stopReason": stop_reasons.get(
+            provider_result.error_type,
+            "provider-execution-failed",
+        ),
+        "provider": provider_result.provider,
+        "providerErrorType": (
+            provider_result.error_type.value if provider_result.error_type else None
+        ),
+        "skippedDeterministicValidation": True,
+    })
+
+
+def _hashed_result(payload: dict[str, Any]) -> dict[str, Any]:
+    redacted = redact_secrets(payload)
+    redacted.pop("hash", None)
+    redacted["hash"] = hashlib.sha256(
+        json.dumps(redacted, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return redacted
 
 
 def maybe_commit_changed_files(

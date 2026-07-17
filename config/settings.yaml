@@ -34,7 +34,9 @@ codex:
   run_args: ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]
   # Trusted writes are allowed only after the isolated executor creates a
   # disposable linked worktree and applies allowed_write_paths + validation gates.
-  write_run_args: ["exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]
+  # Trusted development runs are non-interactive. Approval is explicit while
+  # the disposable worktree and deterministic validation remain the boundary.
+  write_run_args: ["--ask-for-approval", "never", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check"]
   timeout_seconds: 45
   # High-reasoning write cycles need enough time to inspect, edit, and verify
   # a bounded diff; outer delivery limits still cap iterations and token use.
@@ -214,3 +216,24 @@ routing:
 workspace:
   allowlist:
     - "/home/eden/projects"
+
+# Explicit opt-in for fast, recoverable development. Production deployment,
+# production migrations, real payments, and destructive actions stay closed
+# by the product profile and are never enabled by this section.
+trusted_dev_autopilot:
+  enabled_projects:
+    - "/home/eden/projects/CelebrateDeal"
+  min_iterations: 6
+  min_repair_attempts: 4
+  min_token_usage: 360000
+  min_stage_timeout_seconds: 1200
+  checkpoint_on_validation_failure: true
+  preserve_dependency_tree: true
+  cleanup_worktree_after_merge: true
+  test_database:
+    enabled: true
+    url_env: "AI_TEAM_TEST_DATABASE_URL"
+    allowed_hosts: ["localhost", "127.0.0.1", "::1"]
+    required_database_suffixes: ["_dev", "_test"]
+    bootstrap_commands:
+      - "npm run db:migrate:deploy"
