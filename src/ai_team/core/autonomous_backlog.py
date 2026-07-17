@@ -61,6 +61,10 @@ def discover_next_task(
                 "writeRequired": False,
                 "writeAccess": False,
                 "projectRevision": revision,
+                # Reuse the provider's audited PM envelope and read-only
+                # sandbox. The autonomous proposal itself lives in the extra
+                # autonomousBacklog field inside that native envelope.
+                "boundedStage": "pm",
             },
         )
     )
@@ -143,7 +147,9 @@ def _discovery_prompt(revision: str) -> str:
         "The task must be safe for a disposable development worktree and must not require a human business decision.",
         "Never propose production deployment, live payments, secrets, real customer data, destructive actions, or external account changes.",
         "If the project is release-candidate ready or no safe/clear coding task exists, return status=ready.",
-        "Return JSON only using this schema:",
+        "Return the provider-native PM envelope with schema=ai-team-bounded-delivery/v1, stage=pm,",
+        "the runtime-supplied challenge, status=passed, and empty findings/tests/blockers arrays.",
+        "Put this object in its autonomousBacklog field:",
         '{"schema":"ai-team-autonomous-backlog/v1","status":"task|ready","summary":"short Chinese summary","contract":{...}}',
         "For status=task, contract must be a schemaVersion=1 trusted task contract with source.kind=trusted-contract,",
         "a lowercase hyphenated id beginning with auto-, no dependsOn, safe project-relative allowedWritePaths,",
@@ -160,6 +166,8 @@ def _parse_payload(content: str) -> dict[str, Any]:
         value = json.loads(content)
     except json.JSONDecodeError as exc:
         raise ValueError("autonomous PM did not return JSON") from exc
+    if isinstance(value, dict) and value.get("schema") == "ai-team-bounded-delivery/v1":
+        value = value.get("autonomousBacklog")
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
         raise ValueError("autonomous PM returned an invalid schema")
     status = value.get("status")

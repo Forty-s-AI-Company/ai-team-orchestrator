@@ -62,6 +62,29 @@ class AutonomousBacklogTests(unittest.TestCase):
             self.assertEqual(result["status"], "no-safe-task", result)
             self.assertFalse((root / "contracts").exists())
 
+    def test_accepts_audited_pm_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = {
+                "schema": "ai-team-bounded-delivery/v1",
+                "stage": "pm",
+                "status": "passed",
+                "challenge": "runtime-owned",
+                "findings": [],
+                "tests": [],
+                "blockers": [],
+                "autonomousBacklog": _task_payload(),
+            }
+            result = discover_next_task(
+                project_path=root,
+                contract_dir=root / "contracts",
+                state_path=root / "backlog.json",
+                provider=_DiscoveryProvider(payload),
+                timeout_seconds=30,
+            )
+
+            self.assertEqual(result["status"], "task-created", result)
+
     def test_rejects_generated_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
