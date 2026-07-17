@@ -22,6 +22,7 @@ from ai_team.providers import (
 from ai_team.providers.cli_common import CliProviderSettings, run_cli_command
 from ai_team.providers.antigravity import _compact_prompt, _read_only_sandbox_settings, _validate_response
 from ai_team.providers.antigravity import _apply_routing_options as apply_antigravity_routing
+from ai_team.providers.codex import _autonomous_backlog_prompt
 from ai_team.providers.codex import _apply_routing_options as apply_codex_routing
 from ai_team.providers.codex import _extract_token_usage
 
@@ -50,6 +51,13 @@ class CliProviderTests(unittest.TestCase):
         )
 
         self.assertEqual(_extract_token_usage(result), 7044)
+
+    def test_codex_autonomous_backlog_uses_direct_schema(self) -> None:
+        prompt = _autonomous_backlog_prompt()
+
+        self.assertIn('"schema":"ai-team-autonomous-backlog/v1"', prompt)
+        self.assertIn('"status":"task"', prompt)
+        self.assertIn("Never include dependsOn", prompt)
 
     def test_codex_success_content_excludes_native_stderr_diagnostics(self) -> None:
         provider = CodexProvider(

@@ -66,6 +66,13 @@ class CodexProvider(BaseProvider):
         if request.workflow == "provider-smoke":
             return self._run_provider_smoke(request)
 
+        if request.workflow == "autonomous-product-discovery":
+            # Antigravity needs its native bounded-delivery envelope, whereas
+            # Codex can reliably emit the validated backlog object directly.
+            # Keep the provider-specific protocol here rather than making the
+            # PM prompt compromise between two incompatible JSON contracts.
+            request = replace(request, prompt=_autonomous_backlog_prompt())
+
         write_enabled = request.metadata.get("writeRequired") is True
         if write_enabled:
             # Codex danger-full-access is only allowed inside disposable linked
@@ -210,6 +217,27 @@ def _with_inline_bounded_review_evidence(request: ProviderRequest) -> ProviderRe
         prompt=prompt,
         metadata={**request.metadata, "reviewEvidenceMode": "inline-hash-bound"},
     )
+
+
+def _autonomous_backlog_prompt() -> str:
+    """Return Codex's direct, read-only autonomous PM response contract."""
+    return "\n".join((
+        "You are the read-only product manager for an autonomous development team.",
+        "Inspect the repository, tests, recent commits, project docs, and product gaps.",
+        "Choose exactly one small, high-value, independently testable next development task.",
+        "Do not edit files, run migrations or seeds, deploy, process payments, access secrets, use real customer data,",
+        "perform destructive actions, or make external account changes.",
+        "Return JSON only, with no Markdown, matching exactly one of these shapes:",
+        '{"schema":"ai-team-autonomous-backlog/v1","status":"ready","summary":"short Chinese summary"}',
+        "or",
+        '{"schema":"ai-team-autonomous-backlog/v1","status":"task","summary":"short Chinese summary",'
+        '"contract":{"schemaVersion":1,"id":"auto-lowercase-hyphenated-id","title":"non-empty Chinese title",'
+        '"source":{"kind":"trusted-contract","reference":"placeholder"},"instruction":"non-empty concrete instruction",'
+        '"allowedWritePaths":["safe/project/relative/path"],"validationCommands":["npm run lint","npm run typecheck",'
+        '"npm run test","npm run build"],"changePolicy":{"schemaChanges":false,"apiContractChanges":false,'
+        '"migrationArtifacts":false,"fixtureData":false}}}',
+        "Use status=ready only when no safe, clear coding task remains. Never include dependsOn.",
+    ))
 
 
 def _validate_smoke_response(result: ProviderResult, challenge: str) -> ProviderResult:
