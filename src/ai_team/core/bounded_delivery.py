@@ -368,7 +368,12 @@ def _run_stage(
         )
         raise
     try:
-        _reject_forbidden(json.dumps(payload, ensure_ascii=False), f"{stage} output", contract)
+        _reject_forbidden(
+            json.dumps(payload, ensure_ascii=False),
+            f"{stage} output",
+            contract,
+            allow_negated_policy_evidence=True,
+        )
         if stage == "architect":
             schema_or_api_change = payload.get("schemaOrApiChange")
             if not isinstance(schema_or_api_change, bool):
@@ -1218,7 +1223,7 @@ def _reject_forbidden(
     label: str,
     contract: TrustedTaskContract | None = None,
     *,
-    allow_negated_review_evidence: bool = False,
+    allow_negated_policy_evidence: bool = False,
 ) -> None:
     lowered = value.lower()
     if any(re.search(pattern, lowered) for pattern in FORBIDDEN_PATTERNS):
@@ -1228,7 +1233,7 @@ def _reject_forbidden(
         MIGRATION_ARTIFACT_PATTERN.search(lowered)
         and not policy.migration_artifacts
         and not (
-            allow_negated_review_evidence
+            allow_negated_policy_evidence
             and _policy_mentions_are_only_absence_evidence(lowered, MIGRATION_ARTIFACT_PATTERN)
         )
     ):
@@ -1237,7 +1242,7 @@ def _reject_forbidden(
         SCHEMA_CHANGE_PATTERN.search(lowered)
         and not policy.schema_changes
         and not (
-            allow_negated_review_evidence
+            allow_negated_policy_evidence
             and _policy_mentions_are_only_absence_evidence(lowered, SCHEMA_CHANGE_PATTERN)
         )
     ):
@@ -1246,7 +1251,7 @@ def _reject_forbidden(
         API_CONTRACT_CHANGE_PATTERN.search(lowered)
         and not policy.api_contract_changes
         and not (
-            allow_negated_review_evidence
+            allow_negated_policy_evidence
             and _policy_mentions_are_only_absence_evidence(lowered, API_CONTRACT_CHANGE_PATTERN)
         )
     ):
@@ -1255,7 +1260,7 @@ def _reject_forbidden(
         FIXTURE_DATA_PATTERN.search(lowered)
         and not policy.fixture_data
         and not (
-            allow_negated_review_evidence
+            allow_negated_policy_evidence
             and _policy_mentions_are_only_absence_evidence(lowered, FIXTURE_DATA_PATTERN)
         )
     ):
@@ -1279,7 +1284,7 @@ def _reject_forbidden_review_payload(
             value,
             label,
             contract,
-            allow_negated_review_evidence=True,
+            allow_negated_policy_evidence=True,
         )
 
 
@@ -1317,6 +1322,20 @@ def _policy_mentions_are_only_absence_evidence(text: str, pattern: re.Pattern[st
                 is not None
             )
         )
+        english_negations = list(
+            re.finditer(
+                r"\b(?:do not|does not|did not|must not|shall not|may not|cannot|can't|never)\b",
+                before,
+            )
+        )
+        english_prohibition = False
+        if english_negations:
+            negation = english_negations[-1]
+            scoped_text = before[negation.end():]
+            english_prohibition = (
+                len(scoped_text) <= 160
+                and re.search(r"\b(?:but|however|except|then|instead)\b", scoped_text) is None
+            )
         chinese_absence = (
             re.search(r"(?:未產生|未新增|未修改|未包含|沒有|不含|並未|無)", before) is not None
             and re.search(r"(?:變更|artifact|檔案|路徑|資料)", after) is not None
@@ -1343,7 +1362,12 @@ def _policy_mentions_are_only_absence_evidence(text: str, pattern: re.Pattern[st
                     is None
                 )
             )
-        if not english_absence and not chinese_absence and not chinese_prohibition:
+        if (
+            not english_absence
+            and not english_prohibition
+            and not chinese_absence
+            and not chinese_prohibition
+        ):
             return False
     return True
 
