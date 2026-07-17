@@ -360,6 +360,51 @@ class CliProviderTests(unittest.TestCase):
                 self.assertIn(instruction, prompt)
                 self.assertNotIn("[truncated]", prompt)
 
+    def test_antigravity_architect_prompt_preserves_every_allowed_write_path(self) -> None:
+        allowed_paths = [
+            "src/app/(app)/team-templates",
+            "src/components/team-template-form.tsx",
+            "src/components/team-template-form.test.tsx",
+            "src/components/team-template-list.tsx",
+            "src/components/team-template-list.test.tsx",
+            "src/components/app-shell.tsx",
+            "src/app/actions/team-funnel-template-actions.ts",
+        ]
+        validation_commands = [
+            "npm run lint",
+            "npm run typecheck",
+            "npm run test",
+            "npm run build",
+        ]
+        prompt = _compact_prompt(
+            "\n".join(
+                (
+                    "Task: Implement the approved management UI",
+                    "Instruction: Preserve the complete trusted scope",
+                    f"Allowed write paths: {json.dumps(allowed_paths)}",
+                    f"Validation commands: {json.dumps(validation_commands)}",
+                )
+            ),
+            4096,
+            challenge="challenge-complete-scope",
+            bounded_stage="architect",
+        )
+
+        allowed = prompt.split("AllowedWritePaths=", 1)[1].split("; ValidationCommands=", 1)[0]
+        commands = prompt.split("ValidationCommands=", 1)[1].split("; ImplementationEvidence=", 1)[0]
+
+        self.assertEqual(json.loads(allowed), allowed_paths)
+        self.assertEqual(json.loads(commands), validation_commands)
+
+    def test_antigravity_bounded_prompt_rejects_non_string_scope_items(self) -> None:
+        with self.assertRaisesRegex(ValueError, "allowed write paths must be a JSON string array"):
+            _compact_prompt(
+                'Task: Reject malformed scope\nAllowed write paths: ["src/safe.ts", 42]',
+                4096,
+                challenge="challenge-invalid-scope",
+                bounded_stage="architect",
+            )
+
     def test_antigravity_bounded_prompt_fails_closed_when_lossless_limit_is_too_small(self) -> None:
         with self.assertRaisesRegex(ValueError, "lossless prompt limit"):
             _compact_prompt(
@@ -592,7 +637,7 @@ class CliProviderTests(unittest.TestCase):
                     f"Implementation evidence: {evidence}",
                 )
             ),
-            1600,
+            4096,
             challenge="challenge-1",
             bounded_stage="qa",
         )
