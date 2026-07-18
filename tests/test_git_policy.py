@@ -174,6 +174,47 @@ class GitPolicyTests(unittest.TestCase):
 
             self.assertTrue(decision.allowed, decision.reasons)
 
+    def test_negative_assertion_secret_placeholders_are_not_secret_material(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            make_disposable_worktree(root)
+            (root / "invitation.test.ts").write_text(
+                'const response = { token: "one-time-reset-token" };\n'
+                'const suppliedInitialPassword = "initial-password-must-not-be-sent";\n'
+                'expect(url).toContain("token=one-time-reset-token");\n',
+                encoding="utf-8",
+            )
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_git_action(
+                loaded,
+                "commit",
+                candidate_files=["invitation.test.ts"],
+            )
+
+            self.assertTrue(decision.allowed, decision.reasons)
+
+    def test_unmarked_reset_token_literal_remains_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            make_disposable_worktree(root)
+            (root / "config.ts").write_text(
+                'const response = { token: "sensitive-reset-material-abc123" };\n',
+                encoding="utf-8",
+            )
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_git_action(loaded, "commit", candidate_files=["config.ts"])
+
+            self.assertFalse(decision.allowed)
+            self.assertIn("secret", " ".join(decision.reasons))
+
     def test_quoted_access_token_literal_remains_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

@@ -23,6 +23,8 @@ SAFE_SECRET_PLACEHOLDER_MARKERS = (
     b"example",
     b"fake",
     b"mock",
+    b"must-not-be-sent",
+    b"one-time-reset-token",
     b"placeholder",
     b"test",
 )
