@@ -117,6 +117,34 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(result["taskFailureCount"], 3)
             self.assertIn("3 份相同失敗紀錄", notifications[0])
 
+    def test_successful_engineer_receipt_clears_historical_failure_streak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            supervisor = root / "supervisor.json"
+            reports = root / "reports"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(supervisor, now, status="running")
+            _write_task_failure_receipts(reports, count=4, reason="git-policy-denied")
+            _append_successful_engineer_receipt(reports)
+            notifications: list[str] = []
+
+            result = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                report_dir=reports,
+                now=now,
+                runner=_service_runner(5),
+                notifier=lambda _title, message: notifications.append(message) or True,
+            )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertIsNone(result["taskFailureReason"])
+            self.assertEqual(result["taskFailureCount"], 0)
+            self.assertEqual(result["taskReceiptCount"], 5)
+            self.assertEqual(notifications, [])
+
     def test_duplicate_alert_is_suppressed_during_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -217,6 +245,21 @@ def _write_task_failure_receipts(report_dir: Path, *, count: int, reason: str) -
         receipt.write_text(json.dumps({"stopReason": reason}), encoding="utf-8")
         receipts.append(str(receipt))
     (task_root / "state.json").write_text(json.dumps({"receipts": receipts}), encoding="utf-8")
+
+
+def _append_successful_engineer_receipt(report_dir: Path) -> None:
+    task_root = (
+        report_dir
+        / "continuous-bounded-delivery"
+        / "tasks"
+        / f"auto-example-task-{'a' * 12}"
+    )
+    state_path = task_root / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    receipt = task_root / "receipts" / "99-engineer.json"
+    receipt.write_text(json.dumps({"validationResult": {"success": True}}), encoding="utf-8")
+    state["receipts"].append(str(receipt))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
 
 
 def _service_runner(restarts: int):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-from collections import Counter
 import json
 import os
 import subprocess
@@ -283,7 +282,7 @@ def _task_failure_evidence(report_dir: Path | None, supervisor: dict[str, Any]) 
     if not isinstance(receipts, list):
         return empty
 
-    reasons: Counter[str] = Counter()
+    receipt_reasons: list[str | None] = []
     receipt_count = 0
     # Bound filesystem work even if a damaged state file contains an oversized list.
     for value in receipts[-200:]:
@@ -308,12 +307,19 @@ def _task_failure_evidence(report_dir: Path | None, supervisor: dict[str, Any]) 
         reason = receipt.get("stopReason")
         if not isinstance(reason, str) and isinstance(validation, dict):
             reason = validation.get("stopReason")
-        if isinstance(reason, str) and reason.strip():
-            reasons[reason.strip()] += 1
+        receipt_reasons.append(reason.strip() if isinstance(reason, str) and reason.strip() else None)
 
-    if not reasons:
+    # Only alert on the latest uninterrupted run of the same failure. A
+    # successful receipt proves that the task has recovered and must clear old
+    # failures, otherwise a repaired task would keep raising stale alerts.
+    if not receipt_reasons or receipt_reasons[-1] is None:
         return {"reason": None, "count": 0, "receiptCount": receipt_count}
-    reason, count = reasons.most_common(1)[0]
+    reason = receipt_reasons[-1]
+    count = 0
+    for candidate in reversed(receipt_reasons):
+        if candidate != reason:
+            break
+        count += 1
     return {"reason": reason, "count": count, "receiptCount": receipt_count}
 
 
