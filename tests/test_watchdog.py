@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ai_team.core.watchdog import WatchdogThresholds, run_watchdog
+from ai_team.core.watchdog_repair import AutoRepairOptions, CONTRACT_COMMAND_DIAGNOSTIC
 
 
 class WatchdogTests(unittest.TestCase):
@@ -218,16 +219,272 @@ class WatchdogTests(unittest.TestCase):
                     runner=_service_runner(0),
                 )
 
+    def test_restart_loop_repairs_contract_commands_and_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = _write_project(root)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            contract = contracts / "task.json"
+            _write_incomplete_contract(contract)
+            supervisor = root / "supervisor.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(
+                supervisor,
+                now,
+                status="attention-required",
+                stop_reason="bounded-delivery-exception",
+                diagnostic=CONTRACT_COMMAND_DIAGNOSTIC,
+                contract_path=contract,
+            )
+            runner = _RecordingServiceRunner(restarts=7)
+            notifications: list[str] = []
+            result: dict[str, object] = {}
 
-def _write_supervisor(path: Path, updated_at: datetime, *, status: str) -> None:
+            for offset in range(3):
+                result = run_watchdog(
+                    supervisor,
+                    root / "watchdog.json",
+                    root / "alerts.log",
+                    service_name="example.service",
+                    now=now + timedelta(minutes=offset),
+                    runner=runner,
+                    notifier=lambda title, _message: notifications.append(title) or True,
+                    auto_repair=AutoRepairOptions(
+                        enabled=True,
+                        project_path=project,
+                        contract_dir=contracts,
+                        backup_dir=root / "backups",
+                        max_attempts=2,
+                    ),
+                )
+
+            self.assertEqual(result["status"], "repaired")
+            self.assertEqual(result["alertType"], "auto-repair-success")
+            self.assertTrue(result["repair"]["restarted"])
+            repaired = json.loads(contract.read_text(encoding="utf-8"))
+            self.assertEqual(
+                repaired["validationCommands"],
+                ["npm run lint", "npm run typecheck", "npm run test", "npm run build"],
+            )
+            self.assertEqual(len(list((root / "backups").glob("*.bak"))), 1)
+            self.assertEqual(runner.actions.count("stop"), 1)
+            self.assertEqual(runner.actions.count("reset-failed"), 1)
+            self.assertEqual(runner.actions.count("start"), 1)
+            self.assertEqual(notifications, ["AI Team 已自動修復並重啟"])
+
+    def test_unknown_failure_stops_then_honors_repair_attempt_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = _write_project(root)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            supervisor = root / "supervisor.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(
+                supervisor,
+                now,
+                status="attention-required",
+                stop_reason="unknown-failure",
+                diagnostic="unknown diagnostic",
+            )
+            runner = _RecordingServiceRunner(restarts=2)
+            options = AutoRepairOptions(
+                enabled=True,
+                project_path=project,
+                contract_dir=contracts,
+                backup_dir=root / "backups",
+                max_attempts=1,
+            )
+            thresholds = WatchdogThresholds(
+                repeat_count=1,
+                restart_count=99,
+                stale_seconds=3600,
+                cooldown_seconds=1800,
+            )
+
+            first = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                now=now,
+                runner=runner,
+                notifier=lambda _title, _message: True,
+                thresholds=thresholds,
+                auto_repair=options,
+            )
+            second = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                now=now + timedelta(minutes=1),
+                runner=runner,
+                notifier=lambda _title, _message: True,
+                thresholds=thresholds,
+                auto_repair=options,
+            )
+
+            self.assertEqual(first["status"], "repair-failed")
+            self.assertEqual(first["repair"]["action"], "unsupported")
+            self.assertEqual(second["status"], "repair-exhausted")
+            self.assertEqual(second["alertType"], "auto-repair-exhausted")
+            self.assertEqual(runner.actions.count("stop"), 1)
+            self.assertNotIn("start", runner.actions)
+
+    def test_failed_service_gets_one_controlled_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = _write_project(root)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            supervisor = root / "supervisor.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(supervisor, now, status="running")
+            runner = _RecordingServiceRunner(restarts=1, active_state="failed", sub_state="failed")
+
+            result = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                now=now,
+                runner=runner,
+                notifier=lambda _title, _message: True,
+                auto_repair=AutoRepairOptions(
+                    enabled=True,
+                    project_path=project,
+                    contract_dir=contracts,
+                    backup_dir=root / "backups",
+                ),
+            )
+
+            self.assertEqual(result["status"], "repaired")
+            self.assertEqual(result["repair"]["action"], "controlled-restart")
+            self.assertEqual(runner.actions[-3:], ["stop", "reset-failed", "start"])
+
+    def test_failed_contract_repair_restores_original_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = _write_project(root)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            contract = contracts / "task.json"
+            _write_incomplete_contract(contract)
+            payload = json.loads(contract.read_text(encoding="utf-8"))
+            payload["allowedWritePaths"] = ["../outside.ts"]
+            contract.write_text(json.dumps(payload), encoding="utf-8")
+            original = contract.read_bytes()
+            supervisor = root / "supervisor.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(
+                supervisor,
+                now,
+                status="attention-required",
+                stop_reason="bounded-delivery-exception",
+                diagnostic=CONTRACT_COMMAND_DIAGNOSTIC,
+                contract_path=contract,
+            )
+            runner = _RecordingServiceRunner(restarts=1)
+
+            result = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                now=now,
+                runner=runner,
+                notifier=lambda _title, _message: True,
+                thresholds=WatchdogThresholds(
+                    repeat_count=1,
+                    restart_count=99,
+                    stale_seconds=3600,
+                    cooldown_seconds=1800,
+                ),
+                auto_repair=AutoRepairOptions(
+                    enabled=True,
+                    project_path=project,
+                    contract_dir=contracts,
+                    backup_dir=root / "backups",
+                ),
+            )
+
+            self.assertEqual(result["status"], "repair-failed")
+            self.assertEqual(contract.read_bytes(), original)
+            self.assertEqual(runner.actions.count("stop"), 1)
+            self.assertNotIn("start", runner.actions)
+
+
+def _write_supervisor(
+    path: Path,
+    updated_at: datetime,
+    *,
+    status: str,
+    stop_reason: str | None = None,
+    diagnostic: str | None = None,
+    contract_path: Path | None = None,
+) -> None:
     payload = {
         "updatedAt": updated_at.isoformat(),
         "status": status,
-        "currentTask": {"id": "auto-example-task", "taskSha": "a" * 64},
-        "stopReason": "publication-exception" if status == "attention-required" else None,
+        "currentTask": {
+            "id": "auto-example-task",
+            "taskSha": "a" * 64,
+            **({"contractPath": str(contract_path)} if contract_path else {}),
+        },
+        "stopReason": (
+            stop_reason
+            if stop_reason is not None
+            else ("publication-exception" if status == "attention-required" else None)
+        ),
         "nextAction": "manual-review-required" if status == "attention-required" else "bounded-delivery",
+        "diagnostic": diagnostic,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_project(root: Path) -> Path:
+    project = root / "project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    profile = project / ".ai-team" / "project.yaml"
+    profile.parent.mkdir()
+    profile.write_text(
+        """project:
+  name: watchdog-test
+  root: "."
+  stage: development
+commands:
+  lint: npm run lint
+  typecheck: npm run typecheck
+  test: npm run test
+  build: npm run build
+safety:
+  allow_git_push: false
+  allow_deploy: false
+  allow_database_migration: false
+  allow_database_seed: false
+  allow_destructive_commands: false
+""",
+        encoding="utf-8",
+    )
+    return project
+
+
+def _write_incomplete_contract(path: Path) -> None:
+    path.write_text(
+        json.dumps({
+            "schemaVersion": 1,
+            "id": "auto-example-task",
+            "title": "Example",
+            "source": {"kind": "trusted-contract", "reference": "test"},
+            "instruction": "Add safe tests.",
+            "allowedWritePaths": ["tests/example.test.ts"],
+            "validationCommands": ["npm run lint", "npm run test -- tests/example.test.ts"],
+        }),
+        encoding="utf-8",
+    )
 
 
 def _write_task_failure_receipts(report_dir: Path, *, count: int, reason: str) -> None:
@@ -272,6 +529,33 @@ def _service_runner(restarts: int):
         )
 
     return run
+
+
+class _RecordingServiceRunner:
+    def __init__(
+        self,
+        *,
+        restarts: int,
+        active_state: str = "active",
+        sub_state: str = "running",
+    ) -> None:
+        self.restarts = restarts
+        self.active_state = active_state
+        self.sub_state = sub_state
+        self.actions: list[str] = []
+
+    def __call__(self, args, **_kwargs):
+        action = args[2]
+        self.actions.append(action)
+        if action == "show":
+            stdout = (
+                f"NRestarts={self.restarts}\n"
+                f"ActiveState={self.active_state}\n"
+                f"SubState={self.sub_state}\n"
+            )
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
 
 
 if __name__ == "__main__":

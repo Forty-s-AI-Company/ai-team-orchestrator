@@ -764,8 +764,20 @@ ai-team watchdog \
   --report-dir ~/.local/share/ai-team/CelebrateDeal/reports \
   --service celebratedeal-ai-team-supervisor.service \
   --repeat-count 3 --restart-count 3 \
-  --stale-minutes 25 --cooldown-minutes 30
+  --stale-minutes 25 --cooldown-minutes 30 \
+  --auto-repair \
+  --project ~/projects/CelebrateDeal \
+  --contract-dir ~/.local/share/ai-team/CelebrateDeal/contracts \
+  --repair-backup-dir ~/.local/state/ai-team/CelebrateDeal/repair-backups \
+  --max-auto-repair-attempts 2
 ```
+
+With `--auto-repair`, the watchdog stops the Supervisor before every repair.
+It deterministically restores project-profile validation commands for the
+known malformed-contract failure, and performs one bounded clean restart for
+a failed service or stale state. Unknown failures remain stopped with their
+evidence intact. The same failure is attempted at most twice; reaching the
+limit sends a final notification and does not restart the service.
 
 Use `--test-notification` to verify the Windows notification path without
 reading the supervisor state or calling an AI provider.

@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from ai_team.core.watchdog_repair import AutoRepairOptions, attempt_auto_repair, repair_key
+
 
 @dataclass(frozen=True)
 class WatchdogThresholds:
@@ -34,10 +36,12 @@ def run_watchdog(
     runner: Runner = subprocess.run,
     notifier: Notifier | None = None,
     powershell_path: str = "powershell.exe",
+    auto_repair: AutoRepairOptions = AutoRepairOptions(),
 ) -> dict[str, Any]:
     """Inspect one supervisor snapshot and emit at most one deduplicated alert."""
 
     _validate_thresholds(thresholds)
+    _validate_auto_repair(auto_repair)
     checked_at = _as_utc(now or datetime.now(UTC))
     supervisor = _read_json(supervisor_state_path)
     previous = _read_json(watchdog_state_path, missing_ok=True)
@@ -67,6 +71,38 @@ def run_watchdog(
         task_failure,
         thresholds,
     )
+    current_repair_key = repair_key(supervisor, task_failure["reason"])
+    previous_repair_attempts = (
+        _nonnegative_int(previous.get("repairAttempts"))
+        if previous.get("repairKey") == current_repair_key
+        else 0
+    )
+    repair: dict[str, Any] | None = None
+    repair_attempts = previous_repair_attempts
+    if alert and auto_repair.enabled:
+        if previous_repair_attempts < auto_repair.max_attempts:
+            repair_attempts += 1
+            repair = attempt_auto_repair(
+                supervisor,
+                alert_type=alert["type"],
+                service_name=service_name,
+                options=auto_repair,
+                runner=runner,
+                now=checked_at,
+            )
+        else:
+            repair = {
+                "attempted": False,
+                "success": False,
+                "action": "attempt-limit-reached",
+                "diagnostic": "maximum automatic repair attempts reached; supervisor remains stopped",
+                "restarted": False,
+                "exhausted": True,
+            }
+        alert = _repair_alert(alert, repair, repair_attempts, auto_repair.max_attempts)
+    elif not _repair_condition_present(supervisor, task_failure, restart_delta):
+        current_repair_key = None
+        repair_attempts = 0
     delivered = False
     suppressed = False
     if alert:
@@ -93,6 +129,15 @@ def run_watchdog(
         "lastTaskFailureReason": task_failure["reason"],
         "taskFailureCount": task_failure["count"],
         "taskReceiptCount": task_failure["receiptCount"],
+        "autoRepairEnabled": auto_repair.enabled,
+        "repairKey": current_repair_key,
+        "repairAttempts": repair_attempts,
+        "lastRepairAt": (
+            checked_at.isoformat()
+            if repair and repair.get("attempted") is True
+            else previous.get("lastRepairAt")
+        ),
+        "lastRepair": repair if repair is not None else previous.get("lastRepair"),
         "lastAlertKey": (
             alert["key"]
             if alert and not suppressed
@@ -106,8 +151,18 @@ def run_watchdog(
     }
     _write_json_atomic(watchdog_state_path, state)
 
+    status = "ok"
+    if repair is not None:
+        if repair.get("success") is True:
+            status = "repaired"
+        elif repair.get("exhausted") is True:
+            status = "repair-exhausted"
+        else:
+            status = "repair-failed"
+    elif alert and not suppressed:
+        status = "alerted"
     return {
-        "status": "alerted" if alert and not suppressed else "ok",
+        "status": status,
         "alertType": alert.get("type") if alert else None,
         "notificationDelivered": delivered,
         "notificationSuppressed": suppressed,
@@ -117,7 +172,46 @@ def run_watchdog(
         "taskFailureReason": task_failure["reason"],
         "taskFailureCount": task_failure["count"],
         "taskReceiptCount": task_failure["receiptCount"],
+        "repairAttempts": repair_attempts,
+        "repair": repair,
         "service": service,
+    }
+
+
+def _repair_condition_present(
+    supervisor: dict[str, Any], task_failure: dict[str, Any], restart_delta: int
+) -> bool:
+    return _needs_attention(supervisor) or bool(task_failure["reason"]) or restart_delta > 0
+
+
+def _repair_alert(
+    original: dict[str, str],
+    repair: dict[str, Any],
+    attempts: int,
+    maximum: int,
+) -> dict[str, str]:
+    if repair.get("success") is True:
+        return {
+            "type": "auto-repair-success",
+            "key": f"auto-repair-success:{original['key']}:{attempts}",
+            "title": "AI Team 已自動修復並重啟",
+            "message": f"修復動作：{repair.get('action')}；嘗試 {attempts}/{maximum}。",
+        }
+    if repair.get("exhausted") is True:
+        return {
+            "type": "auto-repair-exhausted",
+            "key": f"auto-repair-exhausted:{original['key']}",
+            "title": "AI Team 自動修復已停止",
+            "message": f"同一問題已達 {maximum} 次修復上限；Supervisor 保持停止，請查看紀錄。",
+        }
+    return {
+        "type": "auto-repair-failed",
+        "key": f"auto-repair-failed:{original['key']}:{attempts}",
+        "title": "AI Team 自動修復未完成",
+        "message": (
+            f"修復動作：{repair.get('action')}；嘗試 {attempts}/{maximum}。"
+            "Supervisor 已停止，下一輪會在上限內重試。"
+        ),
     }
 
 
@@ -405,6 +499,15 @@ def _validate_thresholds(thresholds: WatchdogThresholds) -> None:
         thresholds.cooldown_seconds,
     ) <= 0:
         raise ValueError("watchdog thresholds must be positive")
+
+
+def _validate_auto_repair(options: AutoRepairOptions) -> None:
+    if options.max_attempts <= 0:
+        raise ValueError("watchdog auto repair attempts must be positive")
+    if options.enabled and any(
+        path is None for path in (options.project_path, options.contract_dir, options.backup_dir)
+    ):
+        raise ValueError("watchdog auto repair requires project, contract, and backup paths")
 
 
 def _nonnegative_int(value: Any) -> int:

@@ -26,6 +26,7 @@ from ai_team.core.trusted_dev import (
     validate_trusted_dev_project,
 )
 from ai_team.core.watchdog import WatchdogThresholds, run_watchdog, send_windows_toast
+from ai_team.core.watchdog_repair import AutoRepairOptions
 from ai_team.providers import (
     AntigravityProvider,
     AntigravitySettings,
@@ -239,6 +240,11 @@ def check_watchdog(
     cooldown_minutes: int,
     powershell_path: str,
     test_notification: bool,
+    auto_repair: bool,
+    project: str | None,
+    contract_dir: str | None,
+    repair_backup_dir: str | None,
+    max_auto_repair_attempts: int,
 ) -> None:
     if test_notification:
         delivered = send_windows_toast(
@@ -248,6 +254,10 @@ def check_watchdog(
         )
         print(json.dumps({"status": "tested", "notificationDelivered": delivered}, indent=2))
         return
+    if auto_repair and not all((project, contract_dir, repair_backup_dir)):
+        raise ValueError(
+            "watchdog --auto-repair requires --project, --contract-dir, and --repair-backup-dir"
+        )
 
     result = run_watchdog(
         Path(supervisor_state).resolve(),
@@ -262,6 +272,13 @@ def check_watchdog(
             cooldown_seconds=cooldown_minutes * 60,
         ),
         powershell_path=powershell_path,
+        auto_repair=AutoRepairOptions(
+            enabled=auto_repair,
+            project_path=Path(project).resolve() if project else None,
+            contract_dir=Path(contract_dir).resolve() if contract_dir else None,
+            backup_dir=Path(repair_backup_dir).resolve() if repair_backup_dir else None,
+            max_attempts=max_auto_repair_attempts,
+        ),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -841,6 +858,11 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog_parser.add_argument("--cooldown-minutes", type=int, default=30)
     watchdog_parser.add_argument("--powershell-path", default="powershell.exe")
     watchdog_parser.add_argument("--test-notification", action="store_true")
+    watchdog_parser.add_argument("--auto-repair", action="store_true")
+    watchdog_parser.add_argument("--project")
+    watchdog_parser.add_argument("--contract-dir")
+    watchdog_parser.add_argument("--repair-backup-dir")
+    watchdog_parser.add_argument("--max-auto-repair-attempts", type=int, default=2)
 
     git_policy_parser = subparsers.add_parser("git-policy", help="Evaluate guarded git automation policy")
     git_policy_parser.add_argument("project", nargs="?", default=".")
@@ -1025,6 +1047,11 @@ def main() -> None:
                 args.cooldown_minutes,
                 args.powershell_path,
                 args.test_notification,
+                args.auto_repair,
+                args.project,
+                args.contract_dir,
+                args.repair_backup_dir,
+                args.max_auto_repair_attempts,
             )
         elif args.command == "git-policy":
             evaluate_git_policy(args.project, args.action, args.file)
