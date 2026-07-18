@@ -25,6 +25,7 @@ from ai_team.core.trusted_dev import (
     load_trusted_dev_settings,
     validate_trusted_dev_project,
 )
+from ai_team.core.watchdog import WatchdogThresholds, run_watchdog, send_windows_toast
 from ai_team.providers import (
     AntigravityProvider,
     AntigravitySettings,
@@ -224,6 +225,43 @@ def create_repair_receipt(
         Path(report_dir).resolve() if report_dir else REPO_ROOT / "reports" / "ci-monitor",
     )
     print(json.dumps({"receiptPath": str(path)}, indent=2))
+
+
+def check_watchdog(
+    supervisor_state: str,
+    watchdog_state: str,
+    alert_log: str,
+    service: str,
+    repeat_count: int,
+    restart_count: int,
+    stale_minutes: int,
+    cooldown_minutes: int,
+    powershell_path: str,
+    test_notification: bool,
+) -> None:
+    if test_notification:
+        delivered = send_windows_toast(
+            "AI Team 提醒測試",
+            "Windows 桌面通知已成功啟用；這次測試不會呼叫任何 AI 模型。",
+            powershell_path=powershell_path,
+        )
+        print(json.dumps({"status": "tested", "notificationDelivered": delivered}, indent=2))
+        return
+
+    result = run_watchdog(
+        Path(supervisor_state).resolve(),
+        Path(watchdog_state).resolve(),
+        Path(alert_log).resolve(),
+        service_name=service,
+        thresholds=WatchdogThresholds(
+            repeat_count=repeat_count,
+            restart_count=restart_count,
+            stale_seconds=stale_minutes * 60,
+            cooldown_seconds=cooldown_minutes * 60,
+        ),
+        powershell_path=powershell_path,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 def build_openhands_provider(settings: dict) -> OpenHandsProvider:
@@ -786,6 +824,21 @@ def build_parser() -> argparse.ArgumentParser:
     repair_receipt_parser.add_argument("--final-ci-evidence", required=True)
     repair_receipt_parser.add_argument("--report-dir")
 
+    watchdog_parser = subparsers.add_parser(
+        "watchdog",
+        help="Detect repeated supervisor stalls and send a deduplicated Windows notification",
+    )
+    watchdog_parser.add_argument("--supervisor-state", required=True)
+    watchdog_parser.add_argument("--watchdog-state", required=True)
+    watchdog_parser.add_argument("--alert-log", required=True)
+    watchdog_parser.add_argument("--service", required=True)
+    watchdog_parser.add_argument("--repeat-count", type=int, default=3)
+    watchdog_parser.add_argument("--restart-count", type=int, default=3)
+    watchdog_parser.add_argument("--stale-minutes", type=int, default=25)
+    watchdog_parser.add_argument("--cooldown-minutes", type=int, default=30)
+    watchdog_parser.add_argument("--powershell-path", default="powershell.exe")
+    watchdog_parser.add_argument("--test-notification", action="store_true")
+
     git_policy_parser = subparsers.add_parser("git-policy", help="Evaluate guarded git automation policy")
     git_policy_parser.add_argument("project", nargs="?", default=".")
     git_policy_parser.add_argument(
@@ -955,6 +1008,19 @@ def main() -> None:
                 args.task_path,
                 args.final_ci_evidence,
                 args.report_dir,
+            )
+        elif args.command == "watchdog":
+            check_watchdog(
+                args.supervisor_state,
+                args.watchdog_state,
+                args.alert_log,
+                args.service,
+                args.repeat_count,
+                args.restart_count,
+                args.stale_minutes,
+                args.cooldown_minutes,
+                args.powershell_path,
+                args.test_notification,
             )
         elif args.command == "git-policy":
             evaluate_git_policy(args.project, args.action, args.file)
