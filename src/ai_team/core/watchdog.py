@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import Counter
 import json
 import os
 import subprocess
@@ -28,6 +29,7 @@ def run_watchdog(
     alert_log_path: Path,
     *,
     service_name: str,
+    report_dir: Path | None = None,
     thresholds: WatchdogThresholds = WatchdogThresholds(),
     now: datetime | None = None,
     runner: Runner = subprocess.run,
@@ -54,6 +56,7 @@ def run_watchdog(
     previous_restart_total = _nonnegative_int(previous.get("lastRestartCount"))
     restart_delta = max(0, restart_total - previous_restart_total) if previous else 0
     stale_seconds = _state_age_seconds(supervisor, checked_at)
+    task_failure = _task_failure_evidence(report_dir, supervisor)
 
     alert = _select_alert(
         supervisor,
@@ -62,6 +65,7 @@ def run_watchdog(
         same_signature_count,
         restart_delta,
         stale_seconds,
+        task_failure,
         thresholds,
     )
     delivered = False
@@ -87,6 +91,9 @@ def run_watchdog(
         "sameSignatureCount": same_signature_count,
         "lastSupervisorUpdatedAt": supervisor.get("updatedAt"),
         "lastRestartCount": restart_total,
+        "lastTaskFailureReason": task_failure["reason"],
+        "taskFailureCount": task_failure["count"],
+        "taskReceiptCount": task_failure["receiptCount"],
         "lastAlertKey": (
             alert["key"]
             if alert and not suppressed
@@ -108,6 +115,9 @@ def run_watchdog(
         "sameSignatureCount": same_signature_count,
         "restartDelta": restart_delta,
         "staleSeconds": stale_seconds,
+        "taskFailureReason": task_failure["reason"],
+        "taskFailureCount": task_failure["count"],
+        "taskReceiptCount": task_failure["receiptCount"],
         "service": service,
     }
 
@@ -166,6 +176,7 @@ def _select_alert(
     same_signature_count: int,
     restart_delta: int,
     stale_seconds: int,
+    task_failure: dict[str, Any],
     thresholds: WatchdogThresholds,
 ) -> dict[str, str] | None:
     task_id = _safe_label((supervisor.get("currentTask") or {}).get("id"), "尚未分配任務")
@@ -184,6 +195,17 @@ def _select_alert(
             "key": "service-failed",
             "title": "AI Team 服務失敗",
             "message": "Supervisor 已進入 failed 狀態，請查看 systemctl 與 watchdog 告警紀錄。",
+        }
+    if task_failure["reason"] and task_failure["count"] >= thresholds.repeat_count:
+        repeated_reason = _safe_label(task_failure["reason"], "原因未提供")
+        return {
+            "type": "repeated-task-receipts",
+            "key": f"repeated-task-receipts:{task_id}:{repeated_reason}",
+            "title": "AI Team 疑似隱性迴圈",
+            "message": (
+                f"同一任務已有 {task_failure['count']} 份相同失敗紀錄。"
+                f"任務：{task_id}；原因：{repeated_reason}。"
+            ),
         }
     if _needs_attention(supervisor) and same_signature_count >= thresholds.repeat_count:
         return {
@@ -230,6 +252,69 @@ def _state_age_seconds(supervisor: dict[str, Any], now: datetime) -> int:
     except ValueError:
         return 0
     return max(0, int((now - updated_at).total_seconds()))
+
+
+def _task_failure_evidence(report_dir: Path | None, supervisor: dict[str, Any]) -> dict[str, Any]:
+    empty = {"reason": None, "count": 0, "receiptCount": 0}
+    task = supervisor.get("currentTask")
+    if report_dir is None or not isinstance(task, dict):
+        return empty
+    task_sha = task.get("taskSha")
+    if not isinstance(task_sha, str) or len(task_sha) < 12:
+        return empty
+
+    task_state_paths: list[Path] = []
+    for tasks_root in (
+        report_dir / "continuous-bounded-delivery" / "tasks",
+        report_dir / "tasks",
+    ):
+        if tasks_root.is_dir():
+            task_state_paths.extend(tasks_root.glob(f"*-{task_sha[:12]}/state.json"))
+    if len(task_state_paths) != 1:
+        return empty
+
+    task_state_path = task_state_paths[0]
+    task_root = task_state_path.parent.resolve()
+    try:
+        task_state = _read_json(task_state_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return empty
+    receipts = task_state.get("receipts")
+    if not isinstance(receipts, list):
+        return empty
+
+    reasons: Counter[str] = Counter()
+    receipt_count = 0
+    # Bound filesystem work even if a damaged state file contains an oversized list.
+    for value in receipts[-200:]:
+        if not isinstance(value, str) or not value.endswith("-engineer.json"):
+            continue
+        receipt_path = Path(value)
+        if receipt_path.is_symlink():
+            continue
+        try:
+            resolved = receipt_path.resolve()
+            resolved.relative_to(task_root)
+        except (OSError, ValueError):
+            continue
+        if not resolved.is_file() or resolved.stat().st_size > 1_000_000:
+            continue
+        try:
+            receipt = _read_json(resolved)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        receipt_count += 1
+        validation = receipt.get("validationResult")
+        reason = receipt.get("stopReason")
+        if not isinstance(reason, str) and isinstance(validation, dict):
+            reason = validation.get("stopReason")
+        if isinstance(reason, str) and reason.strip():
+            reasons[reason.strip()] += 1
+
+    if not reasons:
+        return {"reason": None, "count": 0, "receiptCount": receipt_count}
+    reason, count = reasons.most_common(1)[0]
+    return {"reason": reason, "count": count, "receiptCount": receipt_count}
 
 
 def _service_status(service_name: str, runner: Runner) -> dict[str, str]:

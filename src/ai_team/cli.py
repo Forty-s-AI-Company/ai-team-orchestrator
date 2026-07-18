@@ -231,6 +231,7 @@ def check_watchdog(
     supervisor_state: str,
     watchdog_state: str,
     alert_log: str,
+    report_dir: str,
     service: str,
     repeat_count: int,
     restart_count: int,
@@ -253,6 +254,7 @@ def check_watchdog(
         Path(watchdog_state).resolve(),
         Path(alert_log).resolve(),
         service_name=service,
+        report_dir=Path(report_dir).resolve(),
         thresholds=WatchdogThresholds(
             repeat_count=repeat_count,
             restart_count=restart_count,
@@ -831,6 +833,7 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog_parser.add_argument("--supervisor-state", required=True)
     watchdog_parser.add_argument("--watchdog-state", required=True)
     watchdog_parser.add_argument("--alert-log", required=True)
+    watchdog_parser.add_argument("--report-dir", required=True)
     watchdog_parser.add_argument("--service", required=True)
     watchdog_parser.add_argument("--repeat-count", type=int, default=3)
     watchdog_parser.add_argument("--restart-count", type=int, default=3)
@@ -1014,6 +1017,7 @@ def main() -> None:
                 args.supervisor_state,
                 args.watchdog_state,
                 args.alert_log,
+                args.report_dir,
                 args.service,
                 args.repeat_count,
                 args.restart_count,

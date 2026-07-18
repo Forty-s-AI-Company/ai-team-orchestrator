@@ -192,6 +192,41 @@ class GitPolicyTests(unittest.TestCase):
 
             self.assertTrue(decision.allowed, decision.reasons)
 
+    def test_explicit_fixture_labeled_bearer_credential_is_not_secret_material(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            make_disposable_worktree(root)
+            (root / "route.test.ts").write_text(
+                'const authorization = "Bearer test-fixture-wrong-job-secret";\n',
+                encoding="utf-8",
+            )
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_git_action(loaded, "commit", candidate_files=["route.test.ts"])
+
+            self.assertTrue(decision.allowed, decision.reasons)
+
+    def test_unmarked_bearer_credential_remains_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            make_disposable_worktree(root)
+            (root / "route.test.ts").write_text(
+                'const authorization = "Bearer live-sensitive-material";\n',
+                encoding="utf-8",
+            )
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_git_action(loaded, "commit", candidate_files=["route.test.ts"])
+
+            self.assertFalse(decision.allowed)
+            self.assertIn("secret", " ".join(decision.reasons))
+
     def test_unmarked_test_credentials_remain_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

@@ -752,14 +752,16 @@ an `attention-required` state.
 For an unattended desktop supervisor, run the zero-token watchdog once per
 minute from a systemd user timer. It sends a deduplicated Windows toast and
 appends a local JSON-lines audit record when the same `attention-required`
-signature is observed three times, the service restarts three times between
-checks, or the supervisor state has not changed for 25 minutes:
+signature is observed three times, three Engineer receipts contain the same
+stop reason, the service restarts three times between checks, or the supervisor
+state has not changed for 25 minutes:
 
 ```bash
 ai-team watchdog \
   --supervisor-state ~/.local/state/ai-team/CelebrateDeal/continuous-bounded-state.json \
   --watchdog-state ~/.local/state/ai-team/CelebrateDeal/watchdog-state.json \
   --alert-log ~/.local/state/ai-team/CelebrateDeal/watchdog-alerts.log \
+  --report-dir ~/.local/share/ai-team/CelebrateDeal/reports \
   --service celebratedeal-ai-team-supervisor.service \
   --repeat-count 3 --restart-count 3 \
   --stale-minutes 25 --cooldown-minutes 30

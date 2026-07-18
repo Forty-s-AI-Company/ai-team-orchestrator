@@ -91,6 +91,32 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(result["alertType"], "stale-state")
             self.assertEqual(result["staleSeconds"], 26 * 60)
 
+    def test_repeated_engineer_failure_receipts_alert_while_supervisor_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            supervisor = root / "supervisor.json"
+            reports = root / "reports"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(supervisor, now, status="running")
+            _write_task_failure_receipts(reports, count=3, reason="git-policy-denied")
+            notifications: list[str] = []
+
+            result = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                report_dir=reports,
+                now=now,
+                runner=_service_runner(5),
+                notifier=lambda _title, message: notifications.append(message) or True,
+            )
+
+            self.assertEqual(result["alertType"], "repeated-task-receipts")
+            self.assertEqual(result["taskFailureReason"], "git-policy-denied")
+            self.assertEqual(result["taskFailureCount"], 3)
+            self.assertIn("3 份相同失敗紀錄", notifications[0])
+
     def test_duplicate_alert_is_suppressed_during_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -169,11 +195,28 @@ def _write_supervisor(path: Path, updated_at: datetime, *, status: str) -> None:
     payload = {
         "updatedAt": updated_at.isoformat(),
         "status": status,
-        "currentTask": {"id": "auto-example-task", "taskSha": "abc123"},
+        "currentTask": {"id": "auto-example-task", "taskSha": "a" * 64},
         "stopReason": "publication-exception" if status == "attention-required" else None,
         "nextAction": "manual-review-required" if status == "attention-required" else "bounded-delivery",
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_task_failure_receipts(report_dir: Path, *, count: int, reason: str) -> None:
+    task_root = (
+        report_dir
+        / "continuous-bounded-delivery"
+        / "tasks"
+        / f"auto-example-task-{'a' * 12}"
+    )
+    receipts_dir = task_root / "receipts"
+    receipts_dir.mkdir(parents=True)
+    receipts: list[str] = []
+    for number in range(1, count + 1):
+        receipt = receipts_dir / f"{number:02d}-engineer.json"
+        receipt.write_text(json.dumps({"stopReason": reason}), encoding="utf-8")
+        receipts.append(str(receipt))
+    (task_root / "state.json").write_text(json.dumps({"receipts": receipts}), encoding="utf-8")
 
 
 def _service_runner(restarts: int):
