@@ -174,6 +174,43 @@ class GitPolicyTests(unittest.TestCase):
 
             self.assertTrue(decision.allowed, decision.reasons)
 
+    def test_explicit_fixture_labeled_credentials_are_not_secret_material(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            make_disposable_worktree(root)
+            (root / "login.test.ts").write_text(
+                'const password = "test-fixture-incorrect-password";\n'
+                'const response = { token: "test-fixture-session-token" };\n',
+                encoding="utf-8",
+            )
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_git_action(loaded, "commit", candidate_files=["login.test.ts"])
+
+            self.assertTrue(decision.allowed, decision.reasons)
+
+    def test_unmarked_test_credentials_remain_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            make_disposable_worktree(root)
+            (root / "login.test.ts").write_text(
+                'const password = "incorrect-password";\n'
+                'const response = { token: "session-token" };\n',
+                encoding="utf-8",
+            )
+            loaded = load_project(root, allowlist=[tmp])
+            loaded.current_branch = "feature/test"
+
+            decision = evaluate_git_action(loaded, "commit", candidate_files=["login.test.ts"])
+
+            self.assertFalse(decision.allowed)
+            self.assertIn("secret", " ".join(decision.reasons))
+
     def test_negative_assertion_secret_placeholders_are_not_secret_material(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

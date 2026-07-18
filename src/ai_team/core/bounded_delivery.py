@@ -1400,6 +1400,11 @@ def _engineering_instruction(context: dict[str, Any], repairs: list[dict[str, An
         "executionPolicy": {
             "trustedDevelopment": project_wide_writes,
             "writeScope": "entire-disposable-project-worktree" if project_wide_writes else "task-contract-paths",
+            "testDataConvention": (
+                "For development and test data, preserve the production-equivalent shape but label every literal "
+                "password, token, secret, or API key with an explicit non-production marker such as "
+                "test-fixture-, mock-, fake-, example-, or placeholder-. Never use real credentials."
+            ),
             "instruction": (
                 "You may modify any project file needed to complete and validate this task."
                 if project_wide_writes
