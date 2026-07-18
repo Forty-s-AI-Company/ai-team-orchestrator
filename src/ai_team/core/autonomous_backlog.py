@@ -32,6 +32,7 @@ def discover_next_task(
     state_path: Path,
     provider: BaseProvider,
     timeout_seconds: int,
+    project_validation_commands: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Generate at most one validated task for the current project revision."""
 
@@ -111,6 +112,7 @@ def discover_next_task(
             contract_dir,
             payload["contract"],
             revision=revision,
+            project_validation_commands=project_validation_commands,
         )
     except (OSError, ValueError) as exc:
         return _persist(
@@ -191,6 +193,7 @@ def _write_validated_contract(
     raw_contract: dict[str, Any],
     *,
     revision: str,
+    project_validation_commands: tuple[str, ...] = (),
 ) -> tuple[Path, str, str]:
     contract_dir.mkdir(parents=True, exist_ok=True)
     if contract_dir.is_symlink() or not contract_dir.is_dir():
@@ -206,6 +209,8 @@ def _write_validated_contract(
         "reference": f"autonomous project scan at {revision}",
     }
     sanitized["dependsOn"] = []
+    if project_validation_commands:
+        sanitized["validationCommands"] = _validated_project_commands(project_validation_commands)
     encoded = json.dumps(sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if len(encoded) > 64_000:
         raise ValueError("autonomous task contract exceeds size limit")
@@ -225,6 +230,24 @@ def _write_validated_contract(
     finally:
         temporary.unlink(missing_ok=True)
     return final_path, task_sha, task_id
+
+
+def _validated_project_commands(commands: tuple[str, ...]) -> list[str]:
+    """Return unique trusted profile commands for an autonomous contract.
+
+    The PM may suggest narrower commands, but the project profile is the
+    authority for bounded delivery. Replacing model output here prevents a
+    malformed autonomous contract from entering a systemd restart loop.
+    """
+
+    normalized: list[str] = []
+    for command in commands:
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("project validation commands must be non-empty strings")
+        value = command.strip()
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
 
 
 def _normalize_task_id(raw_id: Any, contract: dict[str, Any]) -> str:

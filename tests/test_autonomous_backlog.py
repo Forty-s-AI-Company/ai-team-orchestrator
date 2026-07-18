@@ -139,6 +139,35 @@ class AutonomousBacklogTests(unittest.TestCase):
             contract, _ = load_trusted_task_contract(Path(result["contractPath"]))
             self.assertEqual(contract.id, "auto-accessibility-audit")
 
+    def test_project_commands_replace_incomplete_model_validation_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = _task_payload()
+            payload["contract"]["validationCommands"] = [
+                "npm run lint",
+                "npm run typecheck",
+                "npm run test -- tests/one.test.ts",
+            ]
+            project_commands = (
+                "npm run lint",
+                "npm run typecheck",
+                "npm run test",
+                "npm run build",
+            )
+
+            result = discover_next_task(
+                project_path=root,
+                contract_dir=root / "contracts",
+                state_path=root / "backlog.json",
+                provider=_DiscoveryProvider(payload),
+                timeout_seconds=30,
+                project_validation_commands=project_commands,
+            )
+
+            self.assertEqual(result["status"], "task-created", result)
+            contract, _ = load_trusted_task_contract(Path(result["contractPath"]))
+            self.assertEqual(contract.validation_commands, project_commands)
+
 
 class _DiscoveryProvider(BaseProvider):
     name = "antigravity"

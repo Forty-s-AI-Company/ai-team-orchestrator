@@ -138,12 +138,35 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 autonomous_backlog: dict[str, Any] | None = None
                 if pending_count == 0 and options.autonomous_product_loop:
                     try:
+                        loaded_project = load_project(
+                            options.project_path,
+                            allowlist=options.workspace_allowlist,
+                        )
+                        commands = loaded_project.profile.commands
+                        baseline_commands = (
+                            commands.lint,
+                            commands.typecheck,
+                            commands.test,
+                            commands.build,
+                        )
+                        if not all(
+                            isinstance(command, str) and command.strip()
+                            for command in baseline_commands
+                        ):
+                            raise ValueError(
+                                "autonomous product loop requires project lint, typecheck, test, and build commands"
+                            )
                         autonomous_backlog = discover_next_task(
                             project_path=options.project_path,
                             contract_dir=options.contract_dir,
                             state_path=options.state_path.with_name("autonomous-product-backlog.json"),
                             provider=options.provider_for_role("product-manager"),
                             timeout_seconds=options.autonomous_scan_timeout_seconds,
+                            project_validation_commands=tuple(
+                                command
+                                for command in (*baseline_commands, *commands.additional_validation)
+                                if isinstance(command, str)
+                            ),
                         )
                     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                         autonomous_backlog = {
