@@ -13,6 +13,7 @@ from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_
 from ai_team.core.github_gate import evaluate_github_action
 from ai_team.core.isolated_executor import (
     _validation_env,
+    list_committed_files_since,
     prepare_dependency_link,
     remove_dependency_link,
     run_in_disposable_worktree,
@@ -90,6 +91,35 @@ def write_valid_receipt(root: Path, loaded) -> Path:
 
 
 class IsolatedExecutorTests(unittest.TestCase):
+    def test_committed_files_ignore_source_only_changes_after_branches_diverge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_committed_project(root)
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            (root / "source-only.txt").write_text("source branch\n", encoding="utf-8")
+            subprocess.run(["git", "add", "source-only.txt"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "source advance"], cwd=root, check=True, capture_output=True
+            )
+            source_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            subprocess.run(
+                ["git", "checkout", "--detach", base_sha], cwd=root, check=True, capture_output=True
+            )
+            (root / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.txt"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "candidate change"], cwd=root, check=True, capture_output=True
+            )
+
+            self.assertEqual(list_committed_files_since(root, source_sha), ["candidate.txt"])
+
     def test_trusted_next_dependencies_are_reused_until_manifest_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

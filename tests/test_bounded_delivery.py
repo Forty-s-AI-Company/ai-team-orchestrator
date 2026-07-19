@@ -13,6 +13,7 @@ from ai_team.core.bounded_delivery import (
     DeliveryLimits,
     EngineeringAttempt,
     _engineering_failure,
+    _review_patch_evidence,
     _validate_adopted_secondary_binding,
     _validated_resume_worktree,
     load_trusted_task_contract,
@@ -23,6 +24,59 @@ from ai_team.core.trusted_dev import TrustedDevSettings
 
 
 class BoundedDeliveryTests(unittest.TestCase):
+    def test_review_patch_contains_all_candidate_checkpoints_after_source_advances(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (root / "source-only.txt").write_text("source branch\n", encoding="utf-8")
+            subprocess.run(["git", "add", "source-only.txt"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "source advance"], cwd=root, check=True, capture_output=True
+            )
+            source_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            subprocess.run(
+                ["git", "checkout", "--detach", base_sha], cwd=root, check=True, capture_output=True
+            )
+            candidate = root / "docs" / "safe.md"
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_text("first checkpoint\n", encoding="utf-8")
+            subprocess.run(["git", "add", "docs/safe.md"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "candidate checkpoint one"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            candidate.write_text("first checkpoint\nsecond checkpoint\n", encoding="utf-8")
+            subprocess.run(["git", "add", "docs/safe.md"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "candidate checkpoint two"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            candidate_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            evidence = _review_patch_evidence(
+                root,
+                {
+                    "commitSha": candidate_sha,
+                    "sourceCommitSha": source_sha,
+                    "changedFiles": ["docs/safe.md"],
+                },
+            )
+
+            self.assertIn("first checkpoint", evidence["content"])
+            self.assertIn("second checkpoint", evidence["content"])
+            self.assertNotIn("source-only.txt", evidence["content"])
+
     def test_adopted_secondary_binding_rejects_tampered_evidence(self) -> None:
         secondary = {
             "schema": "ai-team-bounded-delivery/v1",

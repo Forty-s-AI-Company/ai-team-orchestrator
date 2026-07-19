@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -44,6 +45,7 @@ class IsolatedRunResult:
     executor_receipt: Path
     git_policy: dict[str, Any]
     commit_result: dict[str, Any]
+    source_commit_sha: str | None = None
     github_result: dict[str, Any] | None = None
 
 
@@ -283,6 +285,7 @@ def run_in_disposable_worktree(
             executor_receipt=executor_receipt,
             git_policy=git_policy,
             commit_result=commit_result,
+            source_commit_sha=source.commit_sha,
             github_result=github_result,
         )
     finally:
@@ -323,10 +326,19 @@ def list_changed_files(project_root: Path) -> list[str]:
 
 
 def list_committed_files_since(project_root: Path, source_sha: str | None) -> list[str]:
-    """Return files committed inside a reusable worktree after its source SHA."""
+    """Return candidate-side files since the source and worktree diverged.
+
+    A reusable worktree can remain alive while the source branch advances. In
+    that case a direct ``source..HEAD`` diff incorrectly treats source-only
+    commits as candidate deletions. Diffing from the merge base keeps the
+    result bound to changes actually made in the disposable worktree.
+    """
     if not source_sha:
         return []
-    result = _run_git(project_root, ["diff", "--name-only", f"{source_sha}..HEAD"])
+    merge_base = _run_git(project_root, ["merge-base", source_sha, "HEAD"]).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", merge_base):
+        raise ValueError("source and reusable worktree have no valid merge base")
+    result = _run_git(project_root, ["diff", "--name-only", f"{merge_base}..HEAD"])
     return sorted({line.strip() for line in result.stdout.splitlines() if line.strip()})
 
 

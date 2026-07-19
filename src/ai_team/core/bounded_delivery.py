@@ -116,6 +116,7 @@ class EngineeringAttempt:
     commit_sha: str | None
     run_receipt: Path | None = None
     executor_receipt: Path | None = None
+    source_commit_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             "repairs",
             "worktreeInitialized",
             "worktreeBaseSha",
+            "sourceCommitSha",
         ):
             if key in prior:
                 context[key] = prior[key]
@@ -281,6 +283,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 "validation": evidence["validation"],
                 "runReceipt": evidence.get("runReceipt"),
                 "executorReceipt": evidence.get("executorReceipt"),
+                "sourceCommitSha": evidence.get("sourceCommitSha"),
             })
             qa_checkpoint = checkpoints.get("qa")
             _write_state(options, "running", "qa", context)
@@ -356,6 +359,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 "validation": attempt.validation,
                 "runReceipt": str(attempt.run_receipt) if attempt.run_receipt else None,
                 "executorReceipt": str(attempt.executor_receipt) if attempt.executor_receipt else None,
+                "sourceCommitSha": attempt.source_commit_sha,
                 "worktreeInitialized": False,
             })
             _write_state(options, "running", "engineer", context)
@@ -453,6 +457,9 @@ def _run_stage(
                     "structured-output",
                     str(exc),
                     primaryStatus=payload.get("status") if isinstance(payload, dict) else None,
+                    primaryFindings=payload.get("findings") if isinstance(payload, dict) else None,
+                    primaryTests=payload.get("tests") if isinstance(payload, dict) else None,
+                    primaryBlockers=payload.get("blockers") if isinstance(payload, dict) else None,
                 ),
             )
             raise
@@ -577,7 +584,7 @@ def _default_engineering_executor(
             provider_result=result.workflow_result.provider_result, worktree_path=result.worktree_path,
             changed_files=list(result.git_policy.get("changedFiles") or []), validation=validation,
             commit_sha=result.commit_result.get("commitSha"), run_receipt=result.run_receipt,
-            executor_receipt=result.executor_receipt,
+            executor_receipt=result.executor_receipt, source_commit_sha=result.source_commit_sha,
         )
     return execute
 
@@ -638,8 +645,15 @@ def _stage_prompt(
 
 
 def _review_patch_evidence(root: Path, context: dict[str, Any]) -> dict[str, Any]:
-    """Build exact, redacted diff evidence without exposing the primary worktree."""
+    """Build the cumulative candidate diff without exposing the worktree.
+
+    Engineering may use several checkpoint commits. The source branch may also
+    advance while the disposable worktree remains alive, so the review must
+    inspect every candidate-side commit since the merge base instead of only
+    the final repair commit.
+    """
     commit_sha = context.get("commitSha")
+    source_commit_sha = context.get("sourceCommitSha")
     changed_files = context.get("changedFiles")
     if (
         not isinstance(commit_sha, str)
@@ -650,17 +664,34 @@ def _review_patch_evidence(root: Path, context: dict[str, Any]) -> dict[str, Any
     ):
         raise BoundedDeliveryError("review-patch-evidence-invalid")
     try:
+        revision = commit_sha
+        command = "show"
+        if isinstance(source_commit_sha, str) and re.fullmatch(r"[0-9a-f]{40}", source_commit_sha):
+            merge_base_result = subprocess.run(
+                ["git", "-C", str(root), "merge-base", source_commit_sha, commit_sha],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+            merge_base = merge_base_result.stdout.strip()
+            if merge_base_result.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", merge_base) is None:
+                raise BoundedDeliveryError("review-patch-evidence-unavailable")
+            revision = f"{merge_base}..{commit_sha}"
+            command = "diff"
         completed = subprocess.run(
             [
                 "git",
                 "-C",
                 str(root),
-                "show",
-                "--format=",
+                command,
+                *(["--format="] if command == "show" else []),
                 "--no-ext-diff",
                 "--no-textconv",
                 "--unified=3",
-                commit_sha,
+                revision,
                 "--",
                 *changed_files,
             ],
@@ -764,6 +795,7 @@ def _record_engineering_receipt(
         "iteration": iteration, "changedFiles": attempt.changed_files, "validation": attempt.validation,
         "commitSha": attempt.commit_sha, "runReceipt": str(attempt.run_receipt) if attempt.run_receipt else None,
         "executorReceipt": str(attempt.executor_receipt) if attempt.executor_receipt else None,
+        "sourceCommitSha": attempt.source_commit_sha,
     }
     if failure is not None:
         reason, _stage, kind = failure
