@@ -605,19 +605,13 @@ def publish_and_merge(
         and result.get("taskSha") == entry.task_sha
     ):
         return _publication_failure("bounded-delivery-publication-evidence-missing")
-    worktree = Path(worktree_value).resolve()
-    run_receipt = Path(run_receipt_value).resolve()
-    if not worktree.is_dir() or not run_receipt.is_file():
-        return _publication_failure("bounded-delivery-publication-artifact-missing")
-
     primary = load_project(options.project_path, allowlist=options.workspace_allowlist)
     if options.allow_unreviewed_development_merge and primary.profile.project.stage != "development":
         return _publication_failure("unreviewed-merge-requires-development-stage")
     require_review = not options.allow_unreviewed_development_merge
-    loaded = load_project(worktree, allowlist=options.workspace_allowlist)
     branch = f"codex/auto-{_slug(entry.contract.id)}-{entry.task_sha[:8]}"
-    repository = _repository_name(worktree)
-    existing = _find_pull_request(worktree, repository, branch, commit_sha)
+    repository = _repository_name(options.project_path)
+    existing = _find_pull_request(options.project_path, repository, branch, commit_sha)
     if existing and existing.get("state") == "MERGED":
         synced = _sync_primary(options.project_path, primary.current_branch)
         return {
@@ -627,6 +621,15 @@ def publish_and_merge(
             "syncedHead": synced,
             "resumedMergedPullRequest": True,
         }
+
+    # A completed merge can legitimately be resumed after its disposable
+    # worktree and local receipt have been cleaned up. Only an unmerged/open
+    # publication still needs those local artifacts for push, PR, and CI gates.
+    worktree = Path(worktree_value).resolve()
+    run_receipt = Path(run_receipt_value).resolve()
+    if not worktree.is_dir() or not run_receipt.is_file():
+        return _publication_failure("bounded-delivery-publication-artifact-missing")
+    loaded = load_project(worktree, allowlist=options.workspace_allowlist)
 
     validation_hash = str(validation["hash"])
     pr_url = str(existing.get("url")) if existing else ""

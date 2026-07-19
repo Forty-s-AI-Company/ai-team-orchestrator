@@ -24,6 +24,54 @@ from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
 
 
 class ContinuousBoundedSupervisorTests(unittest.TestCase):
+    def test_merged_publication_resumes_after_disposable_artifacts_are_cleaned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            _write_contract(contracts / "001-task.json", "task")
+            entry = discover_contracts(contracts)[0]
+            result = {
+                "status": "completed",
+                "taskSha": entry.task_sha,
+                "commitSha": "a" * 40,
+                "worktreePath": str(root / "already-cleaned-worktree"),
+                "runReceipt": str(root / "already-cleaned-receipt.json"),
+                "validation": {"hash": "b" * 64},
+            }
+            primary = SimpleNamespace(
+                root=root,
+                current_branch="development",
+                profile=SimpleNamespace(project=SimpleNamespace(stage="development")),
+            )
+            options = ContinuousBoundedOptions(
+                project_path=root,
+                contract_dir=contracts,
+                provider_for_role=lambda _role: _NoopProvider(),
+                workspace_allowlist=[tmp],
+                report_dir=root / "reports",
+                state_path=root / "state.json",
+                once=False,
+                github_execute=True,
+                auto_merge=True,
+                allow_unreviewed_development_merge=True,
+            )
+
+            with (
+                patch("ai_team.core.bounded_supervisor.load_project", return_value=primary),
+                patch("ai_team.core.bounded_supervisor._repository_name", return_value="example/project"),
+                patch(
+                    "ai_team.core.bounded_supervisor._find_pull_request",
+                    return_value={"state": "MERGED", "url": "https://example.test/pull/1"},
+                ),
+                patch("ai_team.core.bounded_supervisor._sync_primary", return_value="c" * 40),
+            ):
+                publication = publish_and_merge(options, entry, result)
+
+            self.assertTrue(publication["success"], publication)
+            self.assertTrue(publication["resumedMergedPullRequest"])
+            self.assertEqual(publication["prUrl"], "https://example.test/pull/1")
+
     def test_keyboard_interrupt_persists_resumable_stopped_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
