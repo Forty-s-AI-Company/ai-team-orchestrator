@@ -143,10 +143,12 @@ def run_external_qa(
             "startedAt": started.isoformat(),
             "completedAt": datetime.now(UTC).isoformat(),
         }
-        return ExternalQAResult("failed", result, _write_receipt(report_dir, result, ""))
+        receipt = _write_receipt(report_dir, result, "")
+        return ExternalQAResult("failed", {**result, "receiptPath": str(receipt)}, receipt)
     except OSError as exc:
         result = {**base, "status": "failed", "reason": "command-unavailable"}
-        return ExternalQAResult("failed", result, _write_receipt(report_dir, result, str(exc)))
+        receipt = _write_receipt(report_dir, result, str(exc))
+        return ExternalQAResult("failed", {**result, "receiptPath": str(receipt)}, receipt)
 
     output = ((completed.stdout or "") + (completed.stderr or ""))[-MAX_OUTPUT_BYTES:]
     parsed = _last_json_object(output)
