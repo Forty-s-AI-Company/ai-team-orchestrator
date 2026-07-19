@@ -5,6 +5,8 @@ import unittest
 from ai_team.core.watchdog_ai_repair import (
     _last_json_object,
     _path_allowed,
+    _repair_prompt,
+    _validation_feedback,
     _validate_write_paths,
 )
 
@@ -34,6 +36,27 @@ class WatchdogAIRepairPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(payload["status"], "passed")
+
+    def test_repair_prompt_carries_qa_findings_back_to_terra(self) -> None:
+        prompt = _repair_prompt(
+            {"summary": "repair"},
+            ["scripts/check.mjs"],
+            feedback=["Only catch the wait timeout; do not swallow click failures."],
+        )
+
+        self.assertIn("PreviousQAFindings", prompt)
+        self.assertIn("do not swallow click failures", prompt)
+
+    def test_validation_feedback_uses_the_failing_command(self) -> None:
+        feedback = _validation_feedback({
+            "commands": [
+                {"command": "npm run lint", "returnCode": 0},
+                {"command": "npm run test", "returnCode": 1, "stderr": "one test failed"},
+            ]
+        })
+
+        self.assertIn("npm run test", feedback[0])
+        self.assertIn("one test failed", feedback[0])
 
 
 if __name__ == "__main__":

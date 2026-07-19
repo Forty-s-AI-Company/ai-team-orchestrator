@@ -33,6 +33,7 @@ REPORT_SCHEMA = "ai-team-watchdog-ai-repair/v1"
 MAX_MODEL_OUTPUT_BYTES = 128_000
 MAX_PATCH_BYTES = 512_000
 MAX_WRITE_PATHS = 12
+MAX_REPAIR_CYCLES = 3
 MODEL_TIMEOUT_SECONDS = 1_200
 
 REPOSITORY_PREFIXES = {
@@ -109,49 +110,81 @@ def run_watchdog_ai_repair(
         if repository == "project":
             dependency_link = prepare_dependency_link(worktree, source)
 
-        repair_result = _invoke_codex(
-            codex_executable,
-            model=repair_model,
-            reasoning_effort=reasoning_effort,
-            root=worktree,
-            write=True,
-            prompt=_repair_prompt(diagnosis, allowed_paths),
-        )
-        report["repairCommand"] = _command_summary(repair_result)
-        if _git(worktree, "rev-parse", "HEAD").stdout.strip() != base_sha:
-            raise ValueError("Terra must not create Git commits during the repair stage")
-        changed_files = _changed_files(worktree)
-        if not changed_files:
-            raise ValueError("Terra completed without producing a repair diff")
-        outside = [path for path in changed_files if not _path_allowed(path, allowed_paths)]
-        if outside:
-            raise ValueError(f"Terra changed files outside diagnosed scope: {', '.join(outside)}")
+        feedback: list[str] = []
+        repair_cycles: list[dict[str, Any]] = []
+        for cycle in range(1, MAX_REPAIR_CYCLES + 1):
+            repair_result = _invoke_codex(
+                codex_executable,
+                model=repair_model,
+                reasoning_effort=reasoning_effort,
+                root=worktree,
+                write=True,
+                prompt=_repair_prompt(diagnosis, allowed_paths, feedback=feedback),
+            )
+            repair_command = _command_summary(repair_result)
+            report["repairCommand"] = repair_command
+            if _git(worktree, "rev-parse", "HEAD").stdout.strip() != base_sha:
+                raise ValueError("Terra must not create Git commits during the repair stage")
+            changed_files = _changed_files(worktree)
+            if not changed_files:
+                raise ValueError("Terra completed without producing a repair diff")
+            outside = [path for path in changed_files if not _path_allowed(path, allowed_paths)]
+            if outside:
+                raise ValueError(f"Terra changed files outside diagnosed scope: {', '.join(outside)}")
 
-        _git(worktree, "add", "--", *changed_files)
-        patch = _git(worktree, "diff", "--cached", "--no-ext-diff", "--binary", "HEAD").stdout
-        if len(patch.encode("utf-8")) > MAX_PATCH_BYTES:
-            raise ValueError("repair patch exceeds the bounded QA evidence limit")
-        candidate_hash = hashlib.sha256(patch.encode("utf-8", "replace")).hexdigest()
-        validation = _run_deterministic_qa(repository, source, worktree)
-        report["validation"] = validation
-        if validation.get("success") is not True:
-            raise ValueError("deterministic QA failed")
-        _assert_candidate_unchanged(worktree, changed_files, candidate_hash, "deterministic QA")
+            _git(worktree, "add", "--", *changed_files)
+            patch = _git(
+                worktree,
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--binary",
+                "HEAD",
+            ).stdout
+            if len(patch.encode("utf-8")) > MAX_PATCH_BYTES:
+                raise ValueError("repair patch exceeds the bounded QA evidence limit")
+            candidate_hash = hashlib.sha256(patch.encode("utf-8", "replace")).hexdigest()
+            validation = _run_deterministic_qa(repository, source, worktree)
+            report["validation"] = validation
+            _assert_candidate_unchanged(worktree, changed_files, candidate_hash, "deterministic QA")
+            cycle_result: dict[str, Any] = {
+                "cycle": cycle,
+                "repairCommand": repair_command,
+                "changedFiles": changed_files,
+                "patchSha256": candidate_hash,
+                "validation": validation,
+            }
+            if validation.get("success") is not True:
+                repair_cycles.append(cycle_result)
+                report["repairCycles"] = repair_cycles
+                if validation.get("kind") == "execution-environment":
+                    raise ValueError("deterministic QA execution environment failed")
+                feedback = _validation_feedback(validation)
+                if cycle == MAX_REPAIR_CYCLES:
+                    raise ValueError("deterministic QA failed after maximum repair cycles")
+                continue
 
-        qa_result = _invoke_codex(
-            codex_executable,
-            model=diagnosis_model,
-            reasoning_effort=reasoning_effort,
-            root=worktree,
-            write=False,
-            prompt=_qa_prompt(diagnosis, validation, patch),
-        )
-        report["qaCommand"] = _command_summary(qa_result)
-        qa = _validate_qa(_last_json_object(qa_result.stdout))
-        report["qa"] = qa
-        if qa["status"] != "passed" or qa["findings"]:
-            raise ValueError("Codex QA rejected the repair")
-        _assert_candidate_unchanged(worktree, changed_files, candidate_hash, "Codex QA")
+            qa_result = _invoke_codex(
+                codex_executable,
+                model=diagnosis_model,
+                reasoning_effort=reasoning_effort,
+                root=worktree,
+                write=False,
+                prompt=_qa_prompt(diagnosis, validation, patch),
+            )
+            qa_command = _command_summary(qa_result)
+            qa = _validate_qa(_last_json_object(qa_result.stdout))
+            report["qaCommand"] = qa_command
+            report["qa"] = qa
+            cycle_result.update({"qaCommand": qa_command, "qa": qa})
+            repair_cycles.append(cycle_result)
+            report["repairCycles"] = repair_cycles
+            _assert_candidate_unchanged(worktree, changed_files, candidate_hash, "Codex QA")
+            if qa["status"] == "passed" and not qa["findings"]:
+                break
+            feedback = qa["findings"] or [qa["summary"]]
+            if cycle == MAX_REPAIR_CYCLES:
+                raise ValueError("Codex QA rejected the repair after maximum repair cycles")
 
         _git(worktree, "commit", "-m", f"fix(ai-team): {diagnosis['summary'][:72]}")
         repair_sha = _git(worktree, "rev-parse", "HEAD").stdout.strip()
@@ -216,7 +249,12 @@ def _diagnosis_prompt(
     ))
 
 
-def _repair_prompt(diagnosis: dict[str, Any], allowed_paths: list[str]) -> str:
+def _repair_prompt(
+    diagnosis: dict[str, Any],
+    allowed_paths: list[str],
+    *,
+    feedback: list[str] | None = None,
+) -> str:
     return "\n".join((
         "You are the repair engineer. Implement the diagnosed fix in this disposable Git worktree.",
         "You may edit only the exact allowlisted paths below. Do not commit, push, deploy, access secrets,",
@@ -224,6 +262,11 @@ def _repair_prompt(diagnosis: dict[str, Any], allowed_paths: list[str]) -> str:
         "Add or update focused tests when an allowlisted test path permits it.",
         f"Diagnosis={json.dumps(diagnosis, ensure_ascii=False)}",
         f"AllowedWritePaths={json.dumps(allowed_paths, ensure_ascii=False)}",
+        (
+            "PreviousQAFindings="
+            f"{json.dumps(feedback or [], ensure_ascii=False)}"
+        ),
+        "When previous QA findings are present, correct each finding without widening the diagnosed scope.",
         "When finished, provide a concise summary; the watchdog performs independent tests and review.",
     ))
 
@@ -305,6 +348,19 @@ def _validate_qa(value: dict[str, Any]) -> dict[str, Any]:
     if not all(isinstance(item, str) for item in value["findings"]):
         raise ValueError("Sol QA findings must be strings")
     return value
+
+
+def _validation_feedback(validation: dict[str, Any]) -> list[str]:
+    commands = validation.get("commands")
+    if not isinstance(commands, list):
+        return ["Deterministic QA failed without command evidence."]
+    for item in reversed(commands):
+        if not isinstance(item, dict) or item.get("returnCode") == 0:
+            continue
+        command = str(item.get("command") or "unknown command")[:300]
+        detail = str(item.get("stderr") or item.get("stdout") or "no output")[-2_000:]
+        return [f"Deterministic QA failed: {command}\n{detail}"]
+    return ["Deterministic QA reported failure without a failing command."]
 
 
 def _validate_write_paths(repository: str, values: list[Any]) -> list[str]:
