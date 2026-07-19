@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from ai_team.core.watchdog_ai_repair import (
+    _diagnosis_prompt,
     _last_json_object,
     _path_allowed,
     _repair_prompt,
@@ -12,6 +14,18 @@ from ai_team.core.watchdog_ai_repair import (
 
 
 class WatchdogAIRepairPolicyTests(unittest.TestCase):
+    def test_diagnosis_prompt_routes_missing_evidence_to_bounded_observability_repair(self) -> None:
+        prompt = _diagnosis_prompt(
+            {},
+            {},
+            Path("/project"),
+            Path("/orchestrator"),
+        )
+
+        self.assertIn("missing non-sensitive failure evidence", prompt)
+        self.assertIn("status=repairable", prompt)
+        self.assertIn("human/provider approval", prompt)
+
     def test_accepts_bounded_project_paths(self) -> None:
         paths = _validate_write_paths(
             "project",
