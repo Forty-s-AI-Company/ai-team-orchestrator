@@ -48,6 +48,21 @@ FIXTURE_DATA_PATTERN = re.compile(r"\b(?:deterministic\s+)?(?:fixture|fake|sampl
 ROLE_BY_STAGE = {"pm": "product-manager", "architect": "architect", "engineer": "engineer", "qa": "delivery-qa", "review": "reviewer"}
 SECONDARY_PROVIDER_BY_STAGE = {"architect": "codex", "qa": "codex", "review": "antigravity"}
 RECEIPT_FILE_PATTERN = re.compile(r"^(\d+)-(pm|architect|engineer|qa|review)\.json$")
+QA_SECONDARY_ADOPTABLE_STATUSES = {
+    "approve",
+    "approved",
+    "complete",
+    "completed",
+    "done",
+    "ok",
+    "pass",
+    "ready",
+    "reviewed",
+    "succeeded",
+    "success",
+    "successful",
+    "verified",
+}
 REVIEW_EVIDENCE_PATH = "/tmp/ai-team-review-evidence/patch.diff"
 MAX_REVIEW_PATCH_BYTES = 512_000
 REPAIRABLE_VALIDATION_KINDS = {"deterministic-validation", "test-database-bootstrap"}
@@ -420,14 +435,28 @@ def _run_stage(
     try:
         _validate_stage_structure(stage, payload)
     except BoundedDeliveryError as exc:
-        _write_receipt(
-            options,
-            context,
-            stage,
+        adopted = _adopt_qa_secondary_result(
             result,
-            _validation_failure("structured-output", str(exc)),
+            stage,
+            payload,
+            context,
+            contract,
+            primary_validation_error=str(exc),
         )
-        raise
+        if adopted is None:
+            _write_receipt(
+                options,
+                context,
+                stage,
+                result,
+                _validation_failure(
+                    "structured-output",
+                    str(exc),
+                    primaryStatus=payload.get("status") if isinstance(payload, dict) else None,
+                ),
+            )
+            raise
+        payload = adopted
     try:
         _reject_forbidden(
             json.dumps(payload, ensure_ascii=False),
@@ -478,7 +507,9 @@ def _run_stage(
                 raise BoundedDeliveryError(
                     "architect-codex-read-only-review-has-findings"
                 )
-            if stage in {"qa", "review"}:
+            if stage == "qa" and payload.get("evidenceSource") == "secondaryReview":
+                _validate_adopted_secondary_binding(payload, secondary_payload)
+            elif stage in {"qa", "review"}:
                 payload = {
                     **payload,
                     "findings": [*payload["findings"], *secondary_payload["findings"]],
@@ -1000,6 +1031,11 @@ def _validate_checkpoint_secondary(
     payload = _validate_secondary_review(secondary, stage, provider, contract)
     if payload["blockers"] or (payload["findings"] and not allow_findings):
         raise BoundedDeliveryError("checkpoint secondary review did not approve")
+    evidence = receipt.get("evidence")
+    if isinstance(evidence, dict) and evidence.get("evidenceSource") == "secondaryReview":
+        if stage != "qa":
+            raise BoundedDeliveryError("checkpoint secondary adoption stage invalid")
+        _validate_adopted_secondary_binding(evidence, payload)
 
 
 def _recover_repairs(
@@ -1349,6 +1385,80 @@ def _validate_secondary_review(
         contract,
     )
     return payload
+
+
+def _adopt_qa_secondary_result(
+    result: ProviderResult,
+    stage: str,
+    primary_payload: Any,
+    context: dict[str, Any],
+    contract: TrustedTaskContract,
+    *,
+    primary_validation_error: str,
+) -> dict[str, Any] | None:
+    """Use the Codex QA review only for a positive status-word mismatch.
+
+    Antigravity has already authenticated the bounded envelope before this
+    point.  Adoption remains fail-closed unless the primary QA supplied
+    complete regression evidence, no findings/blockers, and a positive status
+    synonym.  Explicit failures and substantive objections are never masked.
+    """
+
+    validation = context.get("validation")
+    if (
+        stage != "qa"
+        or not isinstance(validation, dict)
+        or validation.get("success") is not True
+        or not isinstance(primary_payload, dict)
+        or primary_payload.get("schema") != SCHEMA
+        or primary_payload.get("stage") != "qa"
+        or primary_payload.get("findings") != []
+        or primary_payload.get("blockers") != []
+    ):
+        return None
+    status = primary_payload.get("status")
+    if not isinstance(status, str) or status.strip().lower().replace("_", "-") not in QA_SECONDARY_ADOPTABLE_STATUSES:
+        return None
+    try:
+        if not _string_list(primary_payload.get("tests"), "tests"):
+            return None
+    except BoundedDeliveryError:
+        return None
+
+    secondary = result.data.get("secondaryReview")
+    if (
+        not isinstance(secondary, dict)
+        or secondary.get("success") is not True
+        or secondary.get("provider") != "codex"
+    ):
+        return None
+    try:
+        secondary_payload = _validate_secondary_review(secondary, "qa", "codex", contract)
+    except (BoundedDeliveryError, PolicyValidationError):
+        return None
+    if secondary_payload["blockers"]:
+        return None
+    return {
+        **secondary_payload,
+        "evidenceSource": "secondaryReview",
+        "primaryStatus": status.strip()[:80],
+        "primaryValidationError": primary_validation_error[:300],
+    }
+
+
+def _validate_adopted_secondary_binding(
+    evidence: dict[str, Any],
+    secondary_payload: dict[str, Any],
+) -> None:
+    keys = ("schema", "stage", "status", "findings", "tests", "blockers")
+    if any(evidence.get(key) != secondary_payload.get(key) for key in keys):
+        raise BoundedDeliveryError("qa-adopted-secondary-evidence-mismatch")
+    if (
+        evidence.get("evidenceSource") != "secondaryReview"
+        or not isinstance(evidence.get("primaryStatus"), str)
+        or not isinstance(evidence.get("primaryValidationError"), str)
+    ):
+        raise BoundedDeliveryError("qa-adopted-secondary-attestation-invalid")
 
 
 def _findings(payload: dict[str, Any]) -> list[dict[str, str]]:

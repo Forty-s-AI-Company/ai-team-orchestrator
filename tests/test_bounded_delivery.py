@@ -13,6 +13,7 @@ from ai_team.core.bounded_delivery import (
     DeliveryLimits,
     EngineeringAttempt,
     _engineering_failure,
+    _validate_adopted_secondary_binding,
     _validated_resume_worktree,
     load_trusted_task_contract,
     run_bounded_delivery,
@@ -22,6 +23,30 @@ from ai_team.core.trusted_dev import TrustedDevSettings
 
 
 class BoundedDeliveryTests(unittest.TestCase):
+    def test_adopted_secondary_binding_rejects_tampered_evidence(self) -> None:
+        secondary = {
+            "schema": "ai-team-bounded-delivery/v1",
+            "stage": "qa",
+            "status": "passed",
+            "findings": [],
+            "tests": ["independent review"],
+            "blockers": [],
+        }
+        evidence = {
+            **secondary,
+            "evidenceSource": "secondaryReview",
+            "primaryStatus": "completed",
+            "primaryValidationError": "qa status alias required adoption",
+        }
+        _validate_adopted_secondary_binding(evidence, secondary)
+
+        tampered = {**evidence, "tests": ["different evidence"]}
+        with self.assertRaisesRegex(
+            BoundedDeliveryError,
+            "qa-adopted-secondary-evidence-mismatch",
+        ):
+            _validate_adopted_secondary_binding(tampered, secondary)
+
     def test_local_ollama_engineer_requires_native_write_attestation(self) -> None:
         valid = EngineeringAttempt(
             provider_result=ProviderResult(
@@ -576,6 +601,64 @@ class BoundedDeliveryTests(unittest.TestCase):
                 stop_reason=reason,
             )
 
+    def test_qa_adopts_valid_codex_secondary_for_positive_status_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _QaPositiveStatusAliasProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            self.assertEqual(result["status"], "completed", result)
+            receipt = json.loads((Path(tmp) / "reports" / "04-qa.json").read_text())
+            self.assertTrue(receipt["validationResult"]["success"])
+            self.assertEqual(receipt["evidence"]["evidenceSource"], "secondaryReview")
+            self.assertEqual(receipt["evidence"]["primaryStatus"], "completed")
+            self.assertEqual(receipt["evidence"]["status"], "passed")
+            self.assertEqual(
+                receipt["evidence"]["tests"],
+                json.loads(receipt["secondaryReview"]["content"])["tests"],
+            )
+
+    def test_qa_does_not_adopt_secondary_over_explicit_failed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _QaExplicitFailedStatusProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            reason = "qa did not provide a passed, structured result"
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], reason)
+            receipt = json.loads((Path(tmp) / "reports" / "04-qa.json").read_text())
+            self.assertEqual(receipt["evidence"]["primaryStatus"], "failed")
+            self.assertNotIn("evidenceSource", receipt["evidence"])
+
+    def test_qa_positive_status_alias_without_valid_secondary_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _init_project(Path(tmp) / "project")
+            contract_path = _write_contract(Path(tmp), "docs/safe.md")
+
+            def provider(role: str) -> BaseProvider:
+                return _QaPositiveStatusAliasWithoutCodexProvider(role)
+
+            result = run_bounded_delivery(
+                _options(Path(tmp), root, contract_path, provider, _successful_engineering_attempt)
+            )
+
+            reason = "qa did not provide a passed, structured result"
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], reason)
+
     def test_secondary_review_without_regression_evidence_is_not_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _init_project(Path(tmp) / "project")
@@ -798,7 +881,7 @@ class BoundedDeliveryTests(unittest.TestCase):
             executor_receipt.write_text("{}", encoding="utf-8")
 
             def provider(role: str) -> BaseProvider:
-                return _ReviewQuotaOnceProvider(role, stage_calls, provider_state)
+                return _QaAliasReviewQuotaOnceProvider(role, stage_calls, provider_state)
 
             def engineer(
                 contract,
@@ -845,6 +928,8 @@ class BoundedDeliveryTests(unittest.TestCase):
             self.assertEqual(stage_calls["qa"], 1)
             self.assertEqual(stage_calls["review"], 2)
             self.assertEqual(second["commitSha"], commit_sha)
+            qa_receipt = json.loads((base / "reports" / "04-qa.json").read_text())
+            self.assertEqual(qa_receipt["evidence"]["evidenceSource"], "secondaryReview")
 
     def test_resume_fails_closed_for_a_tampered_success_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1545,6 +1630,21 @@ class _ReviewQuotaOnceProvider(_CountingStageProvider):
         return super().run(request)
 
 
+class _QaAliasReviewQuotaOnceProvider(_ReviewQuotaOnceProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "qa" or not result.success:
+            return result
+        payload = json.loads(result.content)
+        payload["status"] = "completed"
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
+        )
+
+
 class _MockSuccessProvider(_StageProvider):
     def __init__(self) -> None:
         super().__init__("product-manager")
@@ -1832,6 +1932,49 @@ class _QaWithoutTestsProvider(_StageProvider):
             success=True,
             content=json.dumps(payload),
             data=result.data,
+        )
+
+
+class _QaPositiveStatusAliasProvider(_StageProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "qa":
+            return result
+        payload = json.loads(result.content)
+        payload["status"] = "completed"
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
+        )
+
+
+class _QaExplicitFailedStatusProvider(_StageProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "qa":
+            return result
+        payload = json.loads(result.content)
+        payload["status"] = "failed"
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=json.dumps(payload),
+            data=result.data,
+        )
+
+
+class _QaPositiveStatusAliasWithoutCodexProvider(_QaPositiveStatusAliasProvider):
+    def run(self, request: ProviderRequest) -> ProviderResult:
+        result = super().run(request)
+        if request.metadata["boundedStage"] != "qa":
+            return result
+        return ProviderResult(
+            provider=result.provider,
+            success=True,
+            content=result.content,
+            data={**result.data, "secondaryReview": None},
         )
 
 
