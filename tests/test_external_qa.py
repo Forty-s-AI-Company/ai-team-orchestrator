@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -54,6 +55,36 @@ class ExternalQATests(unittest.TestCase):
         receipt = result.receipt_path.read_text(encoding="utf-8")
         self.assertIn('"browserCheckout": "passed"', receipt)
         self.assertNotIn("secret-looking-stderr", receipt)
+
+    def test_run_once_preserves_original_failure_evidence(self) -> None:
+        root = self._project()
+        loaded = load_project(root)
+        receipt = root / "reports" / "external-qa-deadbeef.json"
+        prior = {
+            "schema": "ai-team-external-qa-receipt/v1",
+            "revision": "c" * 40,
+            "status": "failed",
+            "exitCode": 1,
+            "error": "page.waitForURL: Timeout 45000ms exceeded",
+            "providerChecks": None,
+            "receiptPath": str(receipt),
+        }
+        receipt.parent.mkdir()
+        receipt.write_text(json.dumps(prior), encoding="utf-8")
+
+        with patch("ai_team.core.external_qa.subprocess.run") as run:
+            result = run_external_qa(
+                loaded,
+                "c" * 40,
+                root / "reports",
+                prior=prior,
+            )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.result["reason"], "already-run-for-revision")
+        self.assertEqual(result.result["error"], prior["error"])
+        self.assertEqual(result.result["exitCode"], 1)
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

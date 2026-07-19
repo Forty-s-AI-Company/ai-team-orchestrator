@@ -17,6 +17,7 @@ from ai_team.core.project_loader import load_project
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+AIRepairer = Callable[..., dict[str, Any]]
 CONTRACT_COMMAND_DIAGNOSTIC = (
     "trusted task contract must run the project lint, typecheck, test, and build commands"
 )
@@ -29,6 +30,14 @@ class AutoRepairOptions:
     contract_dir: Path | None = None
     backup_dir: Path | None = None
     max_attempts: int = 2
+    ai_repair_enabled: bool = False
+    orchestrator_path: Path | None = None
+    ai_report_dir: Path | None = None
+    revive_timer_name: str | None = None
+    codex_executable: str = "codex"
+    diagnosis_model: str = "gpt-5.6-sol"
+    repair_model: str = "gpt-5.6-terra"
+    reasoning_effort: str = "high"
 
 
 def repair_key(supervisor: dict[str, Any], task_failure_reason: str | None) -> str:
@@ -53,12 +62,15 @@ def attempt_auto_repair(
     service_name: str,
     options: AutoRepairOptions,
     runner: Runner = subprocess.run,
+    ai_repairer: AIRepairer | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Stop the supervisor, apply one deterministic repair, and restart on success."""
 
     if not options.enabled:
         return _result(False, False, "disabled", "auto repair is disabled")
+    if options.revive_timer_name and not _systemctl(runner, "stop", options.revive_timer_name):
+        return _result(True, False, "stop-revive-timer", "failed to stop supervisor revive timer")
     stopped = _systemctl(runner, "stop", service_name)
     if not stopped:
         return _result(True, False, "stop-supervisor", "failed to stop supervisor safely")
@@ -68,6 +80,25 @@ def attempt_auto_repair(
         repair = _repair_contract_commands(supervisor, options, now=now)
     elif alert_type in {"service-failed", "stale-state"}:
         repair = _result(True, True, "controlled-restart", "supervisor stopped for a clean restart")
+    elif options.ai_repair_enabled:
+        if options.project_path is None or options.orchestrator_path is None or options.ai_report_dir is None:
+            repair = _result(True, False, "codex-ai-repair", "AI repair paths are not configured")
+        else:
+            if ai_repairer is None:
+                from ai_team.core.watchdog_ai_repair import run_watchdog_ai_repair
+
+                ai_repairer = run_watchdog_ai_repair
+            repair = ai_repairer(
+                supervisor,
+                project_path=options.project_path,
+                orchestrator_path=options.orchestrator_path,
+                report_dir=options.ai_report_dir,
+                codex_executable=options.codex_executable,
+                diagnosis_model=options.diagnosis_model,
+                repair_model=options.repair_model,
+                reasoning_effort=options.reasoning_effort,
+                now=now,
+            )
     else:
         return _result(
             True,
@@ -84,6 +115,13 @@ def attempt_auto_repair(
             **repair,
             "success": False,
             "diagnostic": "repair passed but supervisor restart failed",
+        }
+    if options.revive_timer_name and not _systemctl(runner, "start", options.revive_timer_name):
+        return {
+            **repair,
+            "success": False,
+            "restarted": True,
+            "diagnostic": "supervisor restarted but revive timer could not be restored",
         }
     return {**repair, "restarted": True}
 

@@ -83,10 +83,15 @@ def run_external_qa(
     if config.run_once_per_revision and previous.get("revision") == revision:
         previous_status = str(previous.get("status") or "")
         if previous_status in {"passed", "failed", "blocked"}:
+            # Preserve the attested result. Replacing it with a small
+            # ``already-run`` marker discarded the original Playwright error
+            # and made watchdog diagnosis impossible. A failed revision stays
+            # blocking until a repair creates a new Git revision.
             return ExternalQAResult(
                 previous_status,
                 {
                     **base,
+                    **previous,
                     "status": previous_status,
                     "reason": "already-run-for-revision",
                     "receiptPath": previous.get("receiptPath"),

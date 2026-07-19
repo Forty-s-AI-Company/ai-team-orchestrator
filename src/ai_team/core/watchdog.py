@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from ai_team.core.watchdog_repair import AutoRepairOptions, attempt_auto_repair, repair_key
+from ai_team.core.watchdog_repair import AIRepairer, AutoRepairOptions, attempt_auto_repair, repair_key
 
 
 @dataclass(frozen=True)
@@ -37,6 +37,7 @@ def run_watchdog(
     notifier: Notifier | None = None,
     powershell_path: str = "powershell.exe",
     auto_repair: AutoRepairOptions = AutoRepairOptions(),
+    ai_repairer: AIRepairer | None = None,
 ) -> dict[str, Any]:
     """Inspect one supervisor snapshot and emit at most one deduplicated alert."""
 
@@ -88,6 +89,7 @@ def run_watchdog(
                 service_name=service_name,
                 options=auto_repair,
                 runner=runner,
+                ai_repairer=ai_repairer,
                 now=checked_at,
             )
         else:
@@ -508,6 +510,12 @@ def _validate_auto_repair(options: AutoRepairOptions) -> None:
         path is None for path in (options.project_path, options.contract_dir, options.backup_dir)
     ):
         raise ValueError("watchdog auto repair requires project, contract, and backup paths")
+    if options.ai_repair_enabled and any(
+        path is None for path in (options.project_path, options.orchestrator_path, options.ai_report_dir)
+    ):
+        raise ValueError("watchdog AI repair requires project, orchestrator, and report paths")
+    if options.ai_repair_enabled and not options.enabled:
+        raise ValueError("watchdog AI repair requires automatic repair to be enabled")
 
 
 def _nonnegative_int(value: Any) -> int:

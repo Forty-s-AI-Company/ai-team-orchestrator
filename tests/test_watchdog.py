@@ -333,6 +333,136 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(runner.actions.count("stop"), 1)
             self.assertNotIn("start", runner.actions)
 
+    def test_restart_loop_runs_sol_terra_qa_chain_then_restores_services(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = _write_project(root)
+            orchestrator = root / "orchestrator"
+            orchestrator.mkdir()
+            contracts = root / "contracts"
+            contracts.mkdir()
+            supervisor = root / "supervisor.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(
+                supervisor,
+                now,
+                status="attention-required",
+                stop_reason="external-qa-failed",
+            )
+            runner = _RecordingServiceRunner(restarts=9)
+            calls: list[dict[str, object]] = []
+
+            def ai_repairer(_supervisor, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "attempted": True,
+                    "success": True,
+                    "action": "codex-sol-terra-qa-repair",
+                    "diagnostic": "QA passed",
+                    "restarted": False,
+                }
+
+            result = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                now=now,
+                runner=runner,
+                notifier=lambda _title, _message: True,
+                thresholds=WatchdogThresholds(
+                    repeat_count=1,
+                    restart_count=1,
+                    stale_seconds=3600,
+                    cooldown_seconds=1800,
+                ),
+                auto_repair=AutoRepairOptions(
+                    enabled=True,
+                    project_path=project,
+                    contract_dir=contracts,
+                    backup_dir=root / "backups",
+                    ai_repair_enabled=True,
+                    orchestrator_path=orchestrator,
+                    ai_report_dir=root / "ai-reports",
+                    revive_timer_name="example-revive.timer",
+                    codex_executable="/usr/local/bin/codex",
+                    diagnosis_model="gpt-5.6-sol",
+                    repair_model="gpt-5.6-terra",
+                    reasoning_effort="high",
+                ),
+                ai_repairer=ai_repairer,
+            )
+
+            self.assertEqual(result["status"], "repaired")
+            self.assertEqual(result["repair"]["action"], "codex-sol-terra-qa-repair")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["diagnosis_model"], "gpt-5.6-sol")
+            self.assertEqual(calls[0]["repair_model"], "gpt-5.6-terra")
+            self.assertEqual(calls[0]["reasoning_effort"], "high")
+            self.assertEqual(
+                runner.calls[-5:],
+                [
+                    ("stop", "example-revive.timer"),
+                    ("stop", "example.service"),
+                    ("reset-failed", "example.service"),
+                    ("start", "example.service"),
+                    ("start", "example-revive.timer"),
+                ],
+            )
+
+    def test_failed_ai_repair_keeps_supervisor_and_revive_timer_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = _write_project(root)
+            orchestrator = root / "orchestrator"
+            orchestrator.mkdir()
+            contracts = root / "contracts"
+            contracts.mkdir()
+            supervisor = root / "supervisor.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(supervisor, now, status="attention-required")
+            runner = _RecordingServiceRunner(restarts=9)
+
+            result = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                now=now,
+                runner=runner,
+                notifier=lambda _title, _message: True,
+                thresholds=WatchdogThresholds(
+                    repeat_count=1,
+                    restart_count=1,
+                    stale_seconds=3600,
+                    cooldown_seconds=1800,
+                ),
+                auto_repair=AutoRepairOptions(
+                    enabled=True,
+                    project_path=project,
+                    contract_dir=contracts,
+                    backup_dir=root / "backups",
+                    ai_repair_enabled=True,
+                    orchestrator_path=orchestrator,
+                    ai_report_dir=root / "ai-reports",
+                    revive_timer_name="example-revive.timer",
+                ),
+                ai_repairer=lambda *_args, **_kwargs: {
+                    "attempted": True,
+                    "success": False,
+                    "action": "codex-sol-terra-qa-repair",
+                    "diagnostic": "QA rejected repair",
+                    "restarted": False,
+                },
+            )
+
+            self.assertEqual(result["status"], "repair-failed")
+            self.assertEqual(
+                runner.calls[-2:],
+                [("stop", "example-revive.timer"), ("stop", "example.service")],
+            )
+            self.assertNotIn("start", runner.actions)
+
     def test_failed_service_gets_one_controlled_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -543,10 +673,12 @@ class _RecordingServiceRunner:
         self.active_state = active_state
         self.sub_state = sub_state
         self.actions: list[str] = []
+        self.calls: list[tuple[str, str]] = []
 
     def __call__(self, args, **_kwargs):
         action = args[2]
         self.actions.append(action)
+        self.calls.append((action, args[3]))
         if action == "show":
             stdout = (
                 f"NRestarts={self.restarts}\n"

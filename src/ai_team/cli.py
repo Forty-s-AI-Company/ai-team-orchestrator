@@ -245,6 +245,14 @@ def check_watchdog(
     contract_dir: str | None,
     repair_backup_dir: str | None,
     max_auto_repair_attempts: int,
+    ai_repair: bool,
+    orchestrator_project: str | None,
+    ai_repair_report_dir: str | None,
+    revive_timer: str | None,
+    codex_executable: str,
+    diagnosis_model: str,
+    repair_model: str,
+    repair_reasoning_effort: str,
 ) -> None:
     if test_notification:
         delivered = send_windows_toast(
@@ -257,6 +265,10 @@ def check_watchdog(
     if auto_repair and not all((project, contract_dir, repair_backup_dir)):
         raise ValueError(
             "watchdog --auto-repair requires --project, --contract-dir, and --repair-backup-dir"
+        )
+    if ai_repair and not all((orchestrator_project, ai_repair_report_dir)):
+        raise ValueError(
+            "watchdog --ai-repair requires --orchestrator-project and --ai-repair-report-dir"
         )
 
     result = run_watchdog(
@@ -278,6 +290,18 @@ def check_watchdog(
             contract_dir=Path(contract_dir).resolve() if contract_dir else None,
             backup_dir=Path(repair_backup_dir).resolve() if repair_backup_dir else None,
             max_attempts=max_auto_repair_attempts,
+            ai_repair_enabled=ai_repair,
+            orchestrator_path=(
+                Path(orchestrator_project).resolve() if orchestrator_project else None
+            ),
+            ai_report_dir=(
+                Path(ai_repair_report_dir).resolve() if ai_repair_report_dir else None
+            ),
+            revive_timer_name=revive_timer,
+            codex_executable=codex_executable,
+            diagnosis_model=diagnosis_model,
+            repair_model=repair_model,
+            reasoning_effort=repair_reasoning_effort,
         ),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -863,6 +887,22 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog_parser.add_argument("--contract-dir")
     watchdog_parser.add_argument("--repair-backup-dir")
     watchdog_parser.add_argument("--max-auto-repair-attempts", type=int, default=2)
+    watchdog_parser.add_argument(
+        "--ai-repair",
+        action="store_true",
+        help="Use bounded Codex Sol diagnosis, Terra repair, and QA after deterministic repair is unavailable",
+    )
+    watchdog_parser.add_argument("--orchestrator-project")
+    watchdog_parser.add_argument("--ai-repair-report-dir")
+    watchdog_parser.add_argument("--revive-timer")
+    watchdog_parser.add_argument("--codex-executable", default="codex")
+    watchdog_parser.add_argument("--diagnosis-model", default="gpt-5.6-sol")
+    watchdog_parser.add_argument("--repair-model", default="gpt-5.6-terra")
+    watchdog_parser.add_argument(
+        "--repair-reasoning-effort",
+        choices=["low", "medium", "high", "xhigh"],
+        default="high",
+    )
 
     git_policy_parser = subparsers.add_parser("git-policy", help="Evaluate guarded git automation policy")
     git_policy_parser.add_argument("project", nargs="?", default=".")
@@ -1052,6 +1092,14 @@ def main() -> None:
                 args.contract_dir,
                 args.repair_backup_dir,
                 args.max_auto_repair_attempts,
+                args.ai_repair,
+                args.orchestrator_project,
+                args.ai_repair_report_dir,
+                args.revive_timer,
+                args.codex_executable,
+                args.diagnosis_model,
+                args.repair_model,
+                args.repair_reasoning_effort,
             )
         elif args.command == "git-policy":
             evaluate_git_policy(args.project, args.action, args.file)
