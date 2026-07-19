@@ -33,6 +33,17 @@ MAX_CHECK_DEPTH = 4
 MAX_CHECK_FIELDS = 20
 MAX_CHECK_ITEMS = 20
 MAX_CHECK_STRING_CHARS = 300
+TRUNCATED_DEPTH_MARKER = "<truncated: maximum depth>"
+CALLBACK_TRADE_QUERY_DIAGNOSTIC_FIELDS = (
+    "attempt",
+    "querySucceeded",
+    "tradeStatus",
+    "tradeNoPresent",
+    "flowStage",
+    "errorCategory",
+)
+LEGACY_CALLBACK_TRADE_QUERIES_RERUN_VERSION = 1
+LEGACY_CALLBACK_TRADE_QUERIES_RERUN_REASON = "legacy-truncated-callback-trade-queries"
 
 
 @dataclass(frozen=True)
@@ -86,9 +97,18 @@ def run_external_qa(
         )
 
     previous = prior if isinstance(prior, dict) else {}
+    should_rerun_legacy_failure = False
     if config.run_once_per_revision and previous.get("revision") == revision:
         previous_status = str(previous.get("status") or "")
-        if previous_status in {"passed", "failed", "blocked"}:
+        should_rerun_legacy_failure = (
+            previous_status == "failed"
+            and not _legacy_callback_trade_queries_rerun_was_performed(previous)
+            and _has_legacy_truncated_callback_trade_queries(previous)
+        )
+        # A previous serializer truncated scalar callback evidence needed to
+        # diagnose whether PayUni created or completed a trade. The current
+        # bounded serializer preserves these values on this one retry.
+        if previous_status in {"passed", "failed", "blocked"} and not should_rerun_legacy_failure:
             # Preserve the attested result. Replacing it with a small
             # ``already-run`` marker discarded the original Playwright error
             # and made watchdog diagnosis impossible. A failed revision stays
@@ -104,9 +124,21 @@ def run_external_qa(
                 },
                 Path(previous["receiptPath"]) if isinstance(previous.get("receiptPath"), str) else None,
             )
-
     if not execute:
         return ExternalQAResult("ready", {**base, "status": "ready"})
+
+    execution_base = base
+    if should_rerun_legacy_failure:
+        # This runner-owned marker is persisted in the replacement receipt so
+        # even malformed or untrusted QA output containing the old truncation
+        # marker can trigger at most one additional sandbox execution.
+        execution_base = {
+            **base,
+            "diagnosticRerun": {
+                "version": LEGACY_CALLBACK_TRADE_QUERIES_RERUN_VERSION,
+                "reason": LEGACY_CALLBACK_TRADE_QUERIES_RERUN_REASON,
+            },
+        }
 
     started = datetime.now(UTC)
     # Do not let a supervisor process accidentally override the sandbox values
@@ -148,7 +180,7 @@ def run_external_qa(
         )
     except subprocess.TimeoutExpired:
         result = {
-            **base,
+            **execution_base,
             "status": "failed",
             "reason": "timeout",
             "startedAt": started.isoformat(),
@@ -157,7 +189,7 @@ def run_external_qa(
         receipt = _write_receipt(report_dir, result, "")
         return ExternalQAResult("failed", {**result, "receiptPath": str(receipt)}, receipt)
     except OSError as exc:
-        result = {**base, "status": "failed", "reason": "command-unavailable"}
+        result = {**execution_base, "status": "failed", "reason": "command-unavailable"}
         receipt = _write_receipt(report_dir, result, str(exc))
         return ExternalQAResult("failed", {**result, "receiptPath": str(receipt)}, receipt)
 
@@ -173,7 +205,7 @@ def run_external_qa(
     )
     status = "passed" if success else "failed"
     result = {
-        **base,
+        **execution_base,
         "status": status,
         "exitCode": completed.returncode,
         "startedAt": started.isoformat(),
@@ -210,6 +242,39 @@ def _last_json_object(output: str) -> dict[str, Any]:
         if isinstance(value, dict):
             return value
     return {}
+
+
+def _has_legacy_truncated_callback_trade_queries(receipt: dict[str, Any]) -> bool:
+    """Identify the old failed-receipt shape eligible for one diagnostic retry."""
+
+    checks = receipt.get("providerChecks")
+    if not isinstance(checks, dict):
+        return False
+    provider_checks = checks.get("providerChecks")
+    if not isinstance(provider_checks, dict):
+        return False
+    callback_trade_queries = provider_checks.get("callbackTradeQueries")
+    if not isinstance(callback_trade_queries, list) or not callback_trade_queries:
+        return False
+    # The old serializer produced this exact shape for every recorded query.
+    # A single truncated entry alongside useful evidence is not a legacy
+    # receipt and must remain subject to the normal run-once cache.
+    return all(
+        isinstance(query, dict)
+        and all(query.get(field) == TRUNCATED_DEPTH_MARKER for field in CALLBACK_TRADE_QUERY_DIAGNOSTIC_FIELDS)
+        for query in callback_trade_queries
+    )
+
+
+def _legacy_callback_trade_queries_rerun_was_performed(receipt: dict[str, Any]) -> bool:
+    """Return whether this receipt is the bounded replacement diagnostic run."""
+
+    rerun = receipt.get("diagnosticRerun")
+    return (
+        isinstance(rerun, dict)
+        and rerun.get("version") == LEGACY_CALLBACK_TRADE_QUERIES_RERUN_VERSION
+        and rerun.get("reason") == LEGACY_CALLBACK_TRADE_QUERIES_RERUN_REASON
+    )
 
 
 def _safe_checks(parsed: dict[str, Any]) -> dict[str, Any] | None:

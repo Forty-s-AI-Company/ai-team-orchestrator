@@ -91,6 +91,181 @@ class ExternalQATests(unittest.TestCase):
         self.assertEqual(result.result["exitCode"], 1)
         run.assert_not_called()
 
+    def test_legacy_truncated_failed_receipt_reruns_for_callback_diagnostics(self) -> None:
+        root = self._project()
+        loaded = load_project(root)
+        revision = "g" * 40
+        prior = {
+            "schema": "ai-team-external-qa-receipt/v1",
+            "revision": revision,
+            "status": "failed",
+            "providerChecks": {
+                "providerChecks": {
+                    "callbackTradeQueries": [
+                        {
+                            field: "<truncated: maximum depth>"
+                            for field in (
+                                "attempt",
+                                "querySucceeded",
+                                "tradeStatus",
+                                "tradeNoPresent",
+                                "flowStage",
+                                "errorCategory",
+                            )
+                        }
+                    ]
+                }
+            },
+        }
+        payload = {
+            "schema": "celebratedeal-payuni-sandbox-qa/v1",
+            "success": False,
+            "environment": "sandbox",
+            "checks": {
+                "providerChecks": {
+                    "callbackTradeQueries": [
+                        {"attempt": 3, "querySucceeded": True, "tradeStatus": "SUCCESS"}
+                    ]
+                }
+            },
+            "productionValidation": {"automatedChargeAllowed": False},
+        }
+        completed = subprocess.CompletedProcess(
+            ["npm", "run", "qa:payuni:sandbox"], 1, json.dumps(payload) + "\n", ""
+        )
+
+        with patch("ai_team.core.external_qa.subprocess.run", return_value=completed) as run:
+            result = run_external_qa(loaded, revision, root / "reports", prior=prior)
+
+        self.assertEqual(result.status, "failed")
+        self.assertNotEqual(result.result.get("reason"), "already-run-for-revision")
+        self.assertEqual(
+            result.result["diagnosticRerun"],
+            {"version": 1, "reason": "legacy-truncated-callback-trade-queries"},
+        )
+        self.assertEqual(
+            result.result["providerChecks"]["providerChecks"]["callbackTradeQueries"][0]["attempt"],
+            3,
+        )
+        run.assert_called_once()
+
+    def test_mixed_callback_trade_query_evidence_does_not_rerun(self) -> None:
+        root = self._project()
+        loaded = load_project(root)
+        revision = "h" * 40
+        legacy_query = {
+            field: "<truncated: maximum depth>"
+            for field in (
+                "attempt",
+                "querySucceeded",
+                "tradeStatus",
+                "tradeNoPresent",
+                "flowStage",
+                "errorCategory",
+            )
+        }
+        complete_query = {
+            "attempt": 3,
+            "querySucceeded": True,
+            "tradeStatus": "SUCCESS",
+            "tradeNoPresent": True,
+            "flowStage": "callback-received",
+            "errorCategory": None,
+        }
+        prior = {
+            "schema": "ai-team-external-qa-receipt/v1",
+            "revision": revision,
+            "status": "failed",
+            "providerChecks": {
+                "providerChecks": {"callbackTradeQueries": [legacy_query, complete_query]}
+            },
+        }
+
+        with patch("ai_team.core.external_qa.subprocess.run") as run:
+            result = run_external_qa(loaded, revision, root / "reports", prior=prior)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.result["reason"], "already-run-for-revision")
+        run.assert_not_called()
+
+    def test_legacy_rerun_is_limited_to_once_even_if_replacement_is_truncated(self) -> None:
+        root = self._project()
+        loaded = load_project(root)
+        revision = "i" * 40
+        truncated_query = {
+            field: "<truncated: maximum depth>"
+            for field in (
+                "attempt",
+                "querySucceeded",
+                "tradeStatus",
+                "tradeNoPresent",
+                "flowStage",
+                "errorCategory",
+            )
+        }
+        prior = {
+            "schema": "ai-team-external-qa-receipt/v1",
+            "revision": revision,
+            "status": "failed",
+            "providerChecks": {
+                "providerChecks": {"callbackTradeQueries": [truncated_query]}
+            },
+        }
+        payload = {
+            "schema": "celebratedeal-payuni-sandbox-qa/v1",
+            "success": False,
+            "environment": "sandbox",
+            "checks": {
+                "providerChecks": {"callbackTradeQueries": [truncated_query]}
+            },
+            "productionValidation": {"automatedChargeAllowed": False},
+        }
+        completed = subprocess.CompletedProcess(
+            ["npm", "run", "qa:payuni:sandbox"], 1, json.dumps(payload) + "\n", ""
+        )
+
+        with patch("ai_team.core.external_qa.subprocess.run", return_value=completed) as run:
+            replacement = run_external_qa(loaded, revision, root / "reports", prior=prior)
+            persisted_replacement = json.loads(replacement.receipt_path.read_text(encoding="utf-8"))
+            cached = run_external_qa(loaded, revision, root / "reports", prior=persisted_replacement)
+
+        self.assertEqual(replacement.status, "failed")
+        self.assertEqual(replacement.result["diagnosticRerun"]["version"], 1)
+        self.assertEqual(persisted_replacement["diagnosticRerun"]["version"], 1)
+        self.assertEqual(cached.status, "failed")
+        self.assertEqual(cached.result["reason"], "already-run-for-revision")
+        run.assert_called_once()
+
+    def test_complete_failed_and_passed_receipts_do_not_rerun(self) -> None:
+        root = self._project()
+        loaded = load_project(root)
+        complete_query = {
+            "attempt": 3,
+            "querySucceeded": True,
+            "tradeStatus": "SUCCESS",
+            "tradeNoPresent": True,
+            "flowStage": "callback-received",
+            "errorCategory": None,
+        }
+
+        for status in ("failed", "passed"):
+            with self.subTest(status=status):
+                revision = status[0] * 40
+                prior = {
+                    "schema": "ai-team-external-qa-receipt/v1",
+                    "revision": revision,
+                    "status": status,
+                    "providerChecks": {
+                        "providerChecks": {"callbackTradeQueries": [complete_query]}
+                    },
+                }
+                with patch("ai_team.core.external_qa.subprocess.run") as run:
+                    result = run_external_qa(loaded, revision, root / "reports", prior=prior)
+
+                self.assertEqual(result.status, status)
+                self.assertEqual(result.result["reason"], "already-run-for-revision")
+                run.assert_not_called()
+
     def test_timeout_provider_checks_keep_structured_payuni_diagnostics(self) -> None:
         root = self._project()
         loaded = load_project(root)
