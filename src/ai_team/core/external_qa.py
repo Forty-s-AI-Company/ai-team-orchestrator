@@ -11,15 +11,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from ai_team.core.project_loader import LoadedProject
-from ai_team.providers.base import redact_secrets
+from ai_team.providers.base import SECRET_KEY_PATTERN, redact_secrets
 
 
 SCHEMA = "ai-team-external-qa-receipt/v1"
@@ -27,6 +29,10 @@ ALLOWED_COMMANDS: dict[str, tuple[str, ...]] = {
     "npm run qa:payuni:sandbox": ("npm", "run", "qa:payuni:sandbox"),
 }
 MAX_OUTPUT_BYTES = 64_000
+MAX_CHECK_DEPTH = 4
+MAX_CHECK_FIELDS = 20
+MAX_CHECK_ITEMS = 20
+MAX_CHECK_STRING_CHARS = 300
 
 
 @dataclass(frozen=True)
@@ -210,7 +216,40 @@ def _safe_checks(parsed: dict[str, Any]) -> dict[str, Any] | None:
     checks = parsed.get("checks")
     if not isinstance(checks, dict):
         return None
-    return {str(key): str(value)[:80] for key, value in checks.items()}
+    safe = _safe_check_value(checks, depth=0)
+    return safe if isinstance(safe, dict) else None
+
+
+def _safe_check_value(value: Any, *, depth: int) -> Any:
+    """Keep bounded, JSON-shaped provider evidence for a redacted receipt."""
+
+    if depth >= MAX_CHECK_DEPTH:
+        return "<truncated: maximum depth>"
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value[:MAX_CHECK_STRING_CHARS]
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else "<unsupported number>"
+    if isinstance(value, dict):
+        summary: dict[str, Any] = {}
+        for key, item in islice(value.items(), MAX_CHECK_FIELDS):
+            if not isinstance(key, str):
+                continue
+            safe_key = key[:MAX_CHECK_STRING_CHARS]
+            # Detect sensitive names before truncating the key.  Otherwise a
+            # deliberately long key ending in e.g. ``apiKey`` would evade the
+            # receipt's normal key-based redaction once its suffix is dropped.
+            if SECRET_KEY_PATTERN.search(key):
+                summary[safe_key] = "<redacted>" if item else item
+            else:
+                summary[safe_key] = _safe_check_value(item, depth=depth + 1)
+        return summary
+    if isinstance(value, list):
+        return [_safe_check_value(item, depth=depth + 1) for item in value[:MAX_CHECK_ITEMS]]
+    return "<unsupported value>"
 
 
 def _write_receipt(report_dir: Path, result: dict[str, Any], output: str) -> Path:
