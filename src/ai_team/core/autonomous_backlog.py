@@ -155,7 +155,9 @@ def _discovery_prompt(revision: str) -> str:
         "For status=task, contract must be a schemaVersion=1 trusted task contract with source.kind=trusted-contract,",
         "a lowercase hyphenated id beginning with auto-, no dependsOn, safe project-relative allowedWritePaths,",
         "and validationCommands containing npm run lint, npm run typecheck, npm run test, and npm run build.",
-        "Use changePolicy only when the code task genuinely needs it; never request execution of migrations, seeds, deploys, or payments.",
+        "Always include changePolicy as a JSON object with exactly these boolean keys: schemaChanges, apiContractChanges, migrationArtifacts, fixtureData.",
+        "When no such code change is required, set all four changePolicy values to false; never use a string, array, or null.",
+        "Never request execution of migrations, seeds, deploys, or payments.",
     ))
 
 

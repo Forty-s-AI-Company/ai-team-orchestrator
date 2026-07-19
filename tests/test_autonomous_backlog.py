@@ -77,6 +77,8 @@ class AutonomousBacklogTests(unittest.TestCase):
             self.assertEqual(result["status"], "task-created", result)
             self.assertEqual(provider.last_request.workflow, "autonomous-product-discovery")
             self.assertEqual(provider.last_request.metadata["boundedStage"], "pm")
+            self.assertIn("changePolicy as a JSON object", provider.last_request.prompt)
+            self.assertIn("never use a string, array, or null", provider.last_request.prompt)
 
     def test_accepts_native_pm_envelope_with_top_level_backlog_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
