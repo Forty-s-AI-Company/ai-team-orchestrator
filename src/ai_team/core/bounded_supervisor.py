@@ -720,6 +720,12 @@ def cleanup_completed_worktree(
     if not isinstance(value, str) or not value:
         return {"attempted": False, "success": False, "reason": "worktree-path-missing"}
     worktree = Path(value).resolve()
+    if not worktree.exists():
+        return {
+            "attempted": False,
+            "success": True,
+            "reason": "merged-worktree-already-absent",
+        }
     try:
         primary = load_project(options.project_path, allowlist=options.workspace_allowlist)
         loaded = load_project(worktree, allowlist=options.workspace_allowlist)

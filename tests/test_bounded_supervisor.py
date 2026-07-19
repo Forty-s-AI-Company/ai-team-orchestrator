@@ -24,6 +24,30 @@ from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
 
 
 class ContinuousBoundedSupervisorTests(unittest.TestCase):
+    def test_cleanup_is_idempotent_when_merged_worktree_is_already_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            options = ContinuousBoundedOptions(
+                project_path=root,
+                contract_dir=contracts,
+                provider_for_role=lambda _role: _NoopProvider(),
+                workspace_allowlist=[tmp],
+                report_dir=root / "reports",
+                state_path=root / "state.json",
+                trusted_dev=TrustedDevSettings(cleanup_worktree_after_merge=True),
+            )
+
+            result = cleanup_completed_worktree(
+                options,
+                {"worktreePath": str(root / "already-cleaned-worktree")},
+            )
+
+            self.assertTrue(result["success"], result)
+            self.assertFalse(result["attempted"])
+            self.assertEqual(result["reason"], "merged-worktree-already-absent")
+
     def test_merged_publication_resumes_after_disposable_artifacts_are_cleaned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
