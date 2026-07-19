@@ -66,6 +66,32 @@ class SafetyPolicy(BaseModel):
     require_disposable_worktree_for_writes: bool = True
 
 
+class ExternalQAConfig(BaseModel):
+    """A narrow, staging-only QA command executed outside disposable worktrees.
+
+    External QA is intentionally separate from ``commands.additional_validation``:
+    it may need credentials from the source project's ignored ``.env.local`` and
+    may exercise a real staging provider.  The runner still accepts only a fixed
+    command allowlist and never enables production actions.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    environment: str = "staging"
+    command: str = "npm run qa:payuni:sandbox"
+    run_once_per_revision: bool = True
+    reviewer_role: str = "delivery-qa"
+    production_requires_human_approval: bool = True
+
+    @field_validator("environment", "command", "reviewer_role")
+    @classmethod
+    def non_empty_external_qa_value(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("must not be empty")
+        return value.strip()
+
+
 class StagingOperationsPolicy(BaseModel):
     """Explicit opt-in for deterministic non-production external operations.
 
@@ -110,6 +136,7 @@ class ProjectProfile(BaseModel):
     repository: RepositoryPolicy = Field(default_factory=RepositoryPolicy)
     commands: CommandSet = Field(default_factory=CommandSet)
     safety: SafetyPolicy = Field(default_factory=SafetyPolicy)
+    external_qa: ExternalQAConfig = Field(default_factory=ExternalQAConfig)
     staging_operations: StagingOperationsPolicy = Field(default_factory=StagingOperationsPolicy)
 
 

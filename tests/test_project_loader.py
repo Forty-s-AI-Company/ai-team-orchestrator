@@ -65,6 +65,26 @@ class ProjectLoaderTests(unittest.TestCase):
 
             self.assertEqual(loaded.profile.commands.additional_validation, ["npm run e2e:smoke"])
 
+    def test_loads_staging_external_qa_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            init_git_project(root)
+            profile = root / ".ai-team" / "project.yaml"
+            profile.write_text(
+                profile.read_text(encoding="utf-8").replace(
+                    "safety:\n",
+                    "external_qa:\n  enabled: true\n  environment: staging\n  command: npm run qa:payuni:sandbox\n\nsafety:\n",
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_project(root)
+
+            self.assertTrue(loaded.profile.external_qa.enabled)
+            self.assertEqual(loaded.profile.external_qa.environment, "staging")
+            self.assertEqual(loaded.profile.external_qa.command, "npm run qa:payuni:sandbox")
+
     def test_rejects_duplicate_or_empty_additional_validation_commands(self) -> None:
         for values in (["npm run e2e:smoke", "npm run e2e:smoke"], [""]):
             with self.subTest(values=values), tempfile.TemporaryDirectory() as tmp:

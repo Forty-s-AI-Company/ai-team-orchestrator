@@ -29,6 +29,7 @@ from ai_team.core.bounded_delivery import (
     run_bounded_delivery,
 )
 from ai_team.core.ci_monitor import monitor_pull_request
+from ai_team.core.external_qa import run_external_qa
 from ai_team.core.github_executor import GitHubExecutionOptions, execute_github_action
 from ai_team.core.project_loader import load_project
 from ai_team.core.trusted_dev import TrustedDevSettings
@@ -474,6 +475,46 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
             )
             if publication is not None:
                 publication = {**publication, "worktreeCleanup": cleanup}
+
+            external_qa: dict[str, Any] | None = None
+            if options.github_execute and publication is not None and publication.get("success") is True:
+                # The disposable worktree is gone/merged at this point.  Run
+                # the staging browser test against the synced source project,
+                # where the ignored .env.local is available.
+                project_profile_path = options.project_path / ".ai-team" / "project.yaml"
+                env_file_path = options.project_path / ".env.local"
+                if project_profile_path.is_file() and env_file_path.is_file():
+                    loaded_source = load_project(
+                        options.project_path,
+                        allowlist=options.workspace_allowlist,
+                    )
+                else:
+                    loaded_source = None
+                if loaded_source is not None and loaded_source.profile.external_qa.enabled:
+                    source_revision = _git_head(options.project_path)
+                    qa_result = run_external_qa(
+                        loaded_source,
+                        source_revision,
+                        options.report_dir / "external-qa",
+                        prior=prior.get("externalQa") if isinstance(prior, dict) else None,
+                    )
+                    external_qa = qa_result.result
+                    if qa_result.status in {"failed", "blocked"}:
+                        state = _supervisor_state(
+                            running,
+                            cycles,
+                            "attention-required",
+                            completed,
+                            queue_size=_pending_count(entries, completed),
+                            current=selected,
+                            stop_reason="external-qa-failed" if qa_result.status == "failed" else "external-qa-blocked",
+                            next_action="manual-review-required",
+                            delivery_result=effective_result,
+                            publication=publication,
+                            external_qa=external_qa,
+                        )
+                        _write_json(options.state_path, state)
+                        return state
             completed.add(selected.task_sha)
             state = _supervisor_state(
                 running,
@@ -485,6 +526,7 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 next_action="next-contract",
                 delivery_result=effective_result,
                 publication=publication,
+                external_qa=external_qa,
             )
             _write_json(options.state_path, state)
             if _must_stop(options, started):
@@ -746,6 +788,20 @@ def _git_common_directory(root: Path) -> Path:
     return path.resolve() if path.is_absolute() else (root / path).resolve()
 
 
+def _git_head(root: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ValueError("cannot resolve source Git revision for external QA")
+    return result.stdout.strip()
+
+
 def _validate_options(options: ContinuousBoundedOptions) -> None:
     if options.interval_minutes < 1:
         raise ValueError("interval_minutes must be at least 1")
@@ -778,6 +834,7 @@ def _supervisor_state(
     next_action: str,
     delivery_result: dict[str, Any] | None = None,
     publication: dict[str, Any] | None = None,
+    external_qa: dict[str, Any] | None = None,
     diagnostic: str | None = None,
     provider_backoff: dict[str, Any] | None = None,
     cloud_resilience: dict[str, Any] | None = None,
@@ -812,6 +869,7 @@ def _supervisor_state(
         ),
         "delivery": _result_summary(delivery_result),
         "publication": publication,
+        "externalQa": external_qa if external_qa is not None else prior.get("externalQa"),
         "diagnostic": diagnostic,
         "providerBackoff": provider_backoff,
         "cloudResilience": cloud_resilience,
