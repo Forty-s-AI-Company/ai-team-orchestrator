@@ -128,6 +128,57 @@ class ExternalQATests(unittest.TestCase):
         self.assertEqual(provider_checks["checkoutHttpStatus"], 302)
         self.assertEqual(provider_checks["visiblePayUniStatus"], "等待 PayUni 回傳付款結果")
 
+    def test_callback_trade_query_attempt_leaves_are_preserved_at_depth_boundary(self) -> None:
+        root = self._project()
+        loaded = load_project(root)
+        payload = {
+            "schema": "celebratedeal-payuni-sandbox-qa/v1",
+            "success": False,
+            "environment": "sandbox",
+            "checks": {
+                "providerChecks": {
+                    "callbackTradeQueries": [
+                        {
+                            "attempt": 1,
+                            "querySucceeded": True,
+                            "tradeStatus": "SUCCESS",
+                            "tradeNoPresent": True,
+                            "currentHttpsHostPath": "https://sandbox-api.payuni.com.tw/api/checkout/callback",
+                            "flowStage": "callback-received",
+                            "errorCategory": None,
+                            "apiKey": "sensitive-payuni-credential",
+                            "deeperEvidence": {"mustRemainBounded": "value"},
+                        }
+                    ]
+                }
+            },
+            "productionValidation": {"automatedChargeAllowed": False},
+        }
+        completed = subprocess.CompletedProcess(
+            ["npm", "run", "qa:payuni:sandbox"], 1, json.dumps(payload) + "\n", ""
+        )
+
+        with patch("ai_team.core.external_qa.subprocess.run", return_value=completed):
+            result = run_external_qa(loaded, "f" * 40, root / "reports")
+
+        attempt = result.result["providerChecks"]["providerChecks"]["callbackTradeQueries"][0]
+        self.assertEqual(attempt["attempt"], 1)
+        self.assertIs(attempt["querySucceeded"], True)
+        self.assertEqual(attempt["tradeStatus"], "SUCCESS")
+        self.assertIs(attempt["tradeNoPresent"], True)
+        self.assertEqual(
+            attempt["currentHttpsHostPath"],
+            "https://sandbox-api.payuni.com.tw/api/checkout/callback",
+        )
+        self.assertEqual(attempt["flowStage"], "callback-received")
+        self.assertIsNone(attempt["errorCategory"])
+        self.assertEqual(attempt["deeperEvidence"], "<truncated: maximum depth>")
+
+        receipt = json.loads(result.receipt_path.read_text(encoding="utf-8"))
+        receipt_attempt = receipt["providerChecks"]["providerChecks"]["callbackTradeQueries"][0]
+        self.assertEqual(receipt_attempt["apiKey"], "<redacted>")
+        self.assertNotIn("sensitive-payuni-credential", result.receipt_path.read_text(encoding="utf-8"))
+
     def test_provider_check_summary_is_bounded_and_redacted_in_receipt(self) -> None:
         root = self._project()
         loaded = load_project(root)

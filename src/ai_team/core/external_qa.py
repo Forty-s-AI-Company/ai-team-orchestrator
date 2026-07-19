@@ -223,8 +223,10 @@ def _safe_checks(parsed: dict[str, Any]) -> dict[str, Any] | None:
 def _safe_check_value(value: Any, *, depth: int) -> Any:
     """Keep bounded, JSON-shaped provider evidence for a redacted receipt."""
 
-    if depth >= MAX_CHECK_DEPTH:
-        return "<truncated: maximum depth>"
+    # Leaf evidence at the depth boundary is useful for callback diagnostics:
+    # checks -> providerChecks -> callbackTradeQueries -> attempt -> field.
+    # Bound nesting applies to containers, while scalar values at that boundary
+    # remain safe under their existing type and length limits.
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -233,6 +235,8 @@ def _safe_check_value(value: Any, *, depth: int) -> Any:
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else "<unsupported number>"
+    if depth >= MAX_CHECK_DEPTH:
+        return "<truncated: maximum depth>"
     if isinstance(value, dict):
         summary: dict[str, Any] = {}
         for key, item in islice(value.items(), MAX_CHECK_FIELDS):
