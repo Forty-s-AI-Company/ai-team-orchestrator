@@ -16,6 +16,7 @@ def render_chinese_status(
     supervisor_state_path: Path,
     supervisor_service: str,
     watchdog_service: str,
+    report_dir: Path | None = None,
     runner: Runner | None = None,
     now: datetime | None = None,
 ) -> str:
@@ -30,9 +31,10 @@ def render_chinese_status(
     descendants = _descendants(watchdog_pid, processes) if watchdog_pid else []
     state = _read_json(supervisor_state_path)
     repair = _latest_repair_activity(project, checked_at)
+    repair_report = _repair_report(report_dir)
 
     overall = _overall_status(supervisor, watchdog, descendants, repair)
-    owner, activity = _current_activity(descendants)
+    owner, activity = _current_activity(descendants, repair_report)
     task_title, task_instruction = _task_description(state)
     latest_commit = _latest_commit(project, execute)
 
@@ -70,6 +72,17 @@ def render_chinese_status(
             f"上一個 Git 成果：{latest_commit}",
         ]
     )
+    lines.extend(_repair_history_lines(repair_report))
+
+    deferred_tasks = state.get("deferredTasks")
+    if isinstance(deferred_tasks, list) and deferred_tasks:
+        lines.extend(["", "已暫緩任務（不阻塞其他工作）"])
+        for item in deferred_tasks[-5:]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- {item.get('id') or '未知任務'}：{_shorten(str(item.get('reason') or '未提供原因'), 100)}"
+            )
 
     if state.get("status") == "stopped" and watchdog_pid:
         lines.extend(
@@ -164,7 +177,10 @@ def _overall_status(
     return "已停止（目前沒有 AI Team 工作程序）"
 
 
-def _current_activity(descendants: list[dict[str, int | str]]) -> tuple[str, str]:
+def _current_activity(
+    descendants: list[dict[str, int | str]],
+    repair_report: dict,
+) -> tuple[str, str]:
     commands = "\n".join(str(row["command"]) for row in descendants).lower()
     if "playwright" in commands or "e2e:" in commands:
         activity = "Playwright 瀏覽器驗收測試"
@@ -176,6 +192,8 @@ def _current_activity(descendants: list[dict[str, int | str]]) -> tuple[str, str
         activity = "TypeScript 型別檢查"
     elif "eslint" in commands or "npm run lint" in commands:
         activity = "ESLint 程式碼規範檢查"
+    elif "antigravity" in commands or "/agy" in commands or "gemini 3.1" in commands:
+        activity = "AGY 獨立 QA 驗證修正結果"
     elif "gpt-5.6-sol" in commands:
         activity = "審查修正結果並決定通過或退回"
     elif "gpt-5.6-terra" in commands:
@@ -183,14 +201,19 @@ def _current_activity(descendants: list[dict[str, int | str]]) -> tuple[str, str
     elif descendants:
         activity = "執行自動修復流程"
     else:
-        activity = "目前沒有執行中的工作"
+        activity = _phase_activity(repair_report)
 
+    effort = "XHigh" if "xhigh" in commands else "High"
     if "gpt-5.6-terra" in commands:
-        owner = "Terra High（工程修復）"
+        owner = f"Terra {effort}（工程修復）"
+    elif "antigravity" in commands or "/agy" in commands or "gemini 3.1" in commands:
+        owner = "AGY（獨立 QA）"
     elif "gpt-5.6-sol" in commands:
-        owner = "Sol High（診斷／QA 審查）"
+        owner = f"Sol {effort}（診斷／QA 審查）"
     elif descendants:
         owner = "Watchdog（自動修復控制器）"
+    elif repair_report.get("status") == "running":
+        owner = _phase_owner(repair_report)
     else:
         owner = "無"
     return owner, activity
@@ -200,13 +223,13 @@ def _latest_repair_activity(project: Path, now: datetime) -> dict[str, str] | No
     candidates = list(project.parent.glob(f"{project.name}-watchdog-repair-*"))
     files: list[Path] = []
     for worktree in candidates:
-        scripts = worktree / "scripts"
-        if scripts.is_dir():
-            files.extend(
-                item
-                for item in scripts.rglob("*")
-                if item.is_file() and "payuni-sandbox" in item.name
-            )
+        for directory_name in ("src", "tests", "scripts"):
+            directory = worktree / directory_name
+            if directory.is_dir():
+                files.extend(item for item in directory.rglob("*") if item.is_file())
+        files.extend(
+            item for item in worktree.glob("playwright.config.*") if item.is_file()
+        )
     if not files:
         return None
     latest = max(files, key=lambda item: item.stat().st_mtime)
@@ -219,6 +242,108 @@ def _latest_repair_activity(project: Path, now: datetime) -> dict[str, str] | No
         "files": "、".join(item.name for item in newest),
         "stale": "yes" if age > 600 else "",
     }
+
+
+def _repair_report(report_dir: Path | None) -> dict:
+    if report_dir is None:
+        return {}
+    current = report_dir / "watchdog-ai-repair-current.json"
+    if current.is_file():
+        return _read_json(current)
+    try:
+        candidates = sorted(
+            report_dir.glob("watchdog-ai-repair-*.json"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return {}
+    return _read_json(candidates[0]) if candidates else {}
+
+
+def _repair_history_lines(report: dict) -> list[str]:
+    cycles = report.get("cycles")
+    if not isinstance(cycles, list) or not cycles:
+        return []
+    limit = report.get("cycleLimit") or 5
+    lines = ["", f"自動修復歷程（最多 {limit} 輪）"]
+    for item in cycles[-5:]:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("cycle") or "?"
+        effort = "XHigh" if item.get("reasoningEffort") == "xhigh" else "High"
+        outcome = _outcome_label(str(item.get("outcome") or "進行中"))
+        detail = _cycle_detail(item)
+        suffix = f"：{detail}" if detail else ""
+        lines.append(f"- 第 {number} 輪｜Sol/Terra {effort}｜{outcome}{suffix}")
+    status = str(report.get("status") or "running")
+    status_labels = {
+        "running": "仍在修復中",
+        "passed": "已修好並通過所有 QA",
+        "deferred": "五輪未修好，已記錄並跳過，不阻塞其他工作",
+        "failed": "修復流程本身發生錯誤",
+    }
+    lines.append(f"- 最終結果：{status_labels.get(status, status)}")
+    reason = report.get("deferReason") or report.get("error")
+    if reason:
+        lines.append(f"- 原因：{_shorten(str(reason), 160)}")
+    return lines
+
+
+def _cycle_detail(item: dict) -> str:
+    agy = item.get("agyQa") if isinstance(item.get("agyQa"), dict) else {}
+    sol = item.get("solReview") if isinstance(item.get("solReview"), dict) else {}
+    parts: list[str] = []
+    if agy:
+        parts.append(f"AGY QA {_qa_label(agy)}")
+    if sol:
+        parts.append(f"Sol 複檢 {_qa_label(sol)}")
+    failure = item.get("failureSummary")
+    if failure:
+        parts.append(_shorten(str(failure), 120))
+    return "；".join(parts)
+
+
+def _qa_label(value: dict) -> str:
+    status = value.get("status")
+    return "通過" if status == "passed" else "未通過"
+
+
+def _outcome_label(value: str) -> str:
+    return {
+        "diagnosed": "Sol 已完成診斷",
+        "passed": "修復通過",
+        "unrepairable": "Sol 判定暫時無法自修",
+        "terra-produced-no-diff": "Terra 沒有產生修正",
+        "deterministic-qa-failed": "基礎測試未通過",
+        "review-rejected": "QA／複檢退回",
+        "cycle-error": "本輪執行失敗",
+    }.get(value, value)
+
+
+def _phase_activity(report: dict) -> str:
+    return {
+        "initializing": "準備自動修復證據",
+        "sol-diagnosis": "Sol 正在判斷根因與修正方向",
+        "terra-repair": "Terra 正在依診斷修改程式",
+        "deterministic-qa": "執行 lint、型別、單元測試與建置",
+        "agy-qa": "AGY 正在做獨立 QA",
+        "sol-review": "Sol 正在複檢 AGY 與測試結果",
+        "commit-and-push": "建立 Git checkpoint 並推送",
+        "deferred": "已記錄失敗並跳過目前任務",
+    }.get(str(report.get("activePhase") or ""), "目前沒有執行中的工作")
+
+
+def _phase_owner(report: dict) -> str:
+    phase = str(report.get("activePhase") or "")
+    effort = "XHigh" if _positive_int(str(report.get("activeCycle") or 0)) > 1 else "High"
+    if phase == "terra-repair":
+        return f"Terra {effort}（工程修復）"
+    if phase == "agy-qa":
+        return "AGY（獨立 QA）"
+    if phase in {"sol-diagnosis", "sol-review"}:
+        return f"Sol {effort}（診斷／QA 審查）"
+    return "Watchdog（自動修復控制器）"
 
 
 def _task_description(state: dict) -> tuple[str, str]:

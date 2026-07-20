@@ -68,6 +68,10 @@ class AutoRepairOptions:
     diagnosis_model: str = "gpt-5.6-sol"
     repair_model: str = "gpt-5.6-terra"
     reasoning_effort: str = "high"
+    supervisor_state_path: Path | None = None
+    antigravity_executable: str = "agy"
+    antigravity_qa_model: str = "Gemini 3.1 Pro (High)"
+    max_ai_repair_cycles: int = 5
 
 
 def repair_key(supervisor: dict[str, Any], task_failure_reason: str | None) -> str:
@@ -97,7 +101,10 @@ def attempt_auto_repair(
 ) -> dict[str, Any]:
     """Stop the supervisor, apply one deterministic repair, and restart on success."""
 
-    if requires_manual_review(supervisor):
+    restart_loop_recovery = (
+        alert_type == "restart-loop" and options.ai_repair_enabled
+    )
+    if requires_manual_review(supervisor) and not restart_loop_recovery:
         return _result(
             False,
             False,
@@ -134,6 +141,9 @@ def attempt_auto_repair(
                 diagnosis_model=options.diagnosis_model,
                 repair_model=options.repair_model,
                 reasoning_effort=options.reasoning_effort,
+                antigravity_executable=options.antigravity_executable,
+                antigravity_qa_model=options.antigravity_qa_model,
+                max_repair_cycles=options.max_ai_repair_cycles,
                 now=now,
             )
     else:
@@ -146,6 +156,11 @@ def attempt_auto_repair(
 
     if repair["success"] is not True:
         return repair
+    if repair.get("deferred") is True:
+        deferred = _record_deferred_task(supervisor, repair, options, now=now)
+        if deferred["success"] is not True:
+            return {**repair, **deferred, "restarted": False}
+        repair = {**repair, "deferredState": deferred}
     _systemctl(runner, "reset-failed", service_name)
     if not _systemctl(runner, "start", service_name):
         return {
@@ -161,6 +176,67 @@ def attempt_auto_repair(
             "diagnostic": "supervisor restarted but revive timer could not be restored",
         }
     return {**repair, "restarted": True}
+
+
+def _record_deferred_task(
+    supervisor: dict[str, Any],
+    repair: dict[str, Any],
+    options: AutoRepairOptions,
+    *,
+    now: datetime | None,
+) -> dict[str, Any]:
+    path = options.supervisor_state_path
+    task = supervisor.get("currentTask")
+    task_sha = task.get("taskSha") if isinstance(task, dict) else None
+    if path is None or not isinstance(task_sha, str) or not task_sha:
+        return _result(True, False, "defer-task", "supervisor state or current task is missing")
+    try:
+        resolved = path.resolve(strict=True)
+        if resolved.is_symlink() or not resolved.is_file() or resolved.stat().st_size > 2_000_000:
+            raise ValueError("supervisor state is not a bounded regular file")
+        state = json.loads(resolved.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("supervisor state must be a JSON object")
+        current = state.get("currentTask")
+        if not isinstance(current, dict) or current.get("taskSha") != task_sha:
+            raise ValueError("supervisor task changed during automatic repair")
+        deferred_shas = [
+            value for value in state.get("deferredTaskShas", [])
+            if isinstance(value, str) and value
+        ]
+        if task_sha not in deferred_shas:
+            deferred_shas.append(task_sha)
+        prior_items = [
+            item for item in state.get("deferredTasks", [])
+            if isinstance(item, dict) and item.get("taskSha") != task_sha
+        ]
+        deferred_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        prior_items.append({
+            "id": current.get("id"),
+            "taskSha": task_sha,
+            "reason": repair.get("diagnostic"),
+            "reportPath": repair.get("reportPath"),
+            "deferredAt": deferred_at,
+            "attempts": options.max_ai_repair_cycles,
+        })
+        state.update({
+            "revision": int(state.get("revision") or 0) + 1,
+            "updatedAt": deferred_at,
+            "status": "deferred",
+            "deferredTaskShas": deferred_shas[-256:],
+            "deferredTasks": prior_items[-256:],
+            "stopReason": "repair-cycles-exhausted",
+            "nextAction": "next-contract",
+            "externalQa": None,
+            "diagnostic": str(repair.get("diagnostic") or "")[:500],
+        })
+        _write_bytes_atomic(
+            resolved,
+            (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return _result(True, False, "defer-task", str(exc)[:300])
+    return _result(True, True, "defer-task", "failed task recorded and deferred")
 
 
 def _repair_contract_commands(

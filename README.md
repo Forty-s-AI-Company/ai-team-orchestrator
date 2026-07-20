@@ -769,15 +769,31 @@ ai-team watchdog \
   --project ~/projects/CelebrateDeal \
   --contract-dir ~/.local/share/ai-team/CelebrateDeal/contracts \
   --repair-backup-dir ~/.local/state/ai-team/CelebrateDeal/repair-backups \
-  --max-auto-repair-attempts 2
+  --max-auto-repair-attempts 1 \
+  --ai-repair \
+  --orchestrator-project ~/projects/ai-team-orchestrator \
+  --ai-repair-report-dir ~/.local/share/ai-team/CelebrateDeal/reports \
+  --codex-executable ~/.local/bin/codex \
+  --agy-executable ~/.local/bin/agy \
+  --agy-qa-model "Gemini 3.1 Pro (High)" \
+  --max-ai-repair-cycles 5
 ```
 
 With `--auto-repair`, the watchdog stops the Supervisor before every repair.
 It deterministically restores project-profile validation commands for the
 known malformed-contract failure, and performs one bounded clean restart for
 a failed service or stale state. Unknown failures remain stopped with their
-evidence intact. The same failure is attempted at most twice; reaching the
-limit sends a final notification and does not restart the service.
+evidence intact. With `--ai-repair`, the restart-loop path runs one High cycle
+of Sol diagnosis, Terra repair, deterministic validation, independent
+Antigravity QA, and Sol review. Rejected results are replanned with Sol XHigh
+and repaired with Terra XHigh for at most five total cycles. A fifth rejection
+is written to the repair report, the task SHA is added to `deferredTaskShas`,
+and the Supervisor resumes with the next dependency-ready task instead of
+blocking the whole queue.
+
+Use `ai-team status-zh /path/to/project` to see the active repair phase and the
+last five cycle outcomes, including AGY findings, Sol review findings, and
+deferred-task reasons, in Traditional Chinese.
 
 Use `--test-notification` to verify the Windows notification path without
 reading the supervisor state or calling an AI provider.

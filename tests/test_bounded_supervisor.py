@@ -13,6 +13,7 @@ from ai_team.core.bounded_delivery import load_trusted_task_contract
 from ai_team.core.cloud_resilience import LocalContinuitySettings, RetrySettings, default_engineer_routes
 from ai_team.core.bounded_supervisor import (
     ContinuousBoundedOptions,
+    _exclude_deferred_contracts,
     _sync_primary,
     cleanup_completed_worktree,
     discover_contracts,
@@ -24,6 +25,14 @@ from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
 
 
 class ContinuousBoundedSupervisorTests(unittest.TestCase):
+    def test_deferred_contract_is_removed_without_marking_it_completed(self) -> None:
+        blocked = SimpleNamespace(task_sha="blocked-sha")
+        next_task = SimpleNamespace(task_sha="next-sha")
+
+        active = _exclude_deferred_contracts([blocked, next_task], {"blocked-sha"})
+
+        self.assertEqual(active, [next_task])
+
     def test_cleanup_is_idempotent_when_merged_worktree_is_already_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

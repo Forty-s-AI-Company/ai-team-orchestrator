@@ -81,3 +81,58 @@ def test_status_reports_a_real_stop_when_no_service_has_a_pid(tmp_path: Path) ->
 
     assert "已停止（目前沒有 AI Team 工作程序）" in output
     assert "目前負責：無" in output
+
+
+def test_status_shows_readable_failed_repair_history(tmp_path: Path) -> None:
+    project = tmp_path / "CelebrateDeal"
+    project.mkdir()
+    state = tmp_path / "state.json"
+    state.write_text("{}", encoding="utf-8")
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "watchdog-ai-repair-current.json").write_text(
+        json.dumps({
+            "status": "deferred",
+            "cycleLimit": 5,
+            "activePhase": "deferred",
+            "cycles": [
+                {
+                    "cycle": 1,
+                    "reasoningEffort": "high",
+                    "outcome": "review-rejected",
+                    "agyQa": {"status": "failed"},
+                    "solReview": {"status": "failed"},
+                    "failureSummary": "退款狀態仍不一致",
+                },
+                {
+                    "cycle": 2,
+                    "reasoningEffort": "xhigh",
+                    "outcome": "deterministic-qa-failed",
+                    "failureSummary": "單元測試失敗",
+                },
+            ],
+            "deferReason": "連續 5 輪仍未通過，已暫緩",
+        }),
+        encoding="utf-8",
+    )
+
+    def runner(command: list[str]) -> str:
+        if command[0] == "systemctl":
+            return "ActiveState=inactive\nSubState=dead\nMainPID=0\n"
+        return ""
+
+    output = render_chinese_status(
+        project,
+        supervisor_state_path=state,
+        supervisor_service="supervisor.service",
+        watchdog_service="watchdog.service",
+        report_dir=reports,
+        runner=runner,
+        now=datetime.fromisoformat("2026-07-20T12:23:00+08:00"),
+    )
+
+    assert "自動修復歷程（最多 5 輪）" in output
+    assert "第 1 輪｜Sol/Terra High｜QA／複檢退回" in output
+    assert "AGY QA 未通過" in output
+    assert "第 2 輪｜Sol/Terra XHigh｜基礎測試未通過" in output
+    assert "已記錄並跳過" in output

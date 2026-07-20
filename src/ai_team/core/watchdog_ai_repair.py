@@ -15,7 +15,7 @@ import re
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from ai_team.core.isolated_executor import (
@@ -24,7 +24,8 @@ from ai_team.core.isolated_executor import (
     run_validation_commands,
 )
 from ai_team.core.project_loader import load_project
-from ai_team.providers.base import redact_secrets
+from ai_team.providers.antigravity import AntigravityProvider, AntigravitySettings
+from ai_team.providers.base import ProviderRequest, redact_secrets
 
 
 DIAGNOSIS_SCHEMA = "ai-team-watchdog-diagnosis/v1"
@@ -33,10 +34,13 @@ REPORT_SCHEMA = "ai-team-watchdog-ai-repair/v1"
 MAX_MODEL_OUTPUT_BYTES = 128_000
 MAX_PATCH_BYTES = 512_000
 MAX_WRITE_PATHS = 12
-MAX_REPAIR_CYCLES = 3
-MAX_REPLAN_CYCLES = 3
+MAX_REPAIR_CYCLES = 5
+MAX_REPLAN_CYCLES = 5
 MAX_REPAIR_HISTORY = 4
 MODEL_TIMEOUT_SECONDS = 1_200
+CURRENT_REPORT_NAME = "watchdog-ai-repair-current.json"
+
+AGYReviewer = Callable[..., dict[str, Any]]
 
 REPOSITORY_PREFIXES = {
     "project": (
@@ -52,7 +56,7 @@ REPOSITORY_PREFIXES = {
 }
 
 
-def run_watchdog_ai_repair(
+def _run_legacy_watchdog_ai_repair(
     supervisor: dict[str, Any],
     *,
     project_path: Path,
@@ -288,6 +292,277 @@ def run_watchdog_ai_repair(
             )
 
 
+def run_watchdog_ai_repair(
+    supervisor: dict[str, Any],
+    *,
+    project_path: Path,
+    orchestrator_path: Path,
+    report_dir: Path,
+    codex_executable: str,
+    diagnosis_model: str = "gpt-5.6-sol",
+    repair_model: str = "gpt-5.6-terra",
+    reasoning_effort: str = "high",
+    antigravity_executable: str = "agy",
+    antigravity_qa_model: str = "Gemini 3.1 Pro (High)",
+    max_repair_cycles: int = MAX_REPAIR_CYCLES,
+    agy_reviewer: AGYReviewer | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Run the bounded Sol → Terra → AGY → Sol repair feedback loop."""
+
+    if not 1 <= max_repair_cycles <= MAX_REPAIR_CYCLES:
+        raise ValueError(f"max_repair_cycles must be between 1 and {MAX_REPAIR_CYCLES}")
+    started = (now or datetime.now(UTC)).astimezone(UTC)
+    project = project_path.resolve()
+    orchestrator = orchestrator_path.resolve()
+    reports = report_dir.resolve()
+    report: dict[str, Any] = {
+        "schema": REPORT_SCHEMA,
+        "startedAt": started.isoformat(),
+        "status": "running",
+        "diagnosisModel": diagnosis_model,
+        "repairModel": repair_model,
+        "qaModel": diagnosis_model,
+        "agyQaModel": antigravity_qa_model,
+        "initialReasoningEffort": reasoning_effort,
+        "cycleLimit": max_repair_cycles,
+        "activeCycle": 0,
+        "activePhase": "initializing",
+        "cycles": [],
+        "supervisorEvidence": redact_secrets(supervisor),
+    }
+    worktree: Path | None = None
+    dependency_link: Path | None = None
+    source: Path | None = None
+    try:
+        _validate_repository(project)
+        _validate_repository(orchestrator)
+        evidence = _failure_evidence(supervisor, reports)
+        diagnosis: dict[str, Any] | None = None
+        feedback: list[str] = []
+        cycles: list[dict[str, Any]] = report["cycles"]
+        reviewer = agy_reviewer or _run_antigravity_qa
+
+        for cycle_number in range(1, max_repair_cycles + 1):
+            effort = _cycle_reasoning_effort(cycle_number, reasoning_effort)
+            report.update({"activeCycle": cycle_number, "activePhase": "sol-diagnosis"})
+            _write_current_report(report, reports)
+            diagnosis_result = _invoke_codex(
+                codex_executable,
+                model=diagnosis_model,
+                reasoning_effort=effort,
+                root=orchestrator,
+                write=False,
+                prompt=(
+                    _diagnosis_prompt(supervisor, evidence, project, orchestrator)
+                    if diagnosis is None
+                    else _replan_prompt(
+                        supervisor,
+                        evidence,
+                        project,
+                        orchestrator,
+                        diagnosis,
+                        cycles,
+                    )
+                ),
+            )
+            diagnosis = _validate_diagnosis(_last_json_object(diagnosis_result.stdout))
+            cycle_result: dict[str, Any] = {
+                "cycle": cycle_number,
+                "reasoningEffort": effort,
+                "diagnosisCommand": _command_summary(diagnosis_result),
+                "diagnosis": diagnosis,
+                "outcome": "diagnosed",
+            }
+            cycles.append(cycle_result)
+            report["diagnosis"] = diagnosis
+            _write_current_report(report, reports)
+            if diagnosis["status"] != "repairable":
+                cycle_result.update({
+                    "outcome": "unrepairable",
+                    "failureSummary": diagnosis["summary"],
+                })
+                return _defer(
+                    report,
+                    reports,
+                    diagnostic=f"Sol 判定目前無法自動修復：{diagnosis['summary']}",
+                )
+
+            repository = diagnosis["repository"]
+            source = project if repository == "project" else orchestrator
+            _require_clean_development_branch(source)
+            allowed_paths = _validate_write_paths(repository, diagnosis["allowedWritePaths"])
+            base_sha = _git(source, "rev-parse", "HEAD").stdout.strip()
+            branch = _git(source, "branch", "--show-current").stdout.strip()
+            worktree = source.parent / f"{source.name}-watchdog-repair-{uuid4().hex[:10]}"
+            _git(source, "worktree", "add", "--detach", str(worktree), base_sha)
+            if repository == "project":
+                dependency_link = prepare_dependency_link(worktree, source)
+
+            try:
+                report["activePhase"] = "terra-repair"
+                _write_current_report(report, reports)
+                repair_result = _invoke_codex(
+                    codex_executable,
+                    model=repair_model,
+                    reasoning_effort=effort,
+                    root=worktree,
+                    write=True,
+                    prompt=_repair_prompt(diagnosis, allowed_paths, feedback=feedback),
+                )
+                cycle_result["repairCommand"] = _command_summary(repair_result)
+                if _git(worktree, "rev-parse", "HEAD").stdout.strip() != base_sha:
+                    raise ValueError("Terra must not create Git commits during the repair stage")
+                changed_files = _changed_files(worktree)
+                if not changed_files:
+                    raise ValueError("Terra completed without producing a repair diff")
+                outside = [path for path in changed_files if not _path_allowed(path, allowed_paths)]
+                if outside:
+                    raise ValueError(
+                        f"Terra changed files outside diagnosed scope: {', '.join(outside)}"
+                    )
+
+                _git(worktree, "add", "--", *changed_files)
+                patch = _git(
+                    worktree, "diff", "--cached", "--no-ext-diff", "--binary", "HEAD"
+                ).stdout
+                if len(patch.encode("utf-8")) > MAX_PATCH_BYTES:
+                    raise ValueError("repair patch exceeds the bounded QA evidence limit")
+                candidate_hash = hashlib.sha256(patch.encode("utf-8", "replace")).hexdigest()
+                cycle_result.update({
+                    "changedFiles": changed_files,
+                    "patchSha256": candidate_hash,
+                })
+
+                report["activePhase"] = "deterministic-qa"
+                _write_current_report(report, reports)
+                validation = _run_deterministic_qa(repository, source, worktree)
+                cycle_result["validation"] = validation
+                _assert_candidate_unchanged(
+                    worktree, changed_files, candidate_hash, "deterministic QA"
+                )
+                validation_feedback: list[str] = []
+                if validation.get("success") is not True:
+                    validation_feedback = _validation_feedback(validation)
+                    cycle_result.update({
+                        "outcome": "deterministic-qa-failed",
+                        "failureSummary": validation_feedback[0],
+                    })
+                    _write_current_report(report, reports)
+
+                report["activePhase"] = "agy-qa"
+                _write_current_report(report, reports)
+                agy_qa = reviewer(
+                    worktree=worktree,
+                    diagnosis=diagnosis,
+                    validation=validation,
+                    patch=patch,
+                    patch_sha=candidate_hash,
+                    executable=antigravity_executable,
+                    model=antigravity_qa_model,
+                )
+                cycle_result["agyQa"] = agy_qa
+                _assert_candidate_unchanged(worktree, changed_files, candidate_hash, "Antigravity QA")
+
+                report["activePhase"] = "sol-review"
+                _write_current_report(report, reports)
+                qa_result = _invoke_codex(
+                    codex_executable,
+                    model=diagnosis_model,
+                    reasoning_effort=effort,
+                    root=worktree,
+                    write=False,
+                    prompt=_qa_prompt(diagnosis, validation, agy_qa, patch),
+                )
+                sol_qa = _validate_qa(_last_json_object(qa_result.stdout))
+                cycle_result.update({
+                    "solReviewCommand": _command_summary(qa_result),
+                    "solReview": sol_qa,
+                })
+                _assert_candidate_unchanged(
+                    worktree, changed_files, candidate_hash, "Codex Sol review"
+                )
+                agy_passed = (
+                    validation.get("success") is True
+                    and agy_qa.get("status") == "passed"
+                    and not agy_qa.get("findings")
+                    and not agy_qa.get("blockers")
+                )
+                sol_passed = sol_qa["status"] == "passed" and not sol_qa["findings"]
+                if agy_passed and sol_passed:
+                    cycle_result["outcome"] = "passed"
+                    report["activePhase"] = "commit-and-push"
+                    _write_current_report(report, reports)
+                    _git(worktree, "commit", "-m", f"fix(ai-team): {diagnosis['summary'][:72]}")
+                    repair_sha = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+                    if _git(source, "rev-parse", "HEAD").stdout.strip() != base_sha:
+                        raise ValueError("source branch changed during automatic repair")
+                    if _git(source, "status", "--porcelain").stdout.strip():
+                        raise ValueError("source repository became dirty during automatic repair")
+                    _git(source, "merge", "--ff-only", repair_sha)
+                    _git(source, "push", "origin", f"HEAD:{branch}", timeout=180)
+                    report.update({
+                        "status": "passed",
+                        "repository": repository,
+                        "sourceRoot": str(source),
+                        "baseSha": base_sha,
+                        "repairSha": repair_sha,
+                        "branch": branch,
+                        "changedFiles": changed_files,
+                    })
+                    return _finish(
+                        report,
+                        reports,
+                        success=True,
+                        diagnostic="Sol 診斷、Terra 修正、AGY QA 與 Sol 複檢全部通過",
+                    )
+
+                feedback = [
+                    *validation_feedback,
+                    *[str(item) for item in agy_qa.get("findings", [])],
+                    *[str(item) for item in agy_qa.get("blockers", [])],
+                    *sol_qa["findings"],
+                ] or [str(agy_qa.get("summary") or sol_qa["summary"])]
+                cycle_result.update({
+                    "outcome": "review-rejected",
+                    "failureSummary": "；".join(feedback)[:2_000],
+                })
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                feedback = [str(redact_secrets(str(exc)))[:2_000]]
+                cycle_result.update({
+                    "outcome": "cycle-error",
+                    "failureSummary": feedback[0],
+                })
+
+            _write_current_report(report, reports)
+            if source is not None and worktree is not None:
+                _discard_candidate(source, worktree, dependency_link)
+            worktree = dependency_link = source = None
+
+        return _defer(
+            report,
+            reports,
+            diagnostic=f"連續 {max_repair_cycles} 輪仍未通過，已記錄並暫緩此任務",
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        report["status"] = "failed"
+        report["error"] = str(redact_secrets(str(exc)))[:500]
+        return _finish(report, reports, success=False, diagnostic=report["error"])
+    finally:
+        try:
+            remove_dependency_link(dependency_link)
+        except OSError:
+            pass
+        if worktree is not None and source is not None and worktree.exists():
+            subprocess.run(
+                ["git", "-C", str(source), "worktree", "remove", "--force", str(worktree)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+
 def _diagnosis_prompt(
     supervisor: dict[str, Any],
     evidence: dict[str, Any],
@@ -319,6 +594,10 @@ def _diagnosis_prompt(
     ))
 
 
+def _cycle_reasoning_effort(cycle_number: int, initial: str) -> str:
+    return initial if cycle_number == 1 else "xhigh"
+
+
 def _replan_prompt(
     supervisor: dict[str, Any],
     evidence: dict[str, Any],
@@ -331,7 +610,7 @@ def _replan_prompt(
         "You are the read-only incident diagnostician replanning a rejected autonomous repair.",
         f"Product repository: {project}",
         f"Orchestrator repository: {orchestrator}",
-        "The previous Terra implementation exhausted three repair/QA cycles. Inspect both repositories again.",
+        "The previous repair cycle was rejected. Inspect both repositories again at xhigh reasoning.",
         "Use every QA finding below as new root-cause evidence. Produce a materially revised plan instead of",
         "repeating the rejected design. You may change repository or exact write paths when the evidence supports it.",
         "Prefer structural solutions that make unsafe states unrepresentable over expanding semantic blacklists.",
@@ -374,18 +653,130 @@ def _repair_prompt(
     ))
 
 
-def _qa_prompt(diagnosis: dict[str, Any], validation: dict[str, Any], patch: str) -> str:
+def _qa_prompt(
+    diagnosis: dict[str, Any],
+    validation: dict[str, Any],
+    agy_qa: dict[str, Any],
+    patch: str,
+) -> str:
     return "\n".join((
         "You are the read-only QA reviewer for an automatic watchdog repair.",
-        "Review the exact untrusted patch and deterministic test evidence. Do not edit files or run external actions.",
+        "Review the exact untrusted patch, deterministic tests, and independent AGY QA evidence.",
+        "Do not edit files or run external actions. AGY rejection must be resolved or explicitly disproved.",
         "Check security, correctness, performance, readability, and maintainability.",
         "Return JSON only without Markdown using exactly:",
         '{"schema":"ai-team-watchdog-qa/v1","status":"passed|failed","summary":"Chinese summary",'
         '"findings":["actionable finding"]}',
         f"Diagnosis={json.dumps(diagnosis, ensure_ascii=False)}",
         f"Validation={json.dumps(redact_secrets(validation), ensure_ascii=False)}",
+        f"AGYQA={json.dumps(redact_secrets(agy_qa), ensure_ascii=False)}",
         f"UntrustedPatchJson={json.dumps(patch, ensure_ascii=False)}",
     ))
+
+
+def _run_antigravity_qa(
+    *,
+    worktree: Path,
+    diagnosis: dict[str, Any],
+    validation: dict[str, Any],
+    patch: str,
+    patch_sha: str,
+    executable: str,
+    model: str,
+) -> dict[str, Any]:
+    """Run AGY as a read-only, independently sandboxed repair reviewer."""
+
+    commands = [
+        str(item.get("command"))
+        for item in validation.get("commands", [])
+        if isinstance(item, dict) and isinstance(item.get("command"), str)
+    ]
+    changed_files = _changed_files(worktree)
+    implementation_evidence = {
+        "changedFiles": changed_files,
+        "validation": {"success": validation.get("success") is True},
+        "reviewEvidence": {
+            "path": "/tmp/ai-team-review-evidence/patch.diff",
+            "sha256": patch_sha,
+            "bytes": len(patch.encode("utf-8")),
+        },
+    }
+    prompt = "\n".join((
+        f"Task: {diagnosis['summary']}",
+        f"Instruction: {diagnosis['repairInstruction']}",
+        "Acceptance Criteria: " + json.dumps([
+            "修正符合 Sol 診斷的根因與範圍",
+            "所有 deterministic QA 都通過",
+            "沒有安全性、正確性、效能或可維護性阻擋項目",
+        ], ensure_ascii=False),
+        f"Allowed Write Paths: {json.dumps(changed_files, ensure_ascii=False)}",
+        f"Validation Commands: {json.dumps(commands, ensure_ascii=False)}",
+        "Change Policy: " + json.dumps({
+            "schema_changes": False,
+            "api_contract_changes": False,
+            "migration_artifacts": False,
+            "fixture_data": False,
+        }),
+        f"Implementation Evidence: {json.dumps(implementation_evidence, ensure_ascii=False)}",
+    ))
+    provider = AntigravityProvider(AntigravitySettings(
+        executable=executable,
+        status_args=["models"],
+        quota_args=[],
+        run_args=[
+            "--model", model,
+            "--print-timeout", "120s",
+            "--mode", "plan",
+            "--sandbox",
+            "--print",
+        ],
+        timeout_seconds=45,
+        run_timeout_seconds=MODEL_TIMEOUT_SECONDS,
+        execution_enabled=True,
+        prompt_max_chars=8192,
+        read_only_sandbox_executable="/usr/bin/bwrap",
+        allowed_models=(model,),
+        allowed_reasoning_efforts=("high",),
+    ))
+    result = provider.run(ProviderRequest(
+        workflow="watchdog-repair-qa",
+        prompt=prompt,
+        project_root=worktree,
+        metadata={
+            "boundedStage": "qa",
+            "requestedModel": model,
+            "reasoningEffort": "high",
+            "reviewPatch": patch,
+            "reviewPatchSha": patch_sha,
+        },
+        timeout_seconds=MODEL_TIMEOUT_SECONDS,
+        run_mode="read-only",
+    ))
+    if not result.success:
+        return {
+            "schema": "ai-team-bounded-delivery/v1",
+            "status": "failed",
+            "summary": str(redact_secrets(result.content or "AGY QA 執行失敗"))[-2_000:],
+            "findings": ["AGY QA 未產生可驗證的通過結果"],
+            "tests": [],
+            "blockers": [str(result.error_type or "unknown")],
+            "provider": result.provider,
+        }
+    try:
+        payload = json.loads(result.content)
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "schema": payload.get("schema"),
+        "status": payload.get("status"),
+        "summary": str(payload.get("summary") or "AGY QA 已完成"),
+        "findings": payload.get("findings") if isinstance(payload.get("findings"), list) else [],
+        "tests": payload.get("tests") if isinstance(payload.get("tests"), list) else [],
+        "blockers": payload.get("blockers") if isinstance(payload.get("blockers"), list) else [],
+        "provider": result.provider,
+    }
 
 
 def _invoke_codex(
@@ -470,7 +861,9 @@ def _compact_repair_cycles(repair_cycles: list[dict[str, Any]]) -> list[dict[str
     compact: list[dict[str, Any]] = []
     for item in repair_cycles[-MAX_REPAIR_CYCLES:]:
         validation = item.get("validation") if isinstance(item, dict) else None
-        qa = item.get("qa") if isinstance(item, dict) else None
+        qa = (
+            item.get("solReview", item.get("qa")) if isinstance(item, dict) else None
+        )
         compact.append({
             "cycle": item.get("cycle") if isinstance(item, dict) else None,
             "changedFiles": item.get("changedFiles", []) if isinstance(item, dict) else [],
@@ -482,6 +875,9 @@ def _compact_repair_cycles(repair_cycles: list[dict[str, Any]]) -> list[dict[str
                 and validation.get("success") is not True else []
             ),
             "qa": qa if isinstance(qa, dict) else None,
+            "agyQa": item.get("agyQa") if isinstance(item, dict) else None,
+            "outcome": item.get("outcome") if isinstance(item, dict) else None,
+            "failureSummary": item.get("failureSummary") if isinstance(item, dict) else None,
         })
     return compact
 
@@ -735,21 +1131,61 @@ def _finish(
     diagnostic: str,
 ) -> dict[str, Any]:
     report["completedAt"] = datetime.now(UTC).isoformat()
+    if report.get("status") != "deferred":
+        report["activePhase"] = "completed" if success else "failed"
     report_dir.mkdir(parents=True, exist_ok=True)
     path = report_dir / f"watchdog-ai-repair-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.json"
-    path.write_text(
-        json.dumps(redact_secrets(report), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.chmod(path, 0o600)
+    _write_report_atomic(path, report)
+    _write_report_atomic(report_dir / CURRENT_REPORT_NAME, report)
     return {
         "attempted": True,
         "success": success,
-        "action": "codex-sol-terra-qa-repair",
+        "action": "codex-sol-terra-agy-qa-repair",
         "diagnostic": diagnostic,
         "restarted": False,
         "reportPath": str(path),
+        "deferred": report.get("status") == "deferred",
+        "deferredTaskSha": _report_task_sha(report),
         "repository": report.get("repository"),
         "repairSha": report.get("repairSha"),
         "changedFiles": report.get("changedFiles", []),
     }
+
+
+def _defer(
+    report: dict[str, Any],
+    report_dir: Path,
+    *,
+    diagnostic: str,
+) -> dict[str, Any]:
+    report.update({
+        "status": "deferred",
+        "activePhase": "deferred",
+        "deferReason": diagnostic,
+    })
+    # Deferral is a successful controller decision: the candidate was not
+    # merged, the failure evidence was preserved, and the queue may continue.
+    return _finish(report, report_dir, success=True, diagnostic=diagnostic)
+
+
+def _report_task_sha(report: dict[str, Any]) -> str | None:
+    supervisor = report.get("supervisorEvidence")
+    task = supervisor.get("currentTask") if isinstance(supervisor, dict) else None
+    value = task.get("taskSha") if isinstance(task, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _write_current_report(report: dict[str, Any], report_dir: Path) -> None:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    _write_report_atomic(report_dir / CURRENT_REPORT_NAME, report)
+
+
+def _write_report_atomic(path: Path, report: dict[str, Any]) -> None:
+    payload = json.dumps(redact_secrets(report), ensure_ascii=False, indent=2) + "\n"
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)

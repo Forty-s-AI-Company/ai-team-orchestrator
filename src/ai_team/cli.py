@@ -254,6 +254,9 @@ def check_watchdog(
     diagnosis_model: str,
     repair_model: str,
     repair_reasoning_effort: str,
+    agy_executable: str,
+    agy_qa_model: str,
+    max_ai_repair_cycles: int,
 ) -> None:
     if test_notification:
         delivered = send_windows_toast(
@@ -303,6 +306,10 @@ def check_watchdog(
             diagnosis_model=diagnosis_model,
             repair_model=repair_model,
             reasoning_effort=repair_reasoning_effort,
+            supervisor_state_path=Path(supervisor_state).resolve(),
+            antigravity_executable=agy_executable,
+            antigravity_qa_model=agy_qa_model,
+            max_ai_repair_cycles=max_ai_repair_cycles,
         ),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -891,7 +898,10 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog_parser.add_argument(
         "--ai-repair",
         action="store_true",
-        help="Use bounded Codex Sol diagnosis, Terra repair, and QA after deterministic repair is unavailable",
+        help=(
+            "Use bounded Sol diagnosis, Terra repair, AGY QA, and Sol review; "
+            "defer after the configured cycle limit"
+        ),
     )
     watchdog_parser.add_argument("--orchestrator-project")
     watchdog_parser.add_argument("--ai-repair-report-dir")
@@ -904,6 +914,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["low", "medium", "high", "xhigh"],
         default="high",
     )
+    watchdog_parser.add_argument("--agy-executable", default="agy")
+    watchdog_parser.add_argument(
+        "--agy-qa-model",
+        default="Gemini 3.1 Pro (High)",
+    )
+    watchdog_parser.add_argument("--max-ai-repair-cycles", type=int, default=5)
 
     status_zh_parser = subparsers.add_parser(
         "status-zh",
@@ -913,6 +929,7 @@ def build_parser() -> argparse.ArgumentParser:
     status_zh_parser.add_argument("--supervisor-state")
     status_zh_parser.add_argument("--supervisor-service")
     status_zh_parser.add_argument("--watchdog-service")
+    status_zh_parser.add_argument("--report-dir")
 
     git_policy_parser = subparsers.add_parser("git-policy", help="Evaluate guarded git automation policy")
     git_policy_parser.add_argument("project", nargs="?", default=".")
@@ -1110,6 +1127,9 @@ def main() -> None:
                 args.diagnosis_model,
                 args.repair_model,
                 args.repair_reasoning_effort,
+                args.agy_executable,
+                args.agy_qa_model,
+                args.max_ai_repair_cycles,
             )
         elif args.command == "status-zh":
             project = Path(args.project).resolve()
@@ -1133,6 +1153,16 @@ def main() -> None:
                     or f"{service_prefix}-ai-team-supervisor.service",
                     watchdog_service=args.watchdog_service
                     or f"{service_prefix}-ai-team-watchdog.service",
+                    report_dir=(
+                        Path(args.report_dir).expanduser().resolve()
+                        if args.report_dir
+                        else Path.home()
+                        / ".local"
+                        / "share"
+                        / "ai-team"
+                        / project_name
+                        / "reports"
+                    ),
                 )
             )
         elif args.command == "git-policy":

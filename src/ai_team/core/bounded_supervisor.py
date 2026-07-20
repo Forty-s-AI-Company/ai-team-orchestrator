@@ -117,6 +117,11 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 for value in prior.get("completedTaskShas", [])
                 if isinstance(value, str)
             }
+            deferred = {
+                value
+                for value in prior.get("deferredTaskShas", [])
+                if isinstance(value, str)
+            }
             try:
                 entries = discover_contracts(options.contract_dir)
             except (OSError, ValueError) as exc:
@@ -132,6 +137,10 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                 )
                 _write_json(options.state_path, state)
                 return state
+            # Deferred tasks remain visible in state/report history but are
+            # removed from the runnable queue. Their dependants stay blocked
+            # because a deferred task is deliberately not treated as complete.
+            entries = _exclude_deferred_contracts(entries, deferred)
             blocked_tasks = _blocked_tasks(entries, completed)
             selected = _next_ready_contract(entries, completed)
             if selected is None:
@@ -849,6 +858,14 @@ def _supervisor_state(
     blocked_tasks: list[dict[str, Any]] | None = None,
     autonomous_backlog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    prior_current = prior.get("currentTask")
+    prior_task_sha = (
+        prior_current.get("taskSha") if isinstance(prior_current, dict) else None
+    )
+    current_task_sha = current.task_sha if current else None
+    carried_external_qa = (
+        prior.get("externalQa") if current_task_sha == prior_task_sha else None
+    )
     return {
         # Version 2 adds cloudResilience and continuity while readers continue
         # to accept version-1 state that has only providerBackoff.
@@ -859,6 +876,12 @@ def _supervisor_state(
         "cycleNumber": cycle,
         "queueSize": queue_size,
         "completedTaskShas": sorted(completed),
+        "deferredTaskShas": sorted({
+            value for value in prior.get("deferredTaskShas", []) if isinstance(value, str)
+        }),
+        "deferredTasks": redact_secrets([
+            item for item in prior.get("deferredTasks", []) if isinstance(item, dict)
+        ]),
         "currentTask": (
             {
                 "id": current.contract.id,
@@ -876,7 +899,7 @@ def _supervisor_state(
         ),
         "delivery": _result_summary(delivery_result),
         "publication": publication,
-        "externalQa": external_qa if external_qa is not None else prior.get("externalQa"),
+        "externalQa": external_qa if external_qa is not None else carried_external_qa,
         "diagnostic": diagnostic,
         "providerBackoff": provider_backoff,
         "cloudResilience": cloud_resilience,
@@ -1184,6 +1207,12 @@ def _validate_contract_dependencies(entries: list[ContractEntry]) -> None:
 
 def _completed_contract_ids(entries: list[ContractEntry], completed: set[str]) -> set[str]:
     return {entry.contract.id for entry in entries if entry.task_sha in completed}
+
+
+def _exclude_deferred_contracts(
+    entries: list[ContractEntry], deferred: set[str]
+) -> list[ContractEntry]:
+    return [entry for entry in entries if entry.task_sha not in deferred]
 
 
 def _next_ready_contract(entries: list[ContractEntry], completed: set[str]) -> ContractEntry | None:

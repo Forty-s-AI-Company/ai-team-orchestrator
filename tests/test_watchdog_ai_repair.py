@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ai_team.core.watchdog_ai_repair import (
     MAX_REPAIR_CYCLES,
+    _cycle_reasoning_effort,
     _compact_repair_cycles,
     _diagnosis_prompt,
     _last_json_object,
@@ -20,6 +21,12 @@ from ai_team.core.watchdog_ai_repair import (
 
 
 class WatchdogAIRepairPolicyTests(unittest.TestCase):
+    def test_first_cycle_is_high_and_later_cycles_escalate_to_xhigh(self) -> None:
+        self.assertEqual(MAX_REPAIR_CYCLES, 5)
+        self.assertEqual(_cycle_reasoning_effort(1, "high"), "high")
+        self.assertEqual(_cycle_reasoning_effort(2, "high"), "xhigh")
+        self.assertEqual(_cycle_reasoning_effort(5, "high"), "xhigh")
+
     def test_diagnosis_prompt_routes_missing_evidence_to_bounded_observability_repair(self) -> None:
         prompt = _diagnosis_prompt(
             {},
@@ -105,7 +112,7 @@ class WatchdogAIRepairPolicyTests(unittest.TestCase):
 
         self.assertEqual(len(compact), MAX_REPAIR_CYCLES)
         self.assertEqual(compact[0]["cycle"], 3)
-        self.assertEqual(compact[-1]["qa"]["summary"], "failure 5")
+        self.assertEqual(compact[-1]["qa"]["summary"], "failure 7")
 
     def test_recent_repair_history_only_reuses_same_task_and_revision(self) -> None:
         supervisor = {

@@ -87,8 +87,13 @@ def run_watchdog(
         thresholds,
     )
     manual_review_required = requires_manual_review(supervisor)
+    manual_review_blocks_repair = manual_review_required and not (
+        alert is not None
+        and alert.get("type") == "restart-loop"
+        and auto_repair.ai_repair_enabled
+    )
     current_repair_key = (
-        None if manual_review_required else repair_key(supervisor, task_failure["reason"])
+        None if manual_review_blocks_repair else repair_key(supervisor, task_failure["reason"])
     )
     previous_repair_attempts = (
         _nonnegative_int(previous.get("repairAttempts"))
@@ -97,7 +102,7 @@ def run_watchdog(
     )
     repair: dict[str, Any] | None = None
     repair_attempts = previous_repair_attempts
-    if alert and auto_repair.enabled and not manual_review_required:
+    if alert and auto_repair.enabled and not manual_review_blocks_repair:
         if previous_repair_attempts < auto_repair.max_attempts:
             repair_attempts += 1
             repair = attempt_auto_repair(
@@ -119,7 +124,7 @@ def run_watchdog(
                 "exhausted": True,
             }
         alert = _repair_alert(alert, repair, repair_attempts, auto_repair.max_attempts)
-    elif manual_review_required or not _repair_condition_present(supervisor, task_failure, restart_delta):
+    elif manual_review_blocks_repair or not _repair_condition_present(supervisor, task_failure, restart_delta):
         current_repair_key = None
         repair_attempts = 0
     # A repair can spend several minutes in Sol/Terra/QA. Production calls use
@@ -571,11 +576,16 @@ def _validate_auto_repair(options: AutoRepairOptions) -> None:
     ):
         raise ValueError("watchdog auto repair requires project, contract, and backup paths")
     if options.ai_repair_enabled and any(
-        path is None for path in (options.project_path, options.orchestrator_path, options.ai_report_dir)
+        path is None
+        for path in (options.project_path, options.orchestrator_path, options.ai_report_dir)
     ):
-        raise ValueError("watchdog AI repair requires project, orchestrator, and report paths")
+        raise ValueError(
+            "watchdog AI repair requires project, orchestrator, and report paths"
+        )
     if options.ai_repair_enabled and not options.enabled:
         raise ValueError("watchdog AI repair requires automatic repair to be enabled")
+    if not 1 <= options.max_ai_repair_cycles <= 5:
+        raise ValueError("watchdog AI repair cycles must be between 1 and 5")
 
 
 def _nonnegative_int(value: Any) -> int:

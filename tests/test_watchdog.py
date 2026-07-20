@@ -779,6 +779,55 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(ai_calls, [])
         self.assertEqual(runner.calls, [])
 
+    def test_restart_loop_can_defer_manual_gate_and_continue_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "supervisor.json"
+            state_path.write_text(
+                json.dumps({
+                    "revision": 4,
+                    "status": "attention-required",
+                    "nextAction": "manual-review-required",
+                    "currentTask": {"id": "blocked-payment", "taskSha": "task-sha"},
+                }),
+                encoding="utf-8",
+            )
+            runner = _RecordingServiceRunner(restarts=8)
+
+            result = attempt_auto_repair(
+                json.loads(state_path.read_text(encoding="utf-8")),
+                alert_type="restart-loop",
+                service_name="example.service",
+                options=AutoRepairOptions(
+                    enabled=True,
+                    ai_repair_enabled=True,
+                    project_path=root / "project",
+                    orchestrator_path=root / "orchestrator",
+                    ai_report_dir=root / "reports",
+                    supervisor_state_path=state_path,
+                    max_ai_repair_cycles=5,
+                ),
+                runner=runner,
+                ai_repairer=lambda *_args, **_kwargs: {
+                    "attempted": True,
+                    "success": True,
+                    "action": "codex-sol-terra-agy-qa-repair",
+                    "diagnostic": "連續 5 輪仍未通過",
+                    "restarted": False,
+                    "deferred": True,
+                    "reportPath": str(root / "reports" / "repair.json"),
+                },
+            )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertTrue(result["restarted"])
+            self.assertEqual(state["status"], "deferred")
+            self.assertEqual(state["nextAction"], "next-contract")
+            self.assertEqual(state["deferredTaskShas"], ["task-sha"])
+            self.assertEqual(state["externalQa"], None)
+            self.assertIn("start", runner.actions)
+
 
 def _write_supervisor(
     path: Path,
