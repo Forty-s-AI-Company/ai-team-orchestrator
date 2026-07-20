@@ -26,6 +26,7 @@ from ai_team.core.trusted_dev import (
     load_trusted_dev_settings,
     validate_trusted_dev_project,
 )
+from ai_team.core.telegram_notify import load_telegram_settings, send_telegram_message
 from ai_team.core.watchdog import WatchdogThresholds, run_watchdog, send_windows_toast
 from ai_team.core.watchdog_repair import AutoRepairOptions
 from ai_team.providers import (
@@ -259,12 +260,26 @@ def check_watchdog(
     max_ai_repair_cycles: int,
 ) -> None:
     if test_notification:
-        delivered = send_windows_toast(
-            "AI Team 提醒測試",
-            "Windows 桌面通知已成功啟用；這次測試不會呼叫任何 AI 模型。",
+        title = "AI Team 提醒測試"
+        message = "Telegram／Windows 通知測試成功；這次不會呼叫任何 AI 模型。"
+        windows_delivered = send_windows_toast(
+            title,
+            message,
             powershell_path=powershell_path,
         )
-        print(json.dumps({"status": "tested", "notificationDelivered": delivered}, indent=2))
+        telegram_settings = load_telegram_settings()
+        telegram_delivered = (
+            send_telegram_message(title, message, settings=telegram_settings)
+            if telegram_settings.configured
+            else False
+        )
+        print(json.dumps({
+            "status": "tested",
+            "notificationDelivered": windows_delivered or telegram_delivered,
+            "windowsDelivered": windows_delivered,
+            "telegramConfigured": telegram_settings.configured,
+            "telegramDelivered": telegram_delivered,
+        }, indent=2))
         return
     if auto_repair and not all((project, contract_dir, repair_backup_dir)):
         raise ValueError(
@@ -877,7 +892,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     watchdog_parser = subparsers.add_parser(
         "watchdog",
-        help="Detect repeated supervisor stalls and send a deduplicated Windows notification",
+        help="Detect repeated supervisor stalls and send deduplicated Telegram/Windows notifications",
     )
     watchdog_parser.add_argument("--supervisor-state", required=True)
     watchdog_parser.add_argument("--watchdog-state", required=True)

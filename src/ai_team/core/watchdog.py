@@ -16,6 +16,11 @@ from ai_team.core.watchdog_repair import (
     repair_key,
     requires_manual_review,
 )
+from ai_team.core.telegram_notify import (
+    TelegramSettings,
+    load_telegram_settings,
+    send_telegram_message,
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,12 @@ class WatchdogThresholds:
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 Notifier = Callable[[str, str], bool]
+TelegramSender = Callable[..., bool]
+INFORMATIONAL_ALERT_TYPES = {
+    "task-deferred",
+    "release-review-required",
+    "provider-backoff",
+}
 
 
 def run_watchdog(
@@ -76,19 +87,26 @@ def run_watchdog(
     stale_seconds = _state_age_seconds(supervisor, checked_at)
     task_failure = _task_failure_evidence(report_dir, supervisor)
 
-    alert = None if repair_restart_grace else _select_alert(
-        supervisor,
-        service,
-        signature,
-        same_signature_count,
-        restart_delta,
-        stale_seconds,
-        task_failure,
-        thresholds,
-    )
+    alert = None
+    if not repair_restart_grace:
+        alert = _select_alert(
+            supervisor,
+            service,
+            signature,
+            same_signature_count,
+            restart_delta,
+            stale_seconds,
+            task_failure,
+            thresholds,
+        ) or _select_lifecycle_alert(supervisor, previous)
     manual_review_required = requires_manual_review(supervisor)
+    informational_alert = bool(
+        alert and alert.get("type") in INFORMATIONAL_ALERT_TYPES
+    )
     current_repair_key = (
-        None if manual_review_required else repair_key(supervisor, task_failure["reason"])
+        None
+        if manual_review_required or informational_alert
+        else repair_key(supervisor, task_failure["reason"])
     )
     previous_repair_attempts = (
         _nonnegative_int(previous.get("repairAttempts"))
@@ -97,7 +115,7 @@ def run_watchdog(
     )
     repair: dict[str, Any] | None = None
     repair_attempts = previous_repair_attempts
-    if alert and auto_repair.enabled and not manual_review_required:
+    if alert and auto_repair.enabled and not manual_review_required and not informational_alert:
         if previous_repair_attempts < auto_repair.max_attempts:
             repair_attempts += 1
             repair = attempt_auto_repair(
@@ -133,7 +151,7 @@ def run_watchdog(
         suppressed = _within_cooldown(previous, alert["key"], checked_at, thresholds.cooldown_seconds)
         if not suppressed:
             send = notifier or (
-                lambda title, message: send_windows_toast(
+                lambda title, message: send_watchdog_notifications(
                     title,
                     message,
                     powershell_path=powershell_path,
@@ -153,6 +171,23 @@ def run_watchdog(
         "lastTaskFailureReason": task_failure["reason"],
         "taskFailureCount": task_failure["count"],
         "taskReceiptCount": task_failure["receiptCount"],
+        "lastDeferredTaskCount": _observed_list_count(
+            supervisor.get("deferredTasks"),
+            previous.get("lastDeferredTaskCount"),
+            alert.get("type") if alert else None,
+            "task-deferred",
+        ),
+        "lastReleaseReviewTaskCount": _observed_list_count(
+            supervisor.get("releaseReviewTasks"),
+            previous.get("lastReleaseReviewTaskCount"),
+            alert.get("type") if alert else None,
+            "release-review-required",
+        ),
+        "lastProviderBackoffKey": _observed_provider_backoff(
+            supervisor,
+            previous.get("lastProviderBackoffKey"),
+            alert.get("type") if alert else None,
+        ),
         "autoRepairEnabled": auto_repair.enabled,
         "repairKey": current_repair_key,
         "repairAttempts": repair_attempts,
@@ -251,6 +286,16 @@ def _repair_alert(
     attempts: int,
     maximum: int,
 ) -> dict[str, str]:
+    if repair.get("deferred") is True:
+        return {
+            "type": "auto-repair-deferred",
+            "key": f"auto-repair-deferred:{original['key']}",
+            "title": "AI Team 任務已暫緩並跳過",
+            "message": (
+                f"同一問題在 {attempts}/{maximum} 次自動修復內仍未通過；"
+                "已保存報告並繼續其他工作，請稍後查看暫緩原因。"
+            ),
+        }
     if repair.get("success") is True:
         return {
             "type": "auto-repair-success",
@@ -323,6 +368,30 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
     return completed.returncode == 0
 
 
+def send_watchdog_notifications(
+    title: str,
+    message: str,
+    *,
+    powershell_path: str = "powershell.exe",
+    runner: Runner = subprocess.run,
+    telegram_settings: TelegramSettings | None = None,
+    telegram_sender: TelegramSender = send_telegram_message,
+) -> bool:
+    """Attempt every configured channel; a notification failure never stops repair."""
+
+    settings = telegram_settings or load_telegram_settings()
+    telegram_delivered = False
+    if settings.configured:
+        telegram_delivered = telegram_sender(title, message, settings=settings)
+    toast_delivered = send_windows_toast(
+        title,
+        message,
+        powershell_path=powershell_path,
+        runner=runner,
+    )
+    return telegram_delivered or toast_delivered
+
+
 def _select_alert(
     supervisor: dict[str, Any],
     service: dict[str, str],
@@ -376,6 +445,108 @@ def _select_alert(
             "message": f"狀態已 {stale_seconds // 60} 分鐘未更新。任務：{task_id}。",
         }
     return None
+
+
+def _select_lifecycle_alert(
+    supervisor: dict[str, Any],
+    previous: dict[str, Any],
+) -> dict[str, str] | None:
+    deferred = supervisor.get("deferredTasks")
+    deferred_count = _bounded_list_count(deferred)
+    if deferred_count > _nonnegative_int(previous.get("lastDeferredTaskCount")):
+        item = deferred[-1] if isinstance(deferred, list) and deferred else {}
+        task_id = _safe_label(item.get("id") if isinstance(item, dict) else None, "未知任務")
+        reason = _safe_label(
+            item.get("reason") if isinstance(item, dict) else None,
+            "已達自動修復上限",
+        )
+        return {
+            "type": "task-deferred",
+            "key": f"task-deferred:{task_id}",
+            "title": "AI Team 有任務修不好，已先跳過",
+            "message": f"任務：{task_id}；原因：{reason}。不阻塞其他開發，報告已保留。",
+        }
+
+    release_reviews = supervisor.get("releaseReviewTasks")
+    release_count = _bounded_list_count(release_reviews)
+    if release_count > _nonnegative_int(previous.get("lastReleaseReviewTaskCount")):
+        item = release_reviews[-1] if isinstance(release_reviews, list) and release_reviews else {}
+        task_id = _safe_label(item.get("id") if isinstance(item, dict) else None, "未知任務")
+        reason = _safe_label(
+            item.get("reason") if isinstance(item, dict) else None,
+            "需要人工上線驗收",
+        )
+        return {
+            "type": "release-review-required",
+            "key": f"release-review-required:{task_id}",
+            "title": "AI Team 有項目等待你驗收",
+            "message": f"任務：{task_id}；{reason}。測試站開發仍會繼續。",
+        }
+
+    backoff = supervisor.get("providerBackoff")
+    fingerprint = _provider_backoff_fingerprint(supervisor)
+    if fingerprint and fingerprint != previous.get("lastProviderBackoffKey"):
+        task = supervisor.get("currentTask")
+        task_id = _safe_label(task.get("id") if isinstance(task, dict) else None, "未知任務")
+        stage = _safe_label(backoff.get("stage") if isinstance(backoff, dict) else None, "未知階段")
+        delay = _nonnegative_int(backoff.get("delaySeconds") if isinstance(backoff, dict) else 0)
+        return {
+            "type": "provider-backoff",
+            "key": f"provider-backoff:{task_id}:{stage}",
+            "title": "AI Team 模型供應商暫時不可用",
+            "message": (
+                f"任務：{task_id}；階段：{stage}。"
+                f"系統將在約 {max(1, delay // 60)} 分鐘後自動重試。"
+            ),
+        }
+    return None
+
+
+def _bounded_list_count(value: Any) -> int:
+    return min(len(value), 256) if isinstance(value, list) else 0
+
+
+def _observed_list_count(
+    value: Any,
+    previous_value: Any,
+    alert_type: str | None,
+    observed_alert_type: str,
+) -> int:
+    current = _bounded_list_count(value)
+    previous = _nonnegative_int(previous_value)
+    repair_deferred_observed = (
+        observed_alert_type == "task-deferred"
+        and alert_type == "auto-repair-deferred"
+    )
+    if current <= previous or alert_type == observed_alert_type or repair_deferred_observed:
+        return current
+    return previous
+
+
+def _provider_backoff_fingerprint(supervisor: dict[str, Any]) -> str | None:
+    value = supervisor.get("providerBackoff")
+    if not isinstance(value, dict) or not value:
+        return None
+    fields = (
+        value.get("taskSha"),
+        value.get("stage"),
+        value.get("stopReason"),
+        value.get("consecutiveFailures"),
+        value.get("nextRetryAt"),
+    )
+    return "|".join(str(item or "") for item in fields)[:500]
+
+
+def _observed_provider_backoff(
+    supervisor: dict[str, Any],
+    previous_value: Any,
+    alert_type: str | None,
+) -> str | None:
+    current = _provider_backoff_fingerprint(supervisor)
+    previous = previous_value if isinstance(previous_value, str) else None
+    if current is None or current == previous or alert_type == "provider-backoff":
+        return current
+    return previous
 
 
 def _state_signature(supervisor: dict[str, Any]) -> str:

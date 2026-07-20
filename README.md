@@ -750,11 +750,15 @@ publication evidence mismatches, or dirty primary state stop fail closed with
 an `attention-required` state.
 
 For an unattended desktop supervisor, run the zero-token watchdog once per
-minute from a systemd user timer. It sends a deduplicated Windows toast and
+minute from a systemd user timer. It sends deduplicated Telegram and Windows notifications and
 appends a local JSON-lines audit record when the same `attention-required`
 signature is observed three times, three Engineer receipts contain the same
 stop reason, the service restarts three times between checks, or the supervisor
 state has not changed for 25 minutes:
+
+It also reports each newly deferred five-cycle repair, newly queued human
+release review, and provider backoff transition. These lifecycle alerts are
+informational and never start another automatic-repair loop.
 
 ```bash
 ai-team watchdog \
@@ -805,8 +809,26 @@ review only when the trusted delivery result changed a sensitive integration.
 An enabled policy with no trigger paths retains the conservative project-wide
 behavior; missing or malformed changed-file evidence also triggers review.
 
-Use `--test-notification` to verify the Windows notification path without
-reading the supervisor state or calling an AI provider.
+Telegram delivery is optional and uses the official Bot API `sendMessage`
+endpoint. Keep these values in a watchdog-only environment file that is mode
+`0600` and is never committed:
+
+```dotenv
+AI_TEAM_TELEGRAM_BOT_TOKEN=
+AI_TEAM_TELEGRAM_CHAT_ID=
+# Optional forum topic ID
+AI_TEAM_TELEGRAM_THREAD_ID=
+```
+
+Create the bot with `@BotFather`, send the bot `/start` once, then fill in its
+token and the destination chat ID. The Bot API requires the user to contact a
+bot before it can send a private message. Telegram delivery failures are
+fail-safe and never stop automatic repair. Existing alert signatures and
+cooldowns prevent the bot from repeating the same event every minute.
+
+Use `--test-notification` to verify both configured notification paths without
+reading the supervisor state or calling an AI provider. The JSON result reports
+`windowsDelivered`, `telegramConfigured`, and `telegramDelivered` separately.
 
 `changePolicy` is deny-by-default. `schemaChanges` is required before
 `prisma/schema.prisma` may be in scope; `migrationArtifacts` additionally permits

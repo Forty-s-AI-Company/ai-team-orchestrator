@@ -7,7 +7,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from ai_team.core.watchdog import WatchdogThresholds, run_watchdog
+from ai_team.core.watchdog import WatchdogThresholds, _repair_alert, run_watchdog
 from ai_team.core.watchdog_repair import (
     AutoRepairOptions,
     CONTRACT_COMMAND_DIAGNOSTIC,
@@ -16,6 +16,105 @@ from ai_team.core.watchdog_repair import (
 
 
 class WatchdogTests(unittest.TestCase):
+    def test_new_deferred_and_release_review_tasks_notify_sequentially_without_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            supervisor = root / "supervisor.json"
+            watcher = root / "watchdog.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(supervisor, now, status="running")
+            payload = json.loads(supervisor.read_text(encoding="utf-8"))
+            payload.update({
+                "deferredTasks": [{
+                    "id": "auto-hard-repair",
+                    "reason": "連續五輪未通過",
+                }],
+                "releaseReviewTasks": [{
+                    "id": "auto-payment-release",
+                    "reason": "等待人工上線驗收",
+                }],
+            })
+            supervisor.write_text(json.dumps(payload), encoding="utf-8")
+            notifications: list[tuple[str, str]] = []
+
+            first = run_watchdog(
+                supervisor,
+                watcher,
+                root / "alerts.log",
+                service_name="example.service",
+                now=now,
+                runner=_RecordingServiceRunner(restarts=0),
+                notifier=lambda title, message: notifications.append((title, message)) or True,
+            )
+            second = run_watchdog(
+                supervisor,
+                watcher,
+                root / "alerts.log",
+                service_name="example.service",
+                now=now + timedelta(minutes=1),
+                runner=_RecordingServiceRunner(restarts=0),
+                notifier=lambda title, message: notifications.append((title, message)) or True,
+            )
+            third = run_watchdog(
+                supervisor,
+                watcher,
+                root / "alerts.log",
+                service_name="example.service",
+                now=now + timedelta(minutes=2),
+                runner=_RecordingServiceRunner(restarts=0),
+                notifier=lambda title, message: notifications.append((title, message)) or True,
+            )
+
+            self.assertEqual(first["alertType"], "task-deferred")
+            self.assertEqual(second["alertType"], "release-review-required")
+            self.assertIsNone(third["alertType"])
+            self.assertIn("修不好", notifications[0][0])
+            self.assertIn("等待你驗收", notifications[1][0])
+
+    def test_new_provider_backoff_notifies_without_triggering_auto_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            supervisor = root / "supervisor.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(supervisor, now, status="waiting-provider")
+            payload = json.loads(supervisor.read_text(encoding="utf-8"))
+            payload["providerBackoff"] = {
+                "taskSha": "a" * 64,
+                "stage": "engineer",
+                "stopReason": "provider-quota-exhausted",
+                "consecutiveFailures": 2,
+                "delaySeconds": 1800,
+                "nextRetryAt": "2026-07-18T10:30:00+00:00",
+            }
+            supervisor.write_text(json.dumps(payload), encoding="utf-8")
+            notifications: list[str] = []
+
+            result = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                now=now,
+                runner=_RecordingServiceRunner(restarts=0),
+                notifier=lambda title, _message: notifications.append(title) or True,
+            )
+
+            self.assertEqual(result["status"], "alerted")
+            self.assertEqual(result["alertType"], "provider-backoff")
+            self.assertIsNone(result["repair"])
+            self.assertEqual(notifications, ["AI Team 模型供應商暫時不可用"])
+
+    def test_deferred_ai_repair_is_not_reported_as_success(self) -> None:
+        alert = _repair_alert(
+            {"type": "restart-loop", "key": "restart-loop:task"},
+            {"success": True, "deferred": True},
+            attempts=1,
+            maximum=1,
+        )
+
+        self.assertEqual(alert["type"], "auto-repair-deferred")
+        self.assertIn("暫緩並跳過", alert["title"])
+
     def test_repeated_attention_alerts_on_third_identical_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
