@@ -20,6 +20,7 @@ from ai_team.core.project_loader import ProjectConfigError, load_project
 from ai_team.core.receipts import write_run_receipt
 from ai_team.core.routing_config import ROLE_CHOICES, load_role_profile
 from ai_team.core.staging_operations import run_staging_operations
+from ai_team.core.status_zh import render_chinese_status
 from ai_team.core.supervisor import SupervisorOptions, run_supervisor
 from ai_team.core.trusted_dev import (
     load_trusted_dev_settings,
@@ -904,6 +905,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="high",
     )
 
+    status_zh_parser = subparsers.add_parser(
+        "status-zh",
+        help="Show a human-readable Traditional Chinese supervisor and watchdog status",
+    )
+    status_zh_parser.add_argument("project", nargs="?", default=".")
+    status_zh_parser.add_argument("--supervisor-state")
+    status_zh_parser.add_argument("--supervisor-service")
+    status_zh_parser.add_argument("--watchdog-service")
+
     git_policy_parser = subparsers.add_parser("git-policy", help="Evaluate guarded git automation policy")
     git_policy_parser.add_argument("project", nargs="?", default=".")
     git_policy_parser.add_argument(
@@ -1100,6 +1110,30 @@ def main() -> None:
                 args.diagnosis_model,
                 args.repair_model,
                 args.repair_reasoning_effort,
+            )
+        elif args.command == "status-zh":
+            project = Path(args.project).resolve()
+            project_name = project.name
+            service_prefix = project_name.lower()
+            state_path = (
+                Path(args.supervisor_state).expanduser().resolve()
+                if args.supervisor_state
+                else Path.home()
+                / ".local"
+                / "state"
+                / "ai-team"
+                / project_name
+                / "continuous-bounded-state.json"
+            )
+            print(
+                render_chinese_status(
+                    project,
+                    supervisor_state_path=state_path,
+                    supervisor_service=args.supervisor_service
+                    or f"{service_prefix}-ai-team-supervisor.service",
+                    watchdog_service=args.watchdog_service
+                    or f"{service_prefix}-ai-team-watchdog.service",
+                )
             )
         elif args.command == "git-policy":
             evaluate_git_policy(args.project, args.action, args.file)
