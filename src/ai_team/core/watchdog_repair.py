@@ -13,6 +13,11 @@ from ai_team.core.bounded_delivery import (
     _validate_contract_validation_commands,
     load_trusted_task_contract,
 )
+from ai_team.core.external_qa import (
+    HUMAN_ATTESTATION_REQUIRED,
+    MANUAL_ATTESTATION_ONLY,
+    SCHEMA as EXTERNAL_QA_MANUAL_REVIEW_SCHEMA,
+)
 from ai_team.core.project_loader import load_project
 
 
@@ -21,6 +26,31 @@ AIRepairer = Callable[..., dict[str, Any]]
 CONTRACT_COMMAND_DIAGNOSTIC = (
     "trusted task contract must run the project lint, typecheck, test, and build commands"
 )
+
+
+def requires_manual_review(supervisor: Any) -> bool:
+    """Return whether a supervisor snapshot must never be repaired automatically.
+
+    ``nextAction`` is the ordinary supervisor gate.  External QA also emits a
+    fixed human-attestation receipt which remains authoritative while the
+    supervisor is transiently running or resuming and its next action changes.
+    Every receipt field is checked explicitly so malformed external QA data
+    cannot suppress a legitimate automatic repair.
+    """
+
+    if not isinstance(supervisor, dict):
+        return False
+    if supervisor.get("nextAction") == "manual-review-required":
+        return True
+    external_qa = supervisor.get("externalQa")
+    return (
+        isinstance(external_qa, dict)
+        and external_qa.get("schema") == EXTERNAL_QA_MANUAL_REVIEW_SCHEMA
+        and external_qa.get("executionMode") == MANUAL_ATTESTATION_ONLY
+        and external_qa.get("executionAttempted") is False
+        and external_qa.get("status") == "review-required"
+        and external_qa.get("reason") == HUMAN_ATTESTATION_REQUIRED
+    )
 
 
 @dataclass(frozen=True)
@@ -67,7 +97,7 @@ def attempt_auto_repair(
 ) -> dict[str, Any]:
     """Stop the supervisor, apply one deterministic repair, and restart on success."""
 
-    if supervisor.get("nextAction") == "manual-review-required":
+    if requires_manual_review(supervisor):
         return _result(
             False,
             False,

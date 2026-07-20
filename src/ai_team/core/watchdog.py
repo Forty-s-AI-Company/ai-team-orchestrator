@@ -9,7 +9,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from ai_team.core.watchdog_repair import AIRepairer, AutoRepairOptions, attempt_auto_repair, repair_key
+from ai_team.core.watchdog_repair import (
+    AIRepairer,
+    AutoRepairOptions,
+    attempt_auto_repair,
+    repair_key,
+    requires_manual_review,
+)
 
 
 @dataclass(frozen=True)
@@ -80,7 +86,7 @@ def run_watchdog(
         task_failure,
         thresholds,
     )
-    manual_review_required = supervisor.get("nextAction") == "manual-review-required"
+    manual_review_required = requires_manual_review(supervisor)
     current_repair_key = (
         None if manual_review_required else repair_key(supervisor, task_failure["reason"])
     )
@@ -387,7 +393,7 @@ def _state_signature(supervisor: dict[str, Any]) -> str:
 def _needs_attention(supervisor: dict[str, Any]) -> bool:
     return (
         supervisor.get("status") == "attention-required"
-        or supervisor.get("nextAction") == "manual-review-required"
+        or requires_manual_review(supervisor)
     )
 
 

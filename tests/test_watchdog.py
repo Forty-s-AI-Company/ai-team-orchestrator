@@ -496,6 +496,115 @@ class WatchdogTests(unittest.TestCase):
             self.assertIsNone(state["repairKey"])
             self.assertEqual(state["repairAttempts"], 0)
 
+    def test_external_qa_receipt_blocks_repair_through_transient_supervisor_states(self) -> None:
+        cases = (
+            ("running", "external-qa-human-attestation-required", "bounded-delivery"),
+            ("operator-interrupted", "operator-interrupted", "resume-supervisor"),
+        )
+        for status, stop_reason, next_action in cases:
+            with self.subTest(status=status, next_action=next_action), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = _write_project(root)
+                orchestrator = root / "orchestrator"
+                orchestrator.mkdir()
+                contracts = root / "contracts"
+                contracts.mkdir()
+                supervisor = root / "supervisor.json"
+                watcher = root / "watchdog.json"
+                now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+                _write_supervisor(
+                    supervisor,
+                    now,
+                    status=status,
+                    stop_reason=stop_reason,
+                    next_action=next_action,
+                    external_qa=_manual_external_qa(),
+                )
+                watcher.write_text(
+                    json.dumps({"repairKey": "stale-repair-key", "repairAttempts": 2}),
+                    encoding="utf-8",
+                )
+                runner = _RecordingServiceRunner(restarts=0)
+                ai_calls: list[dict[str, object]] = []
+
+                result = run_watchdog(
+                    supervisor,
+                    watcher,
+                    root / "alerts.log",
+                    service_name="example.service",
+                    now=now,
+                    runner=runner,
+                    notifier=lambda _title, _message: True,
+                    thresholds=WatchdogThresholds(
+                        repeat_count=1,
+                        restart_count=99,
+                        stale_seconds=3600,
+                        cooldown_seconds=1800,
+                    ),
+                    auto_repair=AutoRepairOptions(
+                        enabled=True,
+                        project_path=project,
+                        contract_dir=contracts,
+                        backup_dir=root / "backups",
+                        ai_repair_enabled=True,
+                        orchestrator_path=orchestrator,
+                        ai_report_dir=root / "ai-reports",
+                        revive_timer_name="example-revive.timer",
+                    ),
+                    ai_repairer=lambda *_args, **kwargs: ai_calls.append(kwargs) or {
+                        "attempted": True,
+                        "success": True,
+                        "action": "codex-sol-terra-qa-repair",
+                        "diagnostic": "unexpected repair",
+                        "restarted": False,
+                    },
+                )
+
+                self.assertEqual(result["status"], "alerted")
+                self.assertEqual(result["alertType"], "repeated-attention")
+                self.assertIsNone(result["repair"])
+                self.assertEqual(result["repairAttempts"], 0)
+                self.assertEqual(ai_calls, [])
+                self.assertEqual(runner.actions, ["show"])
+                state = json.loads(watcher.read_text(encoding="utf-8"))
+                self.assertIsNone(state["repairKey"])
+                self.assertEqual(state["repairAttempts"], 0)
+
+    def test_malformed_external_qa_does_not_block_auto_repair(self) -> None:
+        malformed_receipts = (
+            {key: value for key, value in _manual_external_qa().items() if key != "reason"},
+            {**_manual_external_qa(), "executionAttempted": 0},
+        )
+        for external_qa in malformed_receipts:
+            with self.subTest(external_qa=external_qa):
+                runner = _RecordingServiceRunner(restarts=0)
+                ai_calls: list[dict[str, object]] = []
+
+                result = attempt_auto_repair(
+                    {"nextAction": "bounded-delivery", "externalQa": external_qa},
+                    alert_type="repeated-attention",
+                    service_name="example.service",
+                    options=AutoRepairOptions(
+                        enabled=True,
+                        ai_repair_enabled=True,
+                        project_path=Path("project"),
+                        orchestrator_path=Path("orchestrator"),
+                        ai_report_dir=Path("reports"),
+                    ),
+                    runner=runner,
+                    ai_repairer=lambda *_args, **kwargs: ai_calls.append(kwargs) or {
+                        "attempted": True,
+                        "success": True,
+                        "action": "codex-sol-terra-qa-repair",
+                        "diagnostic": "repair passed",
+                        "restarted": False,
+                    },
+                )
+
+                self.assertTrue(result["success"])
+                self.assertEqual(len(ai_calls), 1)
+                self.assertEqual(runner.actions, ["stop", "reset-failed", "start"])
+
     def test_failed_ai_repair_keeps_supervisor_and_revive_timer_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -680,6 +789,7 @@ def _write_supervisor(
     diagnostic: str | None = None,
     contract_path: Path | None = None,
     next_action: str | None = None,
+    external_qa: dict[str, object] | None = None,
 ) -> None:
     payload = {
         "updatedAt": updated_at.isoformat(),
@@ -700,8 +810,21 @@ def _write_supervisor(
             else ("manual-review-required" if status == "attention-required" else "bounded-delivery")
         ),
         "diagnostic": diagnostic,
+        **({"externalQa": external_qa} if external_qa is not None else {}),
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _manual_external_qa() -> dict[str, object]:
+    return {
+        "schema": "ai-team-external-qa-manual-review/v1",
+        "revision": "a" * 40,
+        "executionMode": "manual-attestation-only",
+        "executionAttempted": False,
+        "reviewerRole": "operator",
+        "status": "review-required",
+        "reason": "human-attestation-required",
+    }
 
 
 def _write_project(root: Path) -> Path:
