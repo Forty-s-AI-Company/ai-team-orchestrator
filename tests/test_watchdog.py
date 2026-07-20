@@ -8,7 +8,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ai_team.core.watchdog import WatchdogThresholds, run_watchdog
-from ai_team.core.watchdog_repair import AutoRepairOptions, CONTRACT_COMMAND_DIAGNOSTIC
+from ai_team.core.watchdog_repair import (
+    AutoRepairOptions,
+    CONTRACT_COMMAND_DIAGNOSTIC,
+    attempt_auto_repair,
+)
 
 
 class WatchdogTests(unittest.TestCase):
@@ -310,6 +314,7 @@ class WatchdogTests(unittest.TestCase):
                 stop_reason="bounded-delivery-exception",
                 diagnostic=CONTRACT_COMMAND_DIAGNOSTIC,
                 contract_path=contract,
+                next_action="bounded-delivery",
             )
             runner = _RecordingServiceRunner(restarts=7)
             notifications: list[str] = []
@@ -361,6 +366,7 @@ class WatchdogTests(unittest.TestCase):
                 status="attention-required",
                 stop_reason="unknown-failure",
                 diagnostic="unknown diagnostic",
+                next_action="bounded-delivery",
             )
             runner = _RecordingServiceRunner(restarts=2)
             options = AutoRepairOptions(
@@ -407,7 +413,7 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(runner.actions.count("stop"), 1)
             self.assertNotIn("start", runner.actions)
 
-    def test_restart_loop_runs_sol_terra_qa_chain_then_restores_services(self) -> None:
+    def test_external_qa_manual_review_alerts_without_auto_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project = _write_project(root)
@@ -416,6 +422,7 @@ class WatchdogTests(unittest.TestCase):
             contracts = root / "contracts"
             contracts.mkdir()
             supervisor = root / "supervisor.json"
+            watcher = root / "watchdog.json"
             now = datetime(2026, 7, 18, 10, tzinfo=UTC)
             _write_supervisor(
                 supervisor,
@@ -423,8 +430,19 @@ class WatchdogTests(unittest.TestCase):
                 status="attention-required",
                 stop_reason="external-qa-failed",
             )
+            watcher.write_text(
+                json.dumps(
+                    {
+                        "repairKey": "stale-repair-key",
+                        "repairAttempts": 2,
+                        "lastRestartCount": 9,
+                    }
+                ),
+                encoding="utf-8",
+            )
             runner = _RecordingServiceRunner(restarts=9)
             calls: list[dict[str, object]] = []
+            notifications: list[tuple[str, str]] = []
 
             def ai_repairer(_supervisor, **kwargs):
                 calls.append(kwargs)
@@ -438,12 +456,12 @@ class WatchdogTests(unittest.TestCase):
 
             result = run_watchdog(
                 supervisor,
-                root / "watchdog.json",
+                watcher,
                 root / "alerts.log",
                 service_name="example.service",
                 now=now,
                 runner=runner,
-                notifier=lambda _title, _message: True,
+                notifier=lambda title, message: notifications.append((title, message)) or True,
                 thresholds=WatchdogThresholds(
                     repeat_count=1,
                     restart_count=1,
@@ -467,22 +485,16 @@ class WatchdogTests(unittest.TestCase):
                 ai_repairer=ai_repairer,
             )
 
-            self.assertEqual(result["status"], "repaired")
-            self.assertEqual(result["repair"]["action"], "codex-sol-terra-qa-repair")
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0]["diagnosis_model"], "gpt-5.6-sol")
-            self.assertEqual(calls[0]["repair_model"], "gpt-5.6-terra")
-            self.assertEqual(calls[0]["reasoning_effort"], "high")
-            self.assertEqual(
-                runner.calls[-5:],
-                [
-                    ("stop", "example-revive.timer"),
-                    ("stop", "example.service"),
-                    ("reset-failed", "example.service"),
-                    ("start", "example.service"),
-                    ("start", "example-revive.timer"),
-                ],
-            )
+            self.assertEqual(result["status"], "alerted")
+            self.assertEqual(result["alertType"], "repeated-attention")
+            self.assertIsNone(result["repair"])
+            self.assertEqual(result["repairAttempts"], 0)
+            self.assertEqual(calls, [])
+            self.assertEqual(runner.actions, ["show"])
+            self.assertEqual(len(notifications), 1)
+            state = json.loads(watcher.read_text(encoding="utf-8"))
+            self.assertIsNone(state["repairKey"])
+            self.assertEqual(state["repairAttempts"], 0)
 
     def test_failed_ai_repair_keeps_supervisor_and_revive_timer_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -494,7 +506,12 @@ class WatchdogTests(unittest.TestCase):
             contracts.mkdir()
             supervisor = root / "supervisor.json"
             now = datetime(2026, 7, 18, 10, tzinfo=UTC)
-            _write_supervisor(supervisor, now, status="attention-required")
+            _write_supervisor(
+                supervisor,
+                now,
+                status="attention-required",
+                next_action="bounded-delivery",
+            )
             runner = _RecordingServiceRunner(restarts=9)
 
             result = run_watchdog(
@@ -589,6 +606,7 @@ class WatchdogTests(unittest.TestCase):
                 stop_reason="bounded-delivery-exception",
                 diagnostic=CONTRACT_COMMAND_DIAGNOSTIC,
                 contract_path=contract,
+                next_action="bounded-delivery",
             )
             runner = _RecordingServiceRunner(restarts=1)
 
@@ -619,6 +637,39 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(runner.actions.count("stop"), 1)
             self.assertNotIn("start", runner.actions)
 
+    def test_manual_review_direct_auto_repair_is_fail_closed_before_systemctl(self) -> None:
+        runner = _RecordingServiceRunner(restarts=0)
+        ai_calls: list[dict[str, object]] = []
+
+        result = attempt_auto_repair(
+            {"nextAction": "manual-review-required"},
+            alert_type="repeated-attention",
+            service_name="example.service",
+            options=AutoRepairOptions(
+                enabled=True,
+                ai_repair_enabled=True,
+                project_path=Path("project"),
+                orchestrator_path=Path("orchestrator"),
+                ai_report_dir=Path("reports"),
+                revive_timer_name="example-revive.timer",
+            ),
+            runner=runner,
+            ai_repairer=lambda *_args, **kwargs: ai_calls.append(kwargs) or {},
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "attempted": False,
+                "success": False,
+                "action": "manual-review-required",
+                "diagnostic": "manual review is required; automatic repair is not permitted",
+                "restarted": False,
+            },
+        )
+        self.assertEqual(ai_calls, [])
+        self.assertEqual(runner.calls, [])
+
 
 def _write_supervisor(
     path: Path,
@@ -628,6 +679,7 @@ def _write_supervisor(
     stop_reason: str | None = None,
     diagnostic: str | None = None,
     contract_path: Path | None = None,
+    next_action: str | None = None,
 ) -> None:
     payload = {
         "updatedAt": updated_at.isoformat(),
@@ -642,7 +694,11 @@ def _write_supervisor(
             if stop_reason is not None
             else ("publication-exception" if status == "attention-required" else None)
         ),
-        "nextAction": "manual-review-required" if status == "attention-required" else "bounded-delivery",
+        "nextAction": (
+            next_action
+            if next_action is not None
+            else ("manual-review-required" if status == "attention-required" else "bounded-delivery")
+        ),
         "diagnostic": diagnostic,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")

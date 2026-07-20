@@ -80,15 +80,18 @@ def run_watchdog(
         task_failure,
         thresholds,
     )
-    current_repair_key = repair_key(supervisor, task_failure["reason"])
+    manual_review_required = supervisor.get("nextAction") == "manual-review-required"
+    current_repair_key = (
+        None if manual_review_required else repair_key(supervisor, task_failure["reason"])
+    )
     previous_repair_attempts = (
         _nonnegative_int(previous.get("repairAttempts"))
-        if previous.get("repairKey") == current_repair_key
+        if current_repair_key is not None and previous.get("repairKey") == current_repair_key
         else 0
     )
     repair: dict[str, Any] | None = None
     repair_attempts = previous_repair_attempts
-    if alert and auto_repair.enabled:
+    if alert and auto_repair.enabled and not manual_review_required:
         if previous_repair_attempts < auto_repair.max_attempts:
             repair_attempts += 1
             repair = attempt_auto_repair(
@@ -110,7 +113,7 @@ def run_watchdog(
                 "exhausted": True,
             }
         alert = _repair_alert(alert, repair, repair_attempts, auto_repair.max_attempts)
-    elif not _repair_condition_present(supervisor, task_failure, restart_delta):
+    elif manual_review_required or not _repair_condition_present(supervisor, task_failure, restart_delta):
         current_repair_key = None
         repair_attempts = 0
     # A repair can spend several minutes in Sol/Terra/QA. Production calls use

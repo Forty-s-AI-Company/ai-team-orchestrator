@@ -67,6 +67,13 @@ def attempt_auto_repair(
 ) -> dict[str, Any]:
     """Stop the supervisor, apply one deterministic repair, and restart on success."""
 
+    if supervisor.get("nextAction") == "manual-review-required":
+        return _result(
+            False,
+            False,
+            "manual-review-required",
+            "manual review is required; automatic repair is not permitted",
+        )
     if not options.enabled:
         return _result(False, False, "disabled", "auto repair is disabled")
     if options.revive_timer_name and not _systemctl(runner, "stop", options.revive_timer_name):
