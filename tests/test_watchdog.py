@@ -570,6 +570,83 @@ class WatchdogTests(unittest.TestCase):
                 self.assertIsNone(state["repairKey"])
                 self.assertEqual(state["repairAttempts"], 0)
 
+    def test_external_qa_receipt_blocks_restart_loop_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = _write_project(root)
+            orchestrator = root / "orchestrator"
+            orchestrator.mkdir()
+            contracts = root / "contracts"
+            contracts.mkdir()
+            supervisor = root / "supervisor.json"
+            watcher = root / "watchdog.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(
+                supervisor,
+                now,
+                status="running",
+                stop_reason="external-qa-human-attestation-required",
+                next_action="bounded-delivery",
+                external_qa=_manual_external_qa(),
+            )
+            original_supervisor = supervisor.read_bytes()
+            watcher.write_text(
+                json.dumps(
+                    {
+                        "repairKey": "stale-repair-key",
+                        "repairAttempts": 2,
+                        "lastRestartCount": 3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _RecordingServiceRunner(restarts=7)
+            ai_calls: list[dict[str, object]] = []
+
+            result = run_watchdog(
+                supervisor,
+                watcher,
+                root / "alerts.log",
+                service_name="example.service",
+                now=now,
+                runner=runner,
+                notifier=lambda _title, _message: True,
+                thresholds=WatchdogThresholds(
+                    repeat_count=1,
+                    restart_count=1,
+                    stale_seconds=3600,
+                    cooldown_seconds=1800,
+                ),
+                auto_repair=AutoRepairOptions(
+                    enabled=True,
+                    project_path=project,
+                    contract_dir=contracts,
+                    backup_dir=root / "backups",
+                    ai_repair_enabled=True,
+                    orchestrator_path=orchestrator,
+                    ai_report_dir=root / "ai-reports",
+                    revive_timer_name="example-revive.timer",
+                ),
+                ai_repairer=lambda *_args, **kwargs: ai_calls.append(kwargs) or {
+                    "attempted": True,
+                    "success": True,
+                    "action": "unexpected-repair",
+                    "diagnostic": "unexpected repair",
+                    "restarted": False,
+                },
+            )
+
+            self.assertEqual(result["status"], "alerted")
+            self.assertEqual(result["alertType"], "restart-loop")
+            self.assertIsNone(result["repair"])
+            self.assertEqual(result["repairAttempts"], 0)
+            self.assertEqual(ai_calls, [])
+            self.assertEqual(runner.actions, ["show"])
+            self.assertEqual(supervisor.read_bytes(), original_supervisor)
+            state = json.loads(watcher.read_text(encoding="utf-8"))
+            self.assertIsNone(state["repairKey"])
+            self.assertEqual(state["repairAttempts"], 0)
+
     def test_malformed_external_qa_does_not_block_auto_repair(self) -> None:
         malformed_receipts = (
             {key: value for key, value in _manual_external_qa().items() if key != "reason"},
@@ -779,7 +856,57 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(ai_calls, [])
         self.assertEqual(runner.calls, [])
 
-    def test_restart_loop_can_defer_manual_gate_and_continue_queue(self) -> None:
+    def test_restart_loop_manual_review_direct_auto_repair_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "supervisor.json"
+            state_path.write_text(
+                json.dumps({
+                    "revision": 4,
+                    "status": "running",
+                    "nextAction": "bounded-delivery",
+                    "currentTask": {"id": "blocked-payment", "taskSha": "task-sha"},
+                    "externalQa": _manual_external_qa(),
+                }),
+                encoding="utf-8",
+            )
+            original_state = state_path.read_bytes()
+            runner = _RecordingServiceRunner(restarts=8)
+            ai_calls: list[dict[str, object]] = []
+
+            result = attempt_auto_repair(
+                json.loads(state_path.read_text(encoding="utf-8")),
+                alert_type="restart-loop",
+                service_name="example.service",
+                options=AutoRepairOptions(
+                    enabled=True,
+                    ai_repair_enabled=True,
+                    project_path=root / "project",
+                    orchestrator_path=root / "orchestrator",
+                    ai_report_dir=root / "reports",
+                    supervisor_state_path=state_path,
+                    max_ai_repair_cycles=5,
+                ),
+                runner=runner,
+                ai_repairer=lambda *_args, **kwargs: ai_calls.append(kwargs) or {
+                    "attempted": True,
+                    "success": True,
+                    "action": "codex-sol-terra-agy-qa-repair",
+                    "diagnostic": "連續 5 輪仍未通過",
+                    "restarted": False,
+                    "deferred": True,
+                    "reportPath": str(root / "reports" / "repair.json"),
+                },
+            )
+
+            self.assertEqual(result["action"], "manual-review-required")
+            self.assertFalse(result["attempted"])
+            self.assertFalse(result["success"])
+            self.assertEqual(ai_calls, [])
+            self.assertEqual(runner.calls, [])
+            self.assertEqual(state_path.read_bytes(), original_state)
+
+    def test_restart_loop_can_defer_task_without_manual_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             state_path = root / "supervisor.json"
@@ -787,7 +914,7 @@ class WatchdogTests(unittest.TestCase):
                 json.dumps({
                     "revision": 4,
                     "status": "attention-required",
-                    "nextAction": "manual-review-required",
+                    "nextAction": "bounded-delivery",
                     "currentTask": {"id": "blocked-payment", "taskSha": "task-sha"},
                 }),
                 encoding="utf-8",

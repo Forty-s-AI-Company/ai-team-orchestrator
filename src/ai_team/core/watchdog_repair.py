@@ -101,10 +101,7 @@ def attempt_auto_repair(
 ) -> dict[str, Any]:
     """Stop the supervisor, apply one deterministic repair, and restart on success."""
 
-    restart_loop_recovery = (
-        alert_type == "restart-loop" and options.ai_repair_enabled
-    )
-    if requires_manual_review(supervisor) and not restart_loop_recovery:
+    if requires_manual_review(supervisor):
         return _result(
             False,
             False,
