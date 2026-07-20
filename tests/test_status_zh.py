@@ -164,6 +164,14 @@ def test_status_shows_readable_failed_repair_history(tmp_path: Path) -> None:
             "status": "deferred",
             "cycleLimit": 5,
             "activePhase": "deferred",
+            "acceptanceContract": {
+                "sha256": "a" * 64,
+                "acceptanceCriteria": [{"id": "AC-1"}],
+            },
+            "followUpFindings": [{
+                "id": "ARCH-1",
+                "evidence": "建議重寫發布協議，已拆成後續工作",
+            }],
             "cycles": [
                 {
                     "cycle": 1,
@@ -205,3 +213,6 @@ def test_status_shows_readable_failed_repair_history(tmp_path: Path) -> None:
     assert "AGY QA 未通過" in output
     assert "第 2 輪｜Sol/Terra XHigh｜基礎測試未通過" in output
     assert "已記錄並跳過" in output
+    assert "驗收契約已凍結（1 項）" in output
+    assert "範圍外發現（已另行記錄，不阻擋目前修復）" in output
+    assert "建議重寫發布協議" in output

@@ -34,6 +34,10 @@ REPORT_SCHEMA = "ai-team-watchdog-ai-repair/v1"
 MAX_MODEL_OUTPUT_BYTES = 128_000
 MAX_PATCH_BYTES = 512_000
 MAX_WRITE_PATHS = 12
+MAX_CHANGED_FILES = 5
+MAX_PATCH_CHANGED_LINES = 500
+MAX_ACCEPTANCE_CRITERIA = 8
+MAX_REVIEW_FINDINGS = 20
 MAX_REPAIR_CYCLES = 5
 MAX_REPLAN_CYCLES = 5
 MAX_REPAIR_HISTORY = 4
@@ -54,6 +58,25 @@ REPOSITORY_PREFIXES = {
         "tests/",
     ),
 }
+
+BLOCKING_FINDING_CATEGORIES = {
+    "acceptance-failure",
+    "patch-regression",
+    "critical-safety",
+}
+FINDING_CATEGORIES = BLOCKING_FINDING_CATEGORIES | {
+    "pre-existing",
+    "architecture-improvement",
+    "maintainability-improvement",
+    "unverified",
+}
+FINDING_SEVERITIES = {"critical", "high", "medium", "low"}
+STANDARD_OUT_OF_SCOPE = (
+    "修改前已存在、且未被本次 patch 惡化的問題",
+    "替代架構、重構或可讀性改善",
+    "沒有可重現證據的推測性問題",
+    "需要擴大 repository、允許路徑或驗收條件的工作",
+)
 
 
 def _run_legacy_watchdog_ai_repair(
@@ -339,7 +362,9 @@ def run_watchdog_ai_repair(
         _validate_repository(orchestrator)
         evidence = _failure_evidence(supervisor, reports)
         diagnosis: dict[str, Any] | None = None
+        acceptance_contract: dict[str, Any] | None = None
         feedback: list[str] = []
+        follow_up_findings: list[dict[str, Any]] = []
         cycles: list[dict[str, Any]] = report["cycles"]
         reviewer = agy_reviewer or _run_antigravity_qa
 
@@ -363,10 +388,27 @@ def run_watchdog_ai_repair(
                         orchestrator,
                         diagnosis,
                         cycles,
+                        acceptance_contract=acceptance_contract,
                     )
                 ),
             )
             diagnosis = _validate_diagnosis(_last_json_object(diagnosis_result.stdout))
+            if acceptance_contract is None:
+                acceptance_contract = _freeze_acceptance_contract(diagnosis)
+                report.update({
+                    "acceptanceContract": acceptance_contract,
+                    "repository": acceptance_contract["repository"],
+                })
+            else:
+                diagnosis, scope_findings = _constrain_diagnosis_to_contract(
+                    diagnosis,
+                    acceptance_contract,
+                )
+                follow_up_findings = _merge_follow_up_findings(
+                    follow_up_findings,
+                    scope_findings,
+                )
+                report["followUpFindings"] = follow_up_findings
             cycle_result: dict[str, Any] = {
                 "cycle": cycle_number,
                 "reasoningEffort": effort,
@@ -426,8 +468,7 @@ def run_watchdog_ai_repair(
                 patch = _git(
                     worktree, "diff", "--cached", "--no-ext-diff", "--binary", "HEAD"
                 ).stdout
-                if len(patch.encode("utf-8")) > MAX_PATCH_BYTES:
-                    raise ValueError("repair patch exceeds the bounded QA evidence limit")
+                _validate_patch_budget(changed_files, patch)
                 candidate_hash = hashlib.sha256(patch.encode("utf-8", "replace")).hexdigest()
                 cycle_result.update({
                     "changedFiles": changed_files,
@@ -462,6 +503,23 @@ def run_watchdog_ai_repair(
                     model=antigravity_qa_model,
                 )
                 cycle_result["agyQa"] = agy_qa
+                agy_blocking_findings = _agy_blocking_findings(
+                    agy_qa,
+                    acceptance_contract,
+                )
+                agy_follow_ups = _agy_follow_up_findings(
+                    agy_qa,
+                    agy_blocking_findings,
+                )
+                cycle_result.update({
+                    "agyBlockingFindings": agy_blocking_findings,
+                    "agyFollowUpFindings": agy_follow_ups,
+                })
+                follow_up_findings = _merge_follow_up_findings(
+                    follow_up_findings,
+                    agy_follow_ups,
+                )
+                report["followUpFindings"] = follow_up_findings
                 _assert_candidate_unchanged(worktree, changed_files, candidate_hash, "Antigravity QA")
 
                 report["activePhase"] = "sol-review"
@@ -472,23 +530,45 @@ def run_watchdog_ai_repair(
                     reasoning_effort=effort,
                     root=worktree,
                     write=False,
-                    prompt=_qa_prompt(diagnosis, validation, agy_qa, patch),
+                    prompt=_qa_prompt(
+                        diagnosis,
+                        validation,
+                        agy_qa,
+                        patch,
+                        acceptance_contract=acceptance_contract,
+                    ),
                 )
                 sol_qa = _validate_qa(_last_json_object(qa_result.stdout))
+                blocking_findings = _blocking_review_findings(
+                    sol_qa,
+                    acceptance_contract,
+                )
+                cycle_follow_ups = _follow_up_review_findings(
+                    sol_qa,
+                    blocking_findings,
+                )
+                follow_up_findings = _merge_follow_up_findings(
+                    follow_up_findings,
+                    cycle_follow_ups,
+                )
+                report["followUpFindings"] = follow_up_findings
                 cycle_result.update({
                     "solReviewCommand": _command_summary(qa_result),
                     "solReview": sol_qa,
+                    "blockingFindings": blocking_findings,
+                    "followUpFindings": cycle_follow_ups,
                 })
                 _assert_candidate_unchanged(
                     worktree, changed_files, candidate_hash, "Codex Sol review"
                 )
                 agy_passed = (
                     validation.get("success") is True
-                    and agy_qa.get("status") == "passed"
-                    and not agy_qa.get("findings")
-                    and not agy_qa.get("blockers")
+                    and not agy_blocking_findings
                 )
-                sol_passed = sol_qa["status"] == "passed" and not sol_qa["findings"]
+                # Sol may still report pre-existing defects or architecture ideas,
+                # but only frozen-contract failures and regressions introduced by
+                # this patch are allowed to move the acceptance goalpost.
+                sol_passed = not blocking_findings
                 if agy_passed and sol_passed:
                     cycle_result["outcome"] = "passed"
                     report["activePhase"] = "commit-and-push"
@@ -519,9 +599,8 @@ def run_watchdog_ai_repair(
 
                 feedback = [
                     *validation_feedback,
-                    *[str(item) for item in agy_qa.get("findings", [])],
-                    *[str(item) for item in agy_qa.get("blockers", [])],
-                    *sol_qa["findings"],
+                    *agy_blocking_findings,
+                    *[_review_finding_feedback(item) for item in blocking_findings],
                 ] or [str(agy_qa.get("summary") or sol_qa["summary"])]
                 cycle_result.update({
                     "outcome": "review-rejected",
@@ -584,11 +663,17 @@ def _diagnosis_prompt(
         "a real payment, production access, destructive state changes, or changes outside the permitted paths.",
         "Never request writes to .git, .env files, credentials, user systemd files, production deployment,",
         "database migrations/seeds, real payments, or destructive operations.",
+        "Define the complete acceptance contract now. It is frozen after this response: later review may",
+        "block only an unmet acceptance criterion or a reproducible regression/critical safety defect",
+        "introduced by the candidate patch. Pre-existing defects, architecture alternatives, cleanup, and",
+        "new requirements must be reported as non-blocking follow-up work.",
         "Return JSON only without Markdown using this exact shape:",
         '{"schema":"ai-team-watchdog-diagnosis/v1","status":"repairable|unrepairable",'
         '"repository":"project|orchestrator","summary":"short Chinese summary",'
         '"rootCause":"concrete evidence-backed cause","repairInstruction":"bounded implementation instruction",'
-        '"allowedWritePaths":["exact/relative/path"]}',
+        '"allowedWritePaths":["exact/relative/path"],'
+        '"acceptanceCriteria":[{"id":"AC-1","requirement":"testable requirement",'
+        '"verification":"specific test or evidence"}],"outOfScope":["explicit exclusion"]}',
         f"SupervisorEvidence={json.dumps(redact_secrets(supervisor), ensure_ascii=False)}",
         f"FailureEvidence={json.dumps(redact_secrets(evidence), ensure_ascii=False)}",
     ))
@@ -605,25 +690,34 @@ def _replan_prompt(
     orchestrator: Path,
     previous_diagnosis: dict[str, Any],
     repair_cycles: list[dict[str, Any]],
+    *,
+    acceptance_contract: dict[str, Any] | None = None,
 ) -> str:
     return "\n".join((
         "You are the read-only incident diagnostician replanning a rejected autonomous repair.",
         f"Product repository: {project}",
         f"Orchestrator repository: {orchestrator}",
         "The previous repair cycle was rejected. Inspect both repositories again at xhigh reasoning.",
-        "Use every QA finding below as new root-cause evidence. Produce a materially revised plan instead of",
-        "repeating the rejected design. You may change repository or exact write paths when the evidence supports it.",
-        "Prefer structural solutions that make unsafe states unrepresentable over expanding semantic blacklists.",
+        "Use only blocking QA findings below as evidence for a revised implementation inside the frozen contract.",
+        "The repository, allowed paths, acceptance criteria, and exclusions are immutable. Do not add a new",
+        "requirement or broaden the architecture. If broader work would be useful, keep it out of this repair;",
+        "it will be recorded as a non-blocking follow-up task.",
         "Treat safe observability improvements as repairable, but never request credentials, production access,",
         "real payments, external-service changes, migrations/seeds, destructive actions, .env, .git, or systemd writes.",
         "Return JSON only without Markdown using this exact shape:",
         '{"schema":"ai-team-watchdog-diagnosis/v1","status":"repairable|unrepairable",'
         '"repository":"project|orchestrator","summary":"short Chinese summary",'
-        '"rootCause":"revised evidence-backed cause","repairInstruction":"materially revised bounded instruction",'
-        '"allowedWritePaths":["exact/relative/path"]}',
+        '"rootCause":"revised evidence-backed cause","repairInstruction":"revised bounded instruction",'
+        '"allowedWritePaths":["same frozen path"],'
+        '"acceptanceCriteria":[{"id":"AC-1","requirement":"unchanged requirement",'
+        '"verification":"unchanged verification"}],"outOfScope":["unchanged exclusion"]}',
         f"SupervisorEvidence={json.dumps(redact_secrets(supervisor), ensure_ascii=False)}",
         f"FailureEvidence={json.dumps(redact_secrets(evidence), ensure_ascii=False)}",
         f"RejectedDiagnosis={json.dumps(redact_secrets(previous_diagnosis), ensure_ascii=False)}",
+        (
+            "FrozenAcceptanceContract="
+            f"{json.dumps(redact_secrets(acceptance_contract or {}), ensure_ascii=False)}"
+        ),
         (
             "RejectedRepairCycles="
             f"{json.dumps(redact_secrets(_compact_repair_cycles(repair_cycles)), ensure_ascii=False)}"
@@ -658,15 +752,25 @@ def _qa_prompt(
     validation: dict[str, Any],
     agy_qa: dict[str, Any],
     patch: str,
+    *,
+    acceptance_contract: dict[str, Any] | None = None,
 ) -> str:
     return "\n".join((
         "You are the read-only QA reviewer for an automatic watchdog repair.",
         "Review the exact untrusted patch, deterministic tests, and independent AGY QA evidence.",
-        "Do not edit files or run external actions. AGY rejection must be resolved or explicitly disproved.",
-        "Check security, correctness, performance, readability, and maintainability.",
+        "Do not edit files or run external actions. The acceptance contract is frozen.",
+        "A finding may block only when it proves an unmet acceptance rule, or a reproducible correctness/security",
+        "regression introduced by this exact patch. A critical-safety finding must also be introduced by this patch.",
+        "Pre-existing defects, speculative concerns, architecture alternatives, readability, cleanup, and new",
+        "requirements are follow-up findings and must not fail this repair.",
         "Return JSON only without Markdown using exactly:",
         '{"schema":"ai-team-watchdog-qa/v1","status":"passed|failed","summary":"Chinese summary",'
-        '"findings":["actionable finding"]}',
+        '"findings":[{"id":"stable-id",'
+        '"category":"acceptance-failure|patch-regression|critical-safety|pre-existing|architecture-improvement|maintainability-improvement|unverified",'
+        '"acceptanceRuleId":"AC-1 or null","introducedByCurrentPatch":true,'
+        '"severity":"critical|high|medium|low","evidence":"reproducible evidence",'
+        '"action":"bounded correction or follow-up"}]}',
+        f"FrozenAcceptanceContract={json.dumps(redact_secrets(acceptance_contract or {}), ensure_ascii=False)}",
         f"Diagnosis={json.dumps(diagnosis, ensure_ascii=False)}",
         f"Validation={json.dumps(redact_secrets(validation), ensure_ascii=False)}",
         f"AGYQA={json.dumps(redact_secrets(agy_qa), ensure_ascii=False)}",
@@ -701,14 +805,19 @@ def _run_antigravity_qa(
             "bytes": len(patch.encode("utf-8")),
         },
     }
+    agy_criteria = _agy_acceptance_criteria(diagnosis)
     prompt = "\n".join((
         f"Task: {diagnosis['summary']}",
-        f"Instruction: {diagnosis['repairInstruction']}",
-        "Acceptance Criteria: " + json.dumps([
-            "修正符合 Sol 診斷的根因與範圍",
-            "所有 deterministic QA 都通過",
-            "沒有安全性、正確性、效能或可維護性阻擋項目",
-        ], ensure_ascii=False),
+        (
+            f"Instruction: {diagnosis['repairInstruction']}. Scope is frozen: only an unmet acceptance "
+            "criterion or a reproducible regression introduced by this patch may fail QA; pre-existing "
+            "issues, architecture alternatives, cleanup, and new requirements are non-blocking follow-ups. "
+            "Every failing finding must begin with the exact acceptance criterion ID it proves failed."
+        ),
+        "Acceptance Criteria: " + json.dumps(
+            agy_criteria,
+            ensure_ascii=False,
+        ),
         f"Allowed Write Paths: {json.dumps(changed_files, ensure_ascii=False)}",
         f"Validation Commands: {json.dumps(commands, ensure_ascii=False)}",
         "Change Policy: " + json.dumps({
@@ -761,6 +870,7 @@ def _run_antigravity_qa(
             "tests": [],
             "blockers": [str(result.error_type or "unknown")],
             "provider": result.provider,
+            "providerExecutionSucceeded": False,
         }
     try:
         payload = json.loads(result.content)
@@ -776,7 +886,22 @@ def _run_antigravity_qa(
         "tests": payload.get("tests") if isinstance(payload.get("tests"), list) else [],
         "blockers": payload.get("blockers") if isinstance(payload.get("blockers"), list) else [],
         "provider": result.provider,
+        "providerExecutionSucceeded": True,
     }
+
+
+def _agy_acceptance_criteria(diagnosis: dict[str, Any]) -> list[str]:
+    acceptance_criteria = diagnosis.get("acceptanceCriteria")
+    if not isinstance(acceptance_criteria, list):
+        return []
+    return [
+        (
+            f"{item.get('id')}: {item.get('requirement')}; "
+            f"Verification: {item.get('verification')}"
+        )
+        for item in acceptance_criteria
+        if isinstance(item, dict)
+    ]
 
 
 def _invoke_codex(
@@ -824,14 +949,26 @@ def _validate_diagnosis(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Sol diagnosis schema is invalid")
     if value.get("status") not in {"repairable", "unrepairable"}:
         raise ValueError("Sol diagnosis status is invalid")
-    if value.get("repository") not in REPOSITORY_PREFIXES:
+    repository = value.get("repository")
+    if not isinstance(repository, str) or repository not in REPOSITORY_PREFIXES:
         raise ValueError("Sol diagnosis repository is invalid")
     for key in ("summary", "rootCause", "repairInstruction"):
         if not isinstance(value.get(key), str) or not value[key].strip():
             raise ValueError(f"Sol diagnosis {key} is required")
     if not isinstance(value.get("allowedWritePaths"), list):
         raise ValueError("Sol diagnosis allowedWritePaths must be a list")
-    return value
+    result = dict(value)
+    result["allowedWritePaths"] = _validate_write_paths(
+        repository,
+        value["allowedWritePaths"],
+    )
+    result["acceptanceCriteria"] = _validate_acceptance_criteria(
+        value.get("acceptanceCriteria"),
+        root_cause=value["rootCause"],
+        repair_instruction=value["repairInstruction"],
+    )
+    result["outOfScope"] = _validate_out_of_scope(value.get("outOfScope"))
+    return result
 
 
 def _validate_qa(value: dict[str, Any]) -> dict[str, Any]:
@@ -839,9 +976,319 @@ def _validate_qa(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Sol QA response is invalid")
     if not isinstance(value.get("summary"), str) or not isinstance(value.get("findings"), list):
         raise ValueError("Sol QA response fields are invalid")
-    if not all(isinstance(item, str) for item in value["findings"]):
-        raise ValueError("Sol QA findings must be strings")
-    return value
+    if len(value["findings"]) > MAX_REVIEW_FINDINGS:
+        raise ValueError("Sol QA findings exceed the bounded limit")
+    result = dict(value)
+    result["findings"] = [
+        _normalize_review_finding(item, index)
+        for index, item in enumerate(value["findings"], start=1)
+    ]
+    return result
+
+
+def _validate_acceptance_criteria(
+    value: Any,
+    *,
+    root_cause: str,
+    repair_instruction: str,
+) -> list[dict[str, str]]:
+    if value is None:
+        return [
+            {
+                "id": "AC-1",
+                "requirement": f"修正已診斷根因：{root_cause.strip()}",
+                "verification": "焦點測試可重現修正前失敗、修正後通過",
+            },
+            {
+                "id": "AC-2",
+                "requirement": repair_instruction.strip(),
+                "verification": "修改內容與允許路徑符合修復指示",
+            },
+            {
+                "id": "AC-3",
+                "requirement": "既有 deterministic QA 不得產生 regression",
+                "verification": "所有設定的 lint、型別、測試與建置命令通過",
+            },
+        ]
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_ACCEPTANCE_CRITERIA:
+        raise ValueError("Sol diagnosis acceptanceCriteria must contain 1 to 8 rules")
+    result: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("Sol diagnosis acceptance criteria must be objects")
+        rule_id = item.get("id")
+        requirement = item.get("requirement")
+        verification = item.get("verification")
+        if (
+            not isinstance(rule_id, str)
+            or not re.fullmatch(r"[A-Z][A-Z0-9_-]{1,31}", rule_id)
+            or rule_id in seen_ids
+        ):
+            raise ValueError("Sol diagnosis acceptance criterion id is invalid")
+        if not isinstance(requirement, str) or not requirement.strip():
+            raise ValueError("Sol diagnosis acceptance criterion requirement is required")
+        if not isinstance(verification, str) or not verification.strip():
+            raise ValueError("Sol diagnosis acceptance criterion verification is required")
+        seen_ids.add(rule_id)
+        result.append({
+            "id": rule_id,
+            "requirement": requirement.strip()[:2_000],
+            "verification": verification.strip()[:2_000],
+        })
+    return result
+
+
+def _validate_out_of_scope(value: Any) -> list[str]:
+    if value is None:
+        supplied: list[str] = []
+    elif isinstance(value, list) and len(value) <= MAX_ACCEPTANCE_CRITERIA:
+        if not all(isinstance(item, str) and item.strip() for item in value):
+            raise ValueError("Sol diagnosis outOfScope values must be non-empty strings")
+        supplied = [item.strip()[:2_000] for item in value]
+    else:
+        raise ValueError("Sol diagnosis outOfScope must be a bounded list")
+    return list(dict.fromkeys([*supplied, *STANDARD_OUT_OF_SCOPE]))
+
+
+def _freeze_acceptance_contract(diagnosis: dict[str, Any]) -> dict[str, Any]:
+    contract: dict[str, Any] = {
+        "schema": "ai-team-frozen-repair-contract/v1",
+        "objective": diagnosis["summary"],
+        "repository": diagnosis["repository"],
+        "allowedWritePaths": list(diagnosis["allowedWritePaths"]),
+        "acceptanceCriteria": [dict(item) for item in diagnosis["acceptanceCriteria"]],
+        "outOfScope": list(diagnosis["outOfScope"]),
+        "changeBudget": {
+            "maxChangedFiles": MAX_CHANGED_FILES,
+            "maxChangedLines": MAX_PATCH_CHANGED_LINES,
+            "maxPatchBytes": MAX_PATCH_BYTES,
+        },
+    }
+    encoded = json.dumps(contract, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    contract["sha256"] = hashlib.sha256(encoded).hexdigest()
+    return contract
+
+
+def _constrain_diagnosis_to_contract(
+    diagnosis: dict[str, Any],
+    contract: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    findings: list[dict[str, Any]] = []
+    frozen_repository = contract["repository"]
+    frozen_paths = list(contract["allowedWritePaths"])
+    if diagnosis["repository"] != frozen_repository:
+        findings.append(_scope_follow_up(
+            "Sol 要求更換修復 repository；已拒絕擴張並保留原驗收契約",
+        ))
+    extra_paths = sorted(set(diagnosis["allowedWritePaths"]) - set(frozen_paths))
+    if extra_paths:
+        findings.append(_scope_follow_up(
+            f"Sol 要求新增修改路徑：{', '.join(extra_paths)}；已另行記錄",
+        ))
+    if diagnosis["acceptanceCriteria"] != contract["acceptanceCriteria"]:
+        findings.append(_scope_follow_up(
+            "Sol 要求變更或新增驗收條件；已拒絕移動終點並另行記錄",
+        ))
+
+    constrained = dict(diagnosis)
+    constrained.update({
+        "repository": frozen_repository,
+        "allowedWritePaths": frozen_paths,
+        "acceptanceCriteria": [dict(item) for item in contract["acceptanceCriteria"]],
+        "outOfScope": list(contract["outOfScope"]),
+        "acceptanceContractSha256": contract["sha256"],
+    })
+    return constrained, findings
+
+
+def _scope_follow_up(evidence: str) -> dict[str, Any]:
+    digest = hashlib.sha256(evidence.encode("utf-8")).hexdigest()[:12]
+    return {
+        "id": f"SCOPE-{digest}",
+        "category": "architecture-improvement",
+        "acceptanceRuleId": None,
+        "introducedByCurrentPatch": False,
+        "severity": "medium",
+        "evidence": evidence,
+        "action": "交由 PM 建立獨立後續任務，不阻擋目前修復",
+        "allowedToBlock": False,
+    }
+
+
+def _normalize_review_finding(value: Any, index: int) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        text = str(value)[:2_000]
+        return {
+            "id": f"UNVERIFIED-{index}",
+            "category": "unverified",
+            "acceptanceRuleId": None,
+            "introducedByCurrentPatch": False,
+            "severity": "medium",
+            "evidence": text,
+            "action": text,
+        }
+    finding_id = value.get("id")
+    category = value.get("category")
+    severity = value.get("severity")
+    rule_id = value.get("acceptanceRuleId")
+    evidence = value.get("evidence")
+    action = value.get("action")
+    return {
+        "id": finding_id[:100] if isinstance(finding_id, str) and finding_id else f"F-{index}",
+        "category": category if category in FINDING_CATEGORIES else "unverified",
+        "acceptanceRuleId": rule_id[:100] if isinstance(rule_id, str) and rule_id else None,
+        "introducedByCurrentPatch": value.get("introducedByCurrentPatch") is True,
+        "severity": severity if severity in FINDING_SEVERITIES else "medium",
+        "evidence": evidence[:2_000] if isinstance(evidence, str) else "",
+        "action": action[:2_000] if isinstance(action, str) else "",
+    }
+
+
+def _finding_allowed_to_block(
+    finding: dict[str, Any],
+    contract: dict[str, Any] | None,
+) -> bool:
+    if not finding.get("evidence"):
+        return False
+    category = finding.get("category")
+    rule_ids = {
+        item.get("id")
+        for item in (contract or {}).get("acceptanceCriteria", [])
+        if isinstance(item, dict)
+    }
+    if category == "acceptance-failure":
+        return finding.get("acceptanceRuleId") in rule_ids
+    if category == "patch-regression":
+        return finding.get("introducedByCurrentPatch") is True
+    if category == "critical-safety":
+        return (
+            finding.get("introducedByCurrentPatch") is True
+            and finding.get("severity") in {"critical", "high"}
+        )
+    return False
+
+
+def _blocking_review_findings(
+    qa: dict[str, Any],
+    contract: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    return [
+        {**item, "allowedToBlock": True}
+        for item in qa["findings"]
+        if _finding_allowed_to_block(item, contract)
+    ]
+
+
+def _follow_up_review_findings(
+    qa: dict[str, Any],
+    blocking_findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    blocking_keys = {
+        (item.get("id"), item.get("category"), item.get("evidence"))
+        for item in blocking_findings
+    }
+    return [
+        {**item, "allowedToBlock": False}
+        for item in qa["findings"]
+        if (item.get("id"), item.get("category"), item.get("evidence"))
+        not in blocking_keys
+    ]
+
+
+def _review_finding_feedback(finding: dict[str, Any]) -> str:
+    rule = finding.get("acceptanceRuleId") or finding.get("category")
+    action = finding.get("action") or finding.get("evidence") or "修正阻擋問題"
+    return f"{rule}: {action}"
+
+
+def _agy_blocking_findings(
+    qa: dict[str, Any],
+    contract: dict[str, Any] | None,
+) -> list[str]:
+    if qa.get("providerExecutionSucceeded") is not True:
+        failures = qa.get("blockers")
+        if isinstance(failures, list) and failures:
+            return [f"AGY 執行失敗：{str(item)[:2_000]}" for item in failures]
+        return [f"AGY 執行失敗：{str(qa.get('summary') or 'unknown')[:2_000]}"]
+
+    rule_ids = {
+        str(item.get("id"))
+        for item in (contract or {}).get("acceptanceCriteria", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    candidates = [
+        *qa.get("findings", []),
+        *qa.get("blockers", []),
+    ]
+    blocking: list[str] = []
+    for item in candidates:
+        if isinstance(item, dict):
+            rule_id = item.get("acceptanceRuleId")
+            detail = item.get("evidence") or item.get("message") or str(item)
+            if rule_id in rule_ids:
+                blocking.append(f"{rule_id}: {str(detail)[:2_000]}")
+            continue
+        detail = str(item)[:2_000]
+        if any(re.match(rf"^(?:\[)?{re.escape(rule_id)}(?:\]|:|\s)", detail) for rule_id in rule_ids):
+            blocking.append(detail)
+    return blocking
+
+
+def _agy_follow_up_findings(
+    qa: dict[str, Any],
+    blocking_findings: list[str],
+) -> list[dict[str, Any]]:
+    blocking = set(blocking_findings)
+    follow_ups: list[dict[str, Any]] = []
+    for item in [*qa.get("findings", []), *qa.get("blockers", [])]:
+        detail = str(item)[:2_000]
+        if detail in blocking or any(value.endswith(detail) for value in blocking):
+            continue
+        digest = hashlib.sha256(detail.encode("utf-8")).hexdigest()[:12]
+        follow_ups.append({
+            "id": f"AGY-{digest}",
+            "category": "unverified",
+            "acceptanceRuleId": None,
+            "introducedByCurrentPatch": False,
+            "severity": "medium",
+            "evidence": detail,
+            "action": "交由 PM 評估獨立後續任務，不阻擋目前修復",
+            "allowedToBlock": False,
+        })
+    return follow_ups
+
+
+def _merge_follow_up_findings(
+    current: list[dict[str, Any]],
+    additions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[tuple[Any, Any, Any], dict[str, Any]] = {
+        (item.get("id"), item.get("category"), item.get("evidence")): item
+        for item in current
+    }
+    for item in additions:
+        merged[(item.get("id"), item.get("category"), item.get("evidence"))] = item
+    return list(merged.values())
+
+
+def _validate_patch_budget(changed_files: list[str], patch: str) -> None:
+    if len(changed_files) > MAX_CHANGED_FILES:
+        raise ValueError(
+            f"repair patch changes {len(changed_files)} files; bounded limit is {MAX_CHANGED_FILES}"
+        )
+    if len(patch.encode("utf-8")) > MAX_PATCH_BYTES:
+        raise ValueError("repair patch exceeds the bounded QA evidence limit")
+    changed_lines = sum(
+        1
+        for line in patch.splitlines()
+        if (line.startswith("+") and not line.startswith("+++"))
+        or (line.startswith("-") and not line.startswith("---"))
+    )
+    if changed_lines > MAX_PATCH_CHANGED_LINES:
+        raise ValueError(
+            f"repair patch changes {changed_lines} lines; bounded limit is {MAX_PATCH_CHANGED_LINES}"
+        )
 
 
 def _validation_feedback(validation: dict[str, Any]) -> list[str]:
@@ -864,6 +1311,18 @@ def _compact_repair_cycles(repair_cycles: list[dict[str, Any]]) -> list[dict[str
         qa = (
             item.get("solReview", item.get("qa")) if isinstance(item, dict) else None
         )
+        if isinstance(qa, dict) and isinstance(item, dict) and "blockingFindings" in item:
+            qa = {
+                **qa,
+                "findings": item.get("blockingFindings", []),
+            }
+        agy_qa = item.get("agyQa") if isinstance(item, dict) else None
+        if isinstance(agy_qa, dict) and isinstance(item, dict) and "agyBlockingFindings" in item:
+            agy_qa = {
+                **agy_qa,
+                "findings": item.get("agyBlockingFindings", []),
+                "blockers": [],
+            }
         compact.append({
             "cycle": item.get("cycle") if isinstance(item, dict) else None,
             "changedFiles": item.get("changedFiles", []) if isinstance(item, dict) else [],
@@ -875,7 +1334,7 @@ def _compact_repair_cycles(repair_cycles: list[dict[str, Any]]) -> list[dict[str
                 and validation.get("success") is not True else []
             ),
             "qa": qa if isinstance(qa, dict) else None,
-            "agyQa": item.get("agyQa") if isinstance(item, dict) else None,
+            "agyQa": agy_qa,
             "outcome": item.get("outcome") if isinstance(item, dict) else None,
             "failureSummary": item.get("failureSummary") if isinstance(item, dict) else None,
         })

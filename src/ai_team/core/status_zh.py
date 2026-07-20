@@ -304,6 +304,13 @@ def _repair_history_lines(report: dict) -> list[str]:
     diagnosis = report.get("diagnosis")
     if isinstance(diagnosis, dict) and diagnosis.get("summary"):
         lines.append(f"- 修復內容：{_shorten(str(diagnosis['summary']), 140)}")
+    contract = report.get("acceptanceContract")
+    if isinstance(contract, dict) and contract.get("sha256"):
+        criteria = contract.get("acceptanceCriteria")
+        count = len(criteria) if isinstance(criteria, list) else 0
+        lines.append(
+            f"- 收斂規則：驗收契約已凍結（{count} 項）；範圍外發現不得阻擋"
+        )
     for item in cycles[-5:]:
         if not isinstance(item, dict):
             continue
@@ -317,13 +324,21 @@ def _repair_history_lines(report: dict) -> list[str]:
     status_labels = {
         "running": "仍在修復中",
         "passed": "已修好並通過所有 QA",
-        "deferred": "五輪未修好，已記錄並跳過，不阻塞其他工作",
+        "deferred": "達修復輪次上限，已記錄並跳過，不阻塞其他工作",
         "failed": "修復流程本身發生錯誤",
     }
     lines.append(f"- 最終結果：{status_labels.get(status, status)}")
     reason = report.get("deferReason") or report.get("error")
     if reason:
         lines.append(f"- 原因：{_shorten(str(reason), 160)}")
+    follow_ups = report.get("followUpFindings")
+    if isinstance(follow_ups, list) and follow_ups:
+        lines.extend(["", "範圍外發現（已另行記錄，不阻擋目前修復）"])
+        for finding in follow_ups[-5:]:
+            if not isinstance(finding, dict):
+                continue
+            detail = finding.get("evidence") or finding.get("action") or finding.get("id")
+            lines.append(f"- {_shorten(str(detail), 140)}")
     return lines
 
 
@@ -332,9 +347,17 @@ def _cycle_detail(item: dict) -> str:
     sol = item.get("solReview") if isinstance(item.get("solReview"), dict) else {}
     parts: list[str] = []
     if agy:
-        parts.append(f"AGY QA {_qa_label(agy)}")
+        agy_blocking = item.get("agyBlockingFindings")
+        if isinstance(agy_blocking, list) and not agy_blocking:
+            parts.append("AGY 契約 QA 通過")
+        else:
+            parts.append(f"AGY QA {_qa_label(agy)}")
     if sol:
-        parts.append(f"Sol 複檢 {_qa_label(sol)}")
+        blocking = item.get("blockingFindings")
+        if isinstance(blocking, list) and not blocking:
+            parts.append("Sol 契約複檢通過")
+        else:
+            parts.append(f"Sol 複檢 {_qa_label(sol)}")
     failure = item.get("failureSummary")
     if failure:
         parts.append(_shorten(str(failure), 120))
