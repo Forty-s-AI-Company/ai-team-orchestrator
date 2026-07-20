@@ -444,7 +444,96 @@ class ExternalQATests(unittest.TestCase):
         self.assertNotIn("must-not-escape", receipt_text)
         self.assertNotIn("unknownField", receipt_text)
 
-    def test_version_one_provider_result_receipt_reruns_once_for_version_two_shape(self) -> None:
+    def test_callback_provider_rejection_diagnostics_are_value_free_and_strict(self) -> None:
+        root = self._project()
+        loaded = load_project(root)
+        valid_reference = "hmac-sha256:0123456789abcdef"
+        payload = {
+            "schema": "celebratedeal-payuni-sandbox-qa/v1",
+            "success": False,
+            "environment": "sandbox",
+            "checks": {
+                "providerChecks": {
+                    "callbackTradeQueries": [
+                        {
+                            "failureStage": "provider-result",
+                            "providerStatus": "REJECTED: raw provider status",
+                            "providerStatusPresent": True,
+                            "providerStatusJsonType": "string",
+                            "providerStatusLengthBucket": "9-32",
+                            "providerStatusReference": valid_reference,
+                            "providerErrorCode": "E-SECRET",
+                            "providerErrorCodePresent": True,
+                            "providerErrorCodeJsonType": "number",
+                            "providerErrorCodeLengthBucket": "1-8",
+                            "providerErrorCodeReference": valid_reference,
+                            "providerMessage": "raw provider message",
+                            "providerMessagePresent": True,
+                            "providerMessageJsonType": "string",
+                            "providerMessageLengthBucket": "33-128",
+                            "providerMessageReference": valid_reference,
+                        },
+                        {
+                            "failureStage": "provider-result",
+                            "providerStatusPresent": True,
+                            "providerStatusJsonType": "string",
+                            "providerStatusLengthBucket": "1-8",
+                            "providerStatusReference": "hmac-sha256:not-a-valid-reference",
+                            "providerMessage": "must-not-escape",
+                            "providerMessageReference": valid_reference,
+                        },
+                    ]
+                }
+            },
+            "productionValidation": {"automatedChargeAllowed": False},
+        }
+        completed = subprocess.CompletedProcess(
+            ["npm", "run", "qa:payuni:sandbox"], 1, json.dumps(payload) + "\n", ""
+        )
+
+        with patch("ai_team.core.external_qa.subprocess.run", return_value=completed):
+            result = run_external_qa(loaded, "l" * 40, root / "reports")
+
+        attempts = result.result["providerChecks"]["providerChecks"]["callbackTradeQueries"]
+        self.assertEqual(
+            {key: value for key, value in attempts[0].items() if key.startswith("provider")},
+            {
+                "providerStatusPresent": True,
+                "providerStatusJsonType": "string",
+                "providerStatusLengthBucket": "9-32",
+                "providerStatusReference": valid_reference,
+                "providerErrorCodePresent": True,
+                "providerErrorCodeJsonType": "number",
+                "providerErrorCodeLengthBucket": "1-8",
+                "providerErrorCodeReference": valid_reference,
+                "providerMessagePresent": True,
+                "providerMessageJsonType": "string",
+                "providerMessageLengthBucket": "33-128",
+                "providerMessageReference": valid_reference,
+            },
+        )
+        self.assertEqual(
+            {key: value for key, value in attempts[1].items() if key.startswith("provider")},
+            {
+                "providerStatusPresent": False,
+                "providerStatusJsonType": "absent",
+                "providerStatusLengthBucket": "absent",
+                "providerErrorCodePresent": False,
+                "providerErrorCodeJsonType": "absent",
+                "providerErrorCodeLengthBucket": "absent",
+                "providerMessagePresent": False,
+                "providerMessageJsonType": "absent",
+                "providerMessageLengthBucket": "absent",
+            },
+        )
+        receipt_text = result.receipt_path.read_text(encoding="utf-8")
+        self.assertNotIn("REJECTED: raw provider status", receipt_text)
+        self.assertNotIn("E-SECRET", receipt_text)
+        self.assertNotIn("raw provider message", receipt_text)
+        self.assertNotIn("must-not-escape", receipt_text)
+        self.assertNotIn("not-a-valid-reference", receipt_text)
+
+    def test_version_two_provider_result_receipt_reruns_once_for_version_three_diagnostics(self) -> None:
         root = self._project()
         loaded = load_project(root)
         revision = "k" * 40
@@ -453,8 +542,8 @@ class ExternalQATests(unittest.TestCase):
             "revision": revision,
             "status": "failed",
             "diagnosticRerun": {
-                "version": 1,
-                "reason": "legacy-truncated-callback-trade-queries",
+                "version": 2,
+                "reason": "missing-provider-result-shape",
             },
             "providerChecks": {
                 "providerChecks": {
@@ -481,6 +570,17 @@ class ExternalQATests(unittest.TestCase):
                             "flowStage": "waiting-payment-callback",
                             "failureStage": "provider-result",
                             "providerResultType": "absent",
+                            "providerStatusPresent": True,
+                            "providerStatusJsonType": "string",
+                            "providerStatusLengthBucket": "1-8",
+                            "providerStatusReference": "hmac-sha256:0123456789abcdef",
+                            "providerErrorCodePresent": False,
+                            "providerErrorCodeJsonType": "absent",
+                            "providerErrorCodeLengthBucket": "absent",
+                            "providerMessagePresent": True,
+                            "providerMessageJsonType": "string",
+                            "providerMessageLengthBucket": "9-32",
+                            "providerMessageReference": "hmac-sha256:fedcba9876543210",
                         }
                     ]
                 }
@@ -498,14 +598,84 @@ class ExternalQATests(unittest.TestCase):
 
         self.assertEqual(
             replacement.result["diagnosticRerun"],
-            {"version": 2, "reason": "missing-provider-result-shape"},
+            {"version": 3, "reason": "missing-provider-rejection-diagnostics"},
         )
-        self.assertEqual(persisted["diagnosticRerun"]["version"], 2)
+        self.assertEqual(persisted["diagnosticRerun"]["version"], 3)
         persisted_attempt = persisted["providerChecks"]["providerChecks"]["callbackTradeQueries"][0]
         self.assertEqual(persisted_attempt["failureStage"], "provider-result")
         self.assertEqual(persisted_attempt["providerResultType"], "absent")
+        self.assertEqual(persisted_attempt["providerStatusReference"], "hmac-sha256:0123456789abcdef")
         self.assertEqual(cached.result["reason"], "already-run-for-revision")
         run.assert_called_once()
+
+    def test_present_provider_diagnostic_without_valid_reference_reruns_for_version_three(self) -> None:
+        root = self._project()
+        loaded = load_project(root)
+        canonical_absent_diagnostics = {
+            "providerErrorCodePresent": False,
+            "providerErrorCodeJsonType": "absent",
+            "providerErrorCodeLengthBucket": "absent",
+            "providerMessagePresent": False,
+            "providerMessageJsonType": "absent",
+            "providerMessageLengthBucket": "absent",
+        }
+        completed = subprocess.CompletedProcess(
+            ["npm", "run", "qa:payuni:sandbox"],
+            1,
+            json.dumps(
+                {
+                    "schema": "celebratedeal-payuni-sandbox-qa/v1",
+                    "success": False,
+                    "environment": "sandbox",
+                    "checks": {"providerChecks": {"callbackTradeQueries": []}},
+                    "productionValidation": {"automatedChargeAllowed": False},
+                }
+            )
+            + "\n",
+            "",
+        )
+
+        for name, reference in (
+            ("missing", None),
+            ("malformed", "hmac-sha256:not-a-valid-reference"),
+        ):
+            with self.subTest(reference=name):
+                prior = {
+                    "schema": "ai-team-external-qa-receipt/v1",
+                    "revision": name[0] * 40,
+                    "status": "failed",
+                    "diagnosticRerun": {
+                        "version": 2,
+                        "reason": "missing-provider-result-shape",
+                    },
+                    "providerChecks": {
+                        "providerChecks": {
+                            "callbackTradeQueries": [
+                                {
+                                    "failureStage": "provider-result",
+                                    "providerStatusPresent": True,
+                                    "providerStatusJsonType": "string",
+                                    "providerStatusLengthBucket": "1-8",
+                                    "providerStatusReference": reference,
+                                    **canonical_absent_diagnostics,
+                                }
+                            ]
+                        }
+                    },
+                }
+                with patch("ai_team.core.external_qa.subprocess.run", return_value=completed) as run:
+                    result = run_external_qa(
+                        loaded,
+                        prior["revision"],
+                        root / "reports",
+                        prior=prior,
+                    )
+
+                self.assertEqual(
+                    result.result["diagnosticRerun"],
+                    {"version": 3, "reason": "missing-provider-rejection-diagnostics"},
+                )
+                run.assert_called_once()
 
     def test_provider_check_summary_is_bounded_and_redacted_in_receipt(self) -> None:
         root = self._project()

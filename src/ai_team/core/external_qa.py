@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -87,6 +88,22 @@ LEGACY_CALLBACK_TRADE_QUERIES_RERUN_VERSION = 1
 LEGACY_CALLBACK_TRADE_QUERIES_RERUN_REASON = "legacy-truncated-callback-trade-queries"
 PROVIDER_RESULT_SHAPE_RERUN_VERSION = 2
 PROVIDER_RESULT_SHAPE_RERUN_REASON = "missing-provider-result-shape"
+PROVIDER_REJECTION_DIAGNOSTIC_RERUN_VERSION = 3
+PROVIDER_REJECTION_DIAGNOSTIC_RERUN_REASON = "missing-provider-rejection-diagnostics"
+CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_PREFIXES = (
+    "providerStatus",
+    "providerErrorCode",
+    "providerMessage",
+)
+CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_JSON_TYPES = frozenset(
+    {"absent", "null", "string", "number", "boolean", "array", "object"}
+)
+CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_LENGTH_BUCKETS = frozenset(
+    {"absent", "0", "1-8", "9-32", "33-128", "129-512", "513+"}
+)
+CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_REFERENCE = re.compile(
+    r"hmac-sha256:[a-f0-9]{16}"
+)
 
 
 @dataclass(frozen=True)
@@ -145,6 +162,14 @@ def run_external_qa(
         previous_status = str(previous.get("status") or "")
         if previous_status == "failed":
             if (
+                not _provider_rejection_diagnostic_rerun_was_performed(previous)
+                and _has_callback_provider_rejection_diagnostics_missing(previous)
+            ):
+                diagnostic_rerun = {
+                    "version": PROVIDER_REJECTION_DIAGNOSTIC_RERUN_VERSION,
+                    "reason": PROVIDER_REJECTION_DIAGNOSTIC_RERUN_REASON,
+                }
+            elif (
                 not _provider_result_shape_rerun_was_performed(previous)
                 and _has_callback_provider_result_missing_shape(previous)
             ):
@@ -360,6 +385,37 @@ def _provider_result_shape_rerun_was_performed(receipt: dict[str, Any]) -> bool:
     )
 
 
+def _has_callback_provider_rejection_diagnostics_missing(receipt: dict[str, Any]) -> bool:
+    """Identify provider-result failures missing the v3 safe diagnostics."""
+
+    checks = receipt.get("providerChecks")
+    if not isinstance(checks, dict):
+        return False
+    provider_checks = checks.get("providerChecks")
+    if not isinstance(provider_checks, dict):
+        return False
+    callback_trade_queries = provider_checks.get("callbackTradeQueries")
+    if not isinstance(callback_trade_queries, list):
+        return False
+    return any(
+        isinstance(query, dict)
+        and query.get("failureStage") == "provider-result"
+        and not _has_safe_callback_provider_rejection_diagnostics(query)
+        for query in callback_trade_queries
+    )
+
+
+def _provider_rejection_diagnostic_rerun_was_performed(receipt: dict[str, Any]) -> bool:
+    """Return whether the one-time v3 rejection-diagnostic retry was run."""
+
+    rerun = receipt.get("diagnosticRerun")
+    return (
+        isinstance(rerun, dict)
+        and rerun.get("version") == PROVIDER_REJECTION_DIAGNOSTIC_RERUN_VERSION
+        and rerun.get("reason") == PROVIDER_REJECTION_DIAGNOSTIC_RERUN_REASON
+    )
+
+
 def _safe_checks(parsed: dict[str, Any]) -> dict[str, Any] | None:
     checks = parsed.get("checks")
     if not isinstance(checks, dict):
@@ -476,7 +532,89 @@ def _safe_callback_trade_query_attempt(value: dict[str, Any]) -> dict[str, Any]:
             if len(safe_fields) == MAX_CALLBACK_TRADE_QUERY_PROVIDER_RESULT_FIELDS:
                 break
         summary["providerResultFields"] = safe_fields
+
+    diagnostic_field_names = tuple(
+        f"{prefix}{suffix}"
+        for prefix in CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_PREFIXES
+        for suffix in ("Present", "JsonType", "LengthBucket", "Reference")
+    )
+    if any(field in value for field in diagnostic_field_names):
+        for prefix in CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_PREFIXES:
+            summary.update(_safe_callback_provider_rejection_diagnostic(value, prefix))
     return summary
+
+
+def _safe_callback_provider_rejection_diagnostic(
+    value: dict[str, Any], prefix: str
+) -> dict[str, Any]:
+    """Keep a canonical, value-free PayUni rejection diagnostic.
+
+    The source QA script emits only type/length classification and a keyed
+    HMAC reference.  Revalidate every member here because this is an external
+    process boundary: raw provider status, error-code, and message values are
+    never receipt fields.
+    """
+
+    present = value.get(f"{prefix}Present") is True
+    json_type = value.get(f"{prefix}JsonType")
+    length_bucket = value.get(f"{prefix}LengthBucket")
+    reference = value.get(f"{prefix}Reference")
+    if (
+        not present
+        or not isinstance(json_type, str)
+        or json_type not in CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_JSON_TYPES
+        or json_type == "absent"
+        or not isinstance(length_bucket, str)
+        or length_bucket not in CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_LENGTH_BUCKETS
+        or length_bucket == "absent"
+        or not isinstance(reference, str)
+        or not CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_REFERENCE.fullmatch(reference)
+    ):
+        return {
+            f"{prefix}Present": False,
+            f"{prefix}JsonType": "absent",
+            f"{prefix}LengthBucket": "absent",
+        }
+
+    summary = {
+        f"{prefix}Present": True,
+        f"{prefix}JsonType": json_type,
+        f"{prefix}LengthBucket": length_bucket,
+        f"{prefix}Reference": reference,
+    }
+    return summary
+
+
+def _has_safe_callback_provider_rejection_diagnostics(query: dict[str, Any]) -> bool:
+    """Return whether all v3 PayUni rejection summaries are canonical."""
+
+    for prefix in CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_PREFIXES:
+        present = query.get(f"{prefix}Present")
+        json_type = query.get(f"{prefix}JsonType")
+        length_bucket = query.get(f"{prefix}LengthBucket")
+        reference = query.get(f"{prefix}Reference")
+        if present is False:
+            if (
+                json_type != "absent"
+                or length_bucket != "absent"
+                or reference is not None
+            ):
+                return False
+        elif (
+            present is True
+            and isinstance(json_type, str)
+            and json_type in CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_JSON_TYPES
+            and json_type != "absent"
+            and isinstance(length_bucket, str)
+            and length_bucket in CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_LENGTH_BUCKETS
+            and length_bucket != "absent"
+            and isinstance(reference, str)
+            and CALLBACK_TRADE_QUERY_PROVIDER_DIAGNOSTIC_REFERENCE.fullmatch(reference)
+        ):
+            continue
+        else:
+            return False
+    return True
 
 
 def _write_receipt(report_dir: Path, result: dict[str, Any], output: str) -> Path:
