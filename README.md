@@ -810,8 +810,9 @@ An enabled policy with no trigger paths retains the conservative project-wide
 behavior; missing or malformed changed-file evidence also triggers review.
 
 Telegram delivery is optional and uses the official Bot API `sendMessage`
-endpoint. Keep these values in a watchdog-only environment file that is mode
-`0600` and is never committed:
+endpoint. Copy the orchestrator's tracked `.env.example` to its Git-ignored
+`.env.local`, keep that local file mode `0600`, and configure only the Watchdog
+service to load it:
 
 ```dotenv
 AI_TEAM_TELEGRAM_BOT_TOKEN=
