@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
 from ai_team.core.watchdog_ai_repair import (
+    MAX_REPAIR_CYCLES,
+    _compact_repair_cycles,
     _diagnosis_prompt,
     _last_json_object,
     _path_allowed,
+    _recent_repair_history,
+    _replan_prompt,
     _repair_prompt,
     _validation_feedback,
     _validate_write_paths,
@@ -60,6 +66,90 @@ class WatchdogAIRepairPolicyTests(unittest.TestCase):
 
         self.assertIn("PreviousQAFindings", prompt)
         self.assertIn("do not swallow click failures", prompt)
+
+    def test_replan_prompt_carries_rejected_qa_into_a_new_sol_plan(self) -> None:
+        prompt = _replan_prompt(
+            {},
+            {},
+            Path("/project"),
+            Path("/orchestrator"),
+            {"summary": "old blacklist repair"},
+            [{
+                "cycle": 3,
+                "changedFiles": ["scripts/check.mjs"],
+                "validation": {"success": True},
+                "qa": {
+                    "status": "failed",
+                    "summary": "unsafe blacklist",
+                    "findings": ["Use a structural representation instead."],
+                },
+            }],
+        )
+
+        self.assertIn("materially revised plan", prompt)
+        self.assertIn("Use a structural representation instead", prompt)
+        self.assertIn("RejectedDiagnosis", prompt)
+
+    def test_compact_repair_cycles_keeps_only_bounded_replanning_evidence(self) -> None:
+        cycles = [
+            {
+                "cycle": index,
+                "changedFiles": ["scripts/check.mjs"],
+                "validation": {"success": True},
+                "qa": {"status": "failed", "summary": f"failure {index}", "findings": []},
+            }
+            for index in range(1, MAX_REPAIR_CYCLES + 3)
+        ]
+
+        compact = _compact_repair_cycles(cycles)
+
+        self.assertEqual(len(compact), MAX_REPAIR_CYCLES)
+        self.assertEqual(compact[0]["cycle"], 3)
+        self.assertEqual(compact[-1]["qa"]["summary"], "failure 5")
+
+    def test_recent_repair_history_only_reuses_same_task_and_revision(self) -> None:
+        supervisor = {
+            "currentTask": {"taskSha": "task-sha"},
+            "externalQa": {"revision": "revision-a"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matching = {
+                "status": "failed",
+                "completedAt": "2026-07-20T00:00:00+00:00",
+                "error": "QA rejected",
+                "supervisorEvidence": supervisor,
+                "diagnosis": {"summary": "matching diagnosis"},
+                "repairCycles": [{
+                    "cycle": 3,
+                    "validation": {"success": True},
+                    "qa": {"status": "failed", "summary": "matching QA", "findings": []},
+                }],
+            }
+            unrelated = {
+                **matching,
+                "supervisorEvidence": {
+                    "currentTask": {"taskSha": "other-task"},
+                    "externalQa": {"revision": "revision-a"},
+                },
+            }
+            (root / "watchdog-ai-repair-1.json").write_text(
+                json.dumps(matching),
+                encoding="utf-8",
+            )
+            (root / "watchdog-ai-repair-2.json").write_text(
+                json.dumps(unrelated),
+                encoding="utf-8",
+            )
+
+            history = _recent_repair_history(supervisor, root)
+
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["error"], "QA rejected")
+        self.assertEqual(
+            history[0]["plans"][0]["repairCycles"][0]["qa"]["summary"],
+            "matching QA",
+        )
 
     def test_validation_feedback_uses_the_failing_command(self) -> None:
         feedback = _validation_feedback({

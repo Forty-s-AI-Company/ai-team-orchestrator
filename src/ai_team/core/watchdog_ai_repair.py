@@ -34,6 +34,8 @@ MAX_MODEL_OUTPUT_BYTES = 128_000
 MAX_PATCH_BYTES = 512_000
 MAX_WRITE_PATHS = 12
 MAX_REPAIR_CYCLES = 3
+MAX_REPLAN_CYCLES = 3
+MAX_REPAIR_HISTORY = 4
 MODEL_TIMEOUT_SECONDS = 1_200
 
 REPOSITORY_PREFIXES = {
@@ -96,114 +98,175 @@ def run_watchdog_ai_repair(
         report["diagnosisCommand"] = _command_summary(diagnosis_result)
         diagnosis = _validate_diagnosis(_last_json_object(diagnosis_result.stdout))
         report["diagnosis"] = diagnosis
-        if diagnosis["status"] != "repairable":
-            raise ValueError(f"Sol diagnosis is not repairable: {diagnosis['summary']}")
+        diagnosis_history: list[dict[str, Any]] = [{
+            "plan": 1,
+            "command": _command_summary(diagnosis_result),
+            "diagnosis": diagnosis,
+        }]
+        repair_plans: list[dict[str, Any]] = []
+        report["diagnosisHistory"] = diagnosis_history
+        report["repairPlans"] = repair_plans
 
-        repository = diagnosis["repository"]
-        source = project if repository == "project" else orchestrator
-        _require_clean_development_branch(source)
-        allowed_paths = _validate_write_paths(repository, diagnosis["allowedWritePaths"])
-        base_sha = _git(source, "rev-parse", "HEAD").stdout.strip()
-        branch = _git(source, "branch", "--show-current").stdout.strip()
-        worktree = source.parent / f"{source.name}-watchdog-repair-{uuid4().hex[:10]}"
-        _git(source, "worktree", "add", "--detach", str(worktree), base_sha)
-        if repository == "project":
-            dependency_link = prepare_dependency_link(worktree, source)
+        for plan_number in range(1, MAX_REPLAN_CYCLES + 1):
+            report["diagnosis"] = diagnosis
+            if diagnosis["status"] != "repairable":
+                raise ValueError(f"Sol diagnosis is not repairable: {diagnosis['summary']}")
 
-        feedback: list[str] = []
-        repair_cycles: list[dict[str, Any]] = []
-        for cycle in range(1, MAX_REPAIR_CYCLES + 1):
-            repair_result = _invoke_codex(
-                codex_executable,
-                model=repair_model,
-                reasoning_effort=reasoning_effort,
-                root=worktree,
-                write=True,
-                prompt=_repair_prompt(diagnosis, allowed_paths, feedback=feedback),
-            )
-            repair_command = _command_summary(repair_result)
-            report["repairCommand"] = repair_command
-            if _git(worktree, "rev-parse", "HEAD").stdout.strip() != base_sha:
-                raise ValueError("Terra must not create Git commits during the repair stage")
-            changed_files = _changed_files(worktree)
-            if not changed_files:
-                raise ValueError("Terra completed without producing a repair diff")
-            outside = [path for path in changed_files if not _path_allowed(path, allowed_paths)]
-            if outside:
-                raise ValueError(f"Terra changed files outside diagnosed scope: {', '.join(outside)}")
+            repository = diagnosis["repository"]
+            source = project if repository == "project" else orchestrator
+            _require_clean_development_branch(source)
+            allowed_paths = _validate_write_paths(repository, diagnosis["allowedWritePaths"])
+            base_sha = _git(source, "rev-parse", "HEAD").stdout.strip()
+            branch = _git(source, "branch", "--show-current").stdout.strip()
+            worktree = source.parent / f"{source.name}-watchdog-repair-{uuid4().hex[:10]}"
+            _git(source, "worktree", "add", "--detach", str(worktree), base_sha)
+            if repository == "project":
+                dependency_link = prepare_dependency_link(worktree, source)
 
-            _git(worktree, "add", "--", *changed_files)
-            patch = _git(
-                worktree,
-                "diff",
-                "--cached",
-                "--no-ext-diff",
-                "--binary",
-                "HEAD",
-            ).stdout
-            if len(patch.encode("utf-8")) > MAX_PATCH_BYTES:
-                raise ValueError("repair patch exceeds the bounded QA evidence limit")
-            candidate_hash = hashlib.sha256(patch.encode("utf-8", "replace")).hexdigest()
-            validation = _run_deterministic_qa(repository, source, worktree)
-            report["validation"] = validation
-            _assert_candidate_unchanged(worktree, changed_files, candidate_hash, "deterministic QA")
-            cycle_result: dict[str, Any] = {
-                "cycle": cycle,
-                "repairCommand": repair_command,
-                "changedFiles": changed_files,
-                "patchSha256": candidate_hash,
-                "validation": validation,
-            }
-            if validation.get("success") is not True:
+            feedback: list[str] = []
+            repair_cycles: list[dict[str, Any]] = []
+            plan_outcome = "repair-cycles-exhausted"
+            changed_files: list[str] = []
+            for cycle in range(1, MAX_REPAIR_CYCLES + 1):
+                repair_result = _invoke_codex(
+                    codex_executable,
+                    model=repair_model,
+                    reasoning_effort=reasoning_effort,
+                    root=worktree,
+                    write=True,
+                    prompt=_repair_prompt(diagnosis, allowed_paths, feedback=feedback),
+                )
+                repair_command = _command_summary(repair_result)
+                report["repairCommand"] = repair_command
+                if _git(worktree, "rev-parse", "HEAD").stdout.strip() != base_sha:
+                    raise ValueError("Terra must not create Git commits during the repair stage")
+                changed_files = _changed_files(worktree)
+                if not changed_files:
+                    raise ValueError("Terra completed without producing a repair diff")
+                outside = [path for path in changed_files if not _path_allowed(path, allowed_paths)]
+                if outside:
+                    raise ValueError(f"Terra changed files outside diagnosed scope: {', '.join(outside)}")
+
+                _git(worktree, "add", "--", *changed_files)
+                patch = _git(
+                    worktree,
+                    "diff",
+                    "--cached",
+                    "--no-ext-diff",
+                    "--binary",
+                    "HEAD",
+                ).stdout
+                if len(patch.encode("utf-8")) > MAX_PATCH_BYTES:
+                    raise ValueError("repair patch exceeds the bounded QA evidence limit")
+                candidate_hash = hashlib.sha256(patch.encode("utf-8", "replace")).hexdigest()
+                validation = _run_deterministic_qa(repository, source, worktree)
+                report["validation"] = validation
+                _assert_candidate_unchanged(worktree, changed_files, candidate_hash, "deterministic QA")
+                cycle_result: dict[str, Any] = {
+                    "cycle": cycle,
+                    "repairCommand": repair_command,
+                    "changedFiles": changed_files,
+                    "patchSha256": candidate_hash,
+                    "validation": validation,
+                }
+                if validation.get("success") is not True:
+                    repair_cycles.append(cycle_result)
+                    report["repairCycles"] = repair_cycles
+                    if validation.get("kind") == "execution-environment":
+                        raise ValueError("deterministic QA execution environment failed")
+                    feedback = _validation_feedback(validation)
+                    plan_outcome = "deterministic-qa-failed"
+                    if cycle == MAX_REPAIR_CYCLES:
+                        break
+                    continue
+
+                qa_result = _invoke_codex(
+                    codex_executable,
+                    model=diagnosis_model,
+                    reasoning_effort=reasoning_effort,
+                    root=worktree,
+                    write=False,
+                    prompt=_qa_prompt(diagnosis, validation, patch),
+                )
+                qa_command = _command_summary(qa_result)
+                qa = _validate_qa(_last_json_object(qa_result.stdout))
+                report["qaCommand"] = qa_command
+                report["qa"] = qa
+                cycle_result.update({"qaCommand": qa_command, "qa": qa})
                 repair_cycles.append(cycle_result)
                 report["repairCycles"] = repair_cycles
-                if validation.get("kind") == "execution-environment":
-                    raise ValueError("deterministic QA execution environment failed")
-                feedback = _validation_feedback(validation)
+                _assert_candidate_unchanged(worktree, changed_files, candidate_hash, "Codex QA")
+                if qa["status"] == "passed" and not qa["findings"]:
+                    plan_outcome = "passed"
+                    break
+                feedback = qa["findings"] or [qa["summary"]]
+                plan_outcome = "codex-qa-rejected"
                 if cycle == MAX_REPAIR_CYCLES:
-                    raise ValueError("deterministic QA failed after maximum repair cycles")
-                continue
+                    break
 
-            qa_result = _invoke_codex(
+            repair_plan = {
+                "plan": plan_number,
+                "diagnosis": diagnosis,
+                "outcome": plan_outcome,
+                "repairCycles": repair_cycles,
+            }
+            repair_plans.append(repair_plan)
+            report["repairPlans"] = repair_plans
+            if plan_outcome == "passed":
+                _git(worktree, "commit", "-m", f"fix(ai-team): {diagnosis['summary'][:72]}")
+                repair_sha = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+                if _git(source, "rev-parse", "HEAD").stdout.strip() != base_sha:
+                    raise ValueError("source branch changed during automatic repair")
+                if _git(source, "status", "--porcelain").stdout.strip():
+                    raise ValueError("source repository became dirty during automatic repair")
+                _git(source, "merge", "--ff-only", repair_sha)
+                _git(source, "push", "origin", f"HEAD:{branch}", timeout=180)
+                report.update({
+                    "status": "passed",
+                    "repository": repository,
+                    "sourceRoot": str(source),
+                    "baseSha": base_sha,
+                    "repairSha": repair_sha,
+                    "branch": branch,
+                    "changedFiles": changed_files,
+                })
+                return _finish(
+                    report,
+                    reports,
+                    success=True,
+                    diagnostic="Sol diagnosis, Terra repair, replanning, and QA passed",
+                )
+
+            _discard_candidate(source, worktree, dependency_link)
+            worktree = None
+            dependency_link = None
+            source = None
+            if plan_number == MAX_REPLAN_CYCLES:
+                raise ValueError("repair rejected after maximum Sol replanning cycles")
+
+            replan_result = _invoke_codex(
                 codex_executable,
                 model=diagnosis_model,
                 reasoning_effort=reasoning_effort,
-                root=worktree,
+                root=orchestrator,
                 write=False,
-                prompt=_qa_prompt(diagnosis, validation, patch),
+                prompt=_replan_prompt(
+                    supervisor,
+                    evidence,
+                    project,
+                    orchestrator,
+                    diagnosis,
+                    repair_cycles,
+                ),
             )
-            qa_command = _command_summary(qa_result)
-            qa = _validate_qa(_last_json_object(qa_result.stdout))
-            report["qaCommand"] = qa_command
-            report["qa"] = qa
-            cycle_result.update({"qaCommand": qa_command, "qa": qa})
-            repair_cycles.append(cycle_result)
-            report["repairCycles"] = repair_cycles
-            _assert_candidate_unchanged(worktree, changed_files, candidate_hash, "Codex QA")
-            if qa["status"] == "passed" and not qa["findings"]:
-                break
-            feedback = qa["findings"] or [qa["summary"]]
-            if cycle == MAX_REPAIR_CYCLES:
-                raise ValueError("Codex QA rejected the repair after maximum repair cycles")
-
-        _git(worktree, "commit", "-m", f"fix(ai-team): {diagnosis['summary'][:72]}")
-        repair_sha = _git(worktree, "rev-parse", "HEAD").stdout.strip()
-        if _git(source, "rev-parse", "HEAD").stdout.strip() != base_sha:
-            raise ValueError("source branch changed during automatic repair")
-        if _git(source, "status", "--porcelain").stdout.strip():
-            raise ValueError("source repository became dirty during automatic repair")
-        _git(source, "merge", "--ff-only", repair_sha)
-        _git(source, "push", "origin", f"HEAD:{branch}", timeout=180)
-        report.update({
-            "status": "passed",
-            "repository": repository,
-            "sourceRoot": str(source),
-            "baseSha": base_sha,
-            "repairSha": repair_sha,
-            "branch": branch,
-            "changedFiles": changed_files,
-        })
-        return _finish(report, reports, success=True, diagnostic="Sol diagnosis, Terra repair, and QA passed")
+            diagnosis = _validate_diagnosis(_last_json_object(replan_result.stdout))
+            report["diagnosisCommand"] = _command_summary(replan_result)
+            diagnosis_history.append({
+                "plan": plan_number + 1,
+                "command": _command_summary(replan_result),
+                "diagnosis": diagnosis,
+            })
+            report["diagnosisHistory"] = diagnosis_history
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         report["status"] = "failed"
         report["error"] = str(redact_secrets(str(exc)))[:500]
@@ -253,6 +316,39 @@ def _diagnosis_prompt(
         '"allowedWritePaths":["exact/relative/path"]}',
         f"SupervisorEvidence={json.dumps(redact_secrets(supervisor), ensure_ascii=False)}",
         f"FailureEvidence={json.dumps(redact_secrets(evidence), ensure_ascii=False)}",
+    ))
+
+
+def _replan_prompt(
+    supervisor: dict[str, Any],
+    evidence: dict[str, Any],
+    project: Path,
+    orchestrator: Path,
+    previous_diagnosis: dict[str, Any],
+    repair_cycles: list[dict[str, Any]],
+) -> str:
+    return "\n".join((
+        "You are the read-only incident diagnostician replanning a rejected autonomous repair.",
+        f"Product repository: {project}",
+        f"Orchestrator repository: {orchestrator}",
+        "The previous Terra implementation exhausted three repair/QA cycles. Inspect both repositories again.",
+        "Use every QA finding below as new root-cause evidence. Produce a materially revised plan instead of",
+        "repeating the rejected design. You may change repository or exact write paths when the evidence supports it.",
+        "Prefer structural solutions that make unsafe states unrepresentable over expanding semantic blacklists.",
+        "Treat safe observability improvements as repairable, but never request credentials, production access,",
+        "real payments, external-service changes, migrations/seeds, destructive actions, .env, .git, or systemd writes.",
+        "Return JSON only without Markdown using this exact shape:",
+        '{"schema":"ai-team-watchdog-diagnosis/v1","status":"repairable|unrepairable",'
+        '"repository":"project|orchestrator","summary":"short Chinese summary",'
+        '"rootCause":"revised evidence-backed cause","repairInstruction":"materially revised bounded instruction",'
+        '"allowedWritePaths":["exact/relative/path"]}',
+        f"SupervisorEvidence={json.dumps(redact_secrets(supervisor), ensure_ascii=False)}",
+        f"FailureEvidence={json.dumps(redact_secrets(evidence), ensure_ascii=False)}",
+        f"RejectedDiagnosis={json.dumps(redact_secrets(previous_diagnosis), ensure_ascii=False)}",
+        (
+            "RejectedRepairCycles="
+            f"{json.dumps(redact_secrets(_compact_repair_cycles(repair_cycles)), ensure_ascii=False)}"
+        ),
     ))
 
 
@@ -370,6 +466,26 @@ def _validation_feedback(validation: dict[str, Any]) -> list[str]:
     return ["Deterministic QA reported failure without a failing command."]
 
 
+def _compact_repair_cycles(repair_cycles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for item in repair_cycles[-MAX_REPAIR_CYCLES:]:
+        validation = item.get("validation") if isinstance(item, dict) else None
+        qa = item.get("qa") if isinstance(item, dict) else None
+        compact.append({
+            "cycle": item.get("cycle") if isinstance(item, dict) else None,
+            "changedFiles": item.get("changedFiles", []) if isinstance(item, dict) else [],
+            "validationSuccess": (
+                validation.get("success") if isinstance(validation, dict) else None
+            ),
+            "validationFeedback": (
+                _validation_feedback(validation) if isinstance(validation, dict)
+                and validation.get("success") is not True else []
+            ),
+            "qa": qa if isinstance(qa, dict) else None,
+        })
+    return compact
+
+
 def _validate_write_paths(repository: str, values: list[Any]) -> list[str]:
     if not values or len(values) > MAX_WRITE_PATHS:
         raise ValueError("diagnosed write scope must contain 1 to 12 paths")
@@ -429,23 +545,112 @@ def _run_deterministic_qa(repository: str, source: Path, worktree: Path) -> dict
 
 
 def _failure_evidence(supervisor: dict[str, Any], report_dir: Path) -> dict[str, Any]:
+    receipt: dict[str, Any] = {}
     external = supervisor.get("externalQa")
     receipt_value = external.get("receiptPath") if isinstance(external, dict) else None
-    if not isinstance(receipt_value, str):
-        return {}
-    path = Path(receipt_value)
+    if isinstance(receipt_value, str):
+        path = Path(receipt_value)
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(report_dir)
+            if (
+                resolved.is_file()
+                and not resolved.is_symlink()
+                and resolved.stat().st_size <= 1_000_000
+            ):
+                payload = json.loads(resolved.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    receipt = payload
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    return {
+        "externalQaReceipt": receipt,
+        "previousRepairAttempts": _recent_repair_history(supervisor, report_dir),
+    }
+
+
+def _recent_repair_history(
+    supervisor: dict[str, Any],
+    report_dir: Path,
+) -> list[dict[str, Any]]:
+    task = supervisor.get("currentTask")
+    external = supervisor.get("externalQa")
+    task_sha = task.get("taskSha") if isinstance(task, dict) else None
+    revision = external.get("revision") if isinstance(external, dict) else None
+    if not isinstance(task_sha, str) or not task_sha:
+        return []
+
+    history: list[dict[str, Any]] = []
     try:
-        resolved = path.resolve(strict=True)
-        resolved.relative_to(report_dir)
-    except (OSError, ValueError):
-        return {}
-    if not resolved.is_file() or resolved.is_symlink() or resolved.stat().st_size > 1_000_000:
-        return {}
-    try:
-        payload = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+        paths = sorted(
+            report_dir.glob("watchdog-ai-repair-*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return []
+    for path in paths[:40]:
+        if len(history) >= MAX_REPAIR_HISTORY:
+            break
+        try:
+            if path.is_symlink() or path.stat().st_size > 2_000_000:
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("status") != "failed":
+            continue
+        prior_supervisor = payload.get("supervisorEvidence")
+        prior_task = prior_supervisor.get("currentTask") if isinstance(prior_supervisor, dict) else None
+        prior_external = prior_supervisor.get("externalQa") if isinstance(prior_supervisor, dict) else None
+        if not isinstance(prior_task, dict) or prior_task.get("taskSha") != task_sha:
+            continue
+        if isinstance(revision, str) and revision:
+            if not isinstance(prior_external, dict) or prior_external.get("revision") != revision:
+                continue
+        plans = payload.get("repairPlans")
+        if not isinstance(plans, list):
+            plans = [{
+                "plan": 1,
+                "diagnosis": payload.get("diagnosis"),
+                "outcome": payload.get("error"),
+                "repairCycles": payload.get("repairCycles", []),
+            }]
+        history.append({
+            "completedAt": payload.get("completedAt"),
+            "error": payload.get("error"),
+            "plans": [
+                {
+                    "plan": plan.get("plan"),
+                    "diagnosis": plan.get("diagnosis"),
+                    "outcome": plan.get("outcome"),
+                    "repairCycles": _compact_repair_cycles(
+                        plan.get("repairCycles") if isinstance(plan.get("repairCycles"), list) else []
+                    ),
+                }
+                for plan in plans[-MAX_REPLAN_CYCLES:]
+                if isinstance(plan, dict)
+            ],
+        })
+    return history
+
+
+def _discard_candidate(
+    source: Path,
+    worktree: Path,
+    dependency_link: Path | None,
+) -> None:
+    remove_dependency_link(dependency_link)
+    completed = subprocess.run(
+        ["git", "-C", str(source), "worktree", "remove", "--force", str(worktree)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if completed.returncode != 0:
+        error = str(redact_secrets(completed.stderr))[-2_000:]
+        raise ValueError(f"failed to discard rejected repair worktree: {error}")
 
 
 def _changed_files(root: Path) -> list[str]:
