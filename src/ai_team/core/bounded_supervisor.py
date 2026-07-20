@@ -478,12 +478,11 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
 
             external_qa: dict[str, Any] | None = None
             if options.github_execute and publication is not None and publication.get("success") is True:
-                # The disposable worktree is gone/merged at this point.  Run
-                # the staging browser test against the synced source project,
-                # where the ignored .env.local is available.
+                # External payment QA is a human-only attestation gate.  The
+                # runner builds its requirement without reading source env
+                # files or running a command.
                 project_profile_path = options.project_path / ".ai-team" / "project.yaml"
-                env_file_path = options.project_path / ".env.local"
-                if project_profile_path.is_file() and env_file_path.is_file():
+                if project_profile_path.is_file():
                     loaded_source = load_project(
                         options.project_path,
                         allowlist=options.workspace_allowlist,
@@ -496,10 +495,9 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                         loaded_source,
                         source_revision,
                         options.report_dir / "external-qa",
-                        prior=prior.get("externalQa") if isinstance(prior, dict) else None,
                     )
                     external_qa = qa_result.result
-                    if qa_result.status in {"failed", "blocked"}:
+                    if qa_result.status == "review-required":
                         state = _supervisor_state(
                             running,
                             cycles,
@@ -507,7 +505,7 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                             completed,
                             queue_size=_pending_count(entries, completed),
                             current=selected,
-                            stop_reason="external-qa-failed" if qa_result.status == "failed" else "external-qa-blocked",
+                            stop_reason="external-qa-human-attestation-required",
                             next_action="manual-review-required",
                             delivery_result=effective_result,
                             publication=publication,

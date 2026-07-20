@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -67,17 +67,16 @@ class SafetyPolicy(BaseModel):
 
 
 class ExternalQAConfig(BaseModel):
-    """A narrow, staging-only QA command executed outside disposable worktrees.
+    """Policy for a human-only external QA review gate.
 
-    External QA is intentionally separate from ``commands.additional_validation``:
-    it may need credentials from the source project's ignored ``.env.local`` and
-    may exercise a real staging provider.  The runner still accepts only a fixed
-    command allowlist and never enables production actions.
+    ``enabled`` requires a reviewer attestation; it never authorizes the
+    orchestrator to execute a payment, refund, browser, or provider command.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    execution_mode: Literal["manual-attestation-only"] = "manual-attestation-only"
     environment: str = "staging"
     command: str = "npm run qa:payuni:sandbox"
     run_once_per_revision: bool = True

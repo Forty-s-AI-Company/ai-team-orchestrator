@@ -400,6 +400,57 @@ safety:
             self.assertEqual(result["stopReason"], "architect-requires-product-decision")
             self.assertEqual(published, [])
 
+    def test_external_qa_human_attestation_stops_before_marking_task_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "AI Team Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            profile = root / ".ai-team" / "project.yaml"
+            profile.parent.mkdir()
+            profile.write_text(
+                """project:
+  name: external-qa-test
+  root: .
+external_qa:
+  enabled: true
+""",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", ".ai-team/project.yaml"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
+            contracts = Path(tmp) / "contracts"
+            contracts.mkdir()
+            contract_path = _write_contract(contracts / "001-task.json", "task")
+            task_sha = load_trusted_task_contract(contract_path)[1]
+
+            result = run_continuous_bounded_delivery(
+                ContinuousBoundedOptions(
+                    project_path=root,
+                    contract_dir=contracts,
+                    provider_for_role=lambda _role: _NoopProvider(),
+                    workspace_allowlist=[tmp],
+                    report_dir=Path(tmp) / "reports",
+                    state_path=Path(tmp) / "state.json",
+                    once=True,
+                    github_execute=True,
+                    auto_merge=True,
+                    delivery_runner=lambda _options: {
+                        "status": "completed",
+                        "taskSha": task_sha,
+                        "commitSha": "a" * 40,
+                    },
+                    publisher=lambda _options, _entry, _result: {"success": True},
+                )
+            )
+
+            self.assertEqual(result["status"], "attention-required")
+            self.assertEqual(result["stopReason"], "external-qa-human-attestation-required")
+            self.assertEqual(result["nextAction"], "manual-review-required")
+            self.assertEqual(result["completedTaskShas"], [])
+            self.assertEqual(result["externalQa"]["status"], "review-required")
+
     def test_transient_provider_failure_waits_and_retries_same_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
