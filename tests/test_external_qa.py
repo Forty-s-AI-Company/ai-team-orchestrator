@@ -102,17 +102,7 @@ class ExternalQATests(unittest.TestCase):
             "providerChecks": {
                 "providerChecks": {
                     "callbackTradeQueries": [
-                        {
-                            field: "<truncated: maximum depth>"
-                            for field in (
-                                "attempt",
-                                "querySucceeded",
-                                "tradeStatus",
-                                "tradeNoPresent",
-                                "flowStage",
-                                "errorCategory",
-                            )
-                        }
+                        {"providerSignals": "<truncated: maximum depth>"}
                     ]
                 }
             },
@@ -154,15 +144,7 @@ class ExternalQATests(unittest.TestCase):
         loaded = load_project(root)
         revision = "h" * 40
         legacy_query = {
-            field: "<truncated: maximum depth>"
-            for field in (
-                "attempt",
-                "querySucceeded",
-                "tradeStatus",
-                "tradeNoPresent",
-                "flowStage",
-                "errorCategory",
-            )
+            "providerSignals": "<truncated: maximum depth>"
         }
         complete_query = {
             "attempt": 3,
@@ -171,6 +153,13 @@ class ExternalQATests(unittest.TestCase):
             "tradeNoPresent": True,
             "flowStage": "callback-received",
             "errorCategory": None,
+            "providerSignals": {
+                "tradeNotFound": False,
+                "authentication": False,
+                "invalidRequest": False,
+                "processing": False,
+                "providerRejection": True,
+            },
         }
         prior = {
             "schema": "ai-team-external-qa-receipt/v1",
@@ -193,15 +182,7 @@ class ExternalQATests(unittest.TestCase):
         loaded = load_project(root)
         revision = "i" * 40
         truncated_query = {
-            field: "<truncated: maximum depth>"
-            for field in (
-                "attempt",
-                "querySucceeded",
-                "tradeStatus",
-                "tradeNoPresent",
-                "flowStage",
-                "errorCategory",
-            )
+            "providerSignals": "<truncated: maximum depth>"
         }
         prior = {
             "schema": "ai-team-external-qa-receipt/v1",
@@ -246,6 +227,13 @@ class ExternalQATests(unittest.TestCase):
             "tradeNoPresent": True,
             "flowStage": "callback-received",
             "errorCategory": None,
+            "providerSignals": {
+                "tradeNotFound": False,
+                "authentication": False,
+                "invalidRequest": False,
+                "processing": False,
+                "providerRejection": True,
+            },
         }
 
         for status in ("failed", "passed"):
@@ -323,6 +311,25 @@ class ExternalQATests(unittest.TestCase):
                             "errorCategory": None,
                             "apiKey": "sensitive-payuni-credential",
                             "deeperEvidence": {"mustRemainBounded": "value"},
+                            "providerSignals": {
+                                "tradeNotFound": True,
+                                "authentication": False,
+                                "invalidRequest": True,
+                                "processing": False,
+                                "providerRejection": True,
+                                "apiKey": "provider-signals-secret",
+                                "unexpected": "must-not-escape",
+                            },
+                        },
+                        {
+                            "providerSignals": {
+                                "tradeNotFound": "not-a-boolean",
+                                "authentication": 1,
+                                "invalidRequest": None,
+                                "processing": {"token": "also-secret"},
+                                "providerRejection": ["not", "a", "boolean"],
+                                "apiKey": "another-provider-signals-secret",
+                            },
                         }
                     ]
                 }
@@ -348,11 +355,30 @@ class ExternalQATests(unittest.TestCase):
         self.assertEqual(attempt["flowStage"], "callback-received")
         self.assertIsNone(attempt["errorCategory"])
         self.assertEqual(attempt["deeperEvidence"], "<truncated: maximum depth>")
+        self.assertEqual(
+            attempt["providerSignals"],
+            {
+                "tradeNotFound": True,
+                "authentication": False,
+                "invalidRequest": True,
+                "processing": False,
+                "providerRejection": True,
+            },
+        )
+        self.assertEqual(
+            result.result["providerChecks"]["providerChecks"]["callbackTradeQueries"][1]["providerSignals"],
+            {},
+        )
 
         receipt = json.loads(result.receipt_path.read_text(encoding="utf-8"))
         receipt_attempt = receipt["providerChecks"]["providerChecks"]["callbackTradeQueries"][0]
         self.assertEqual(receipt_attempt["apiKey"], "<redacted>")
-        self.assertNotIn("sensitive-payuni-credential", result.receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(receipt_attempt["providerSignals"], attempt["providerSignals"])
+        receipt_text = result.receipt_path.read_text(encoding="utf-8")
+        self.assertNotIn("sensitive-payuni-credential", receipt_text)
+        self.assertNotIn("provider-signals-secret", receipt_text)
+        self.assertNotIn("another-provider-signals-secret", receipt_text)
+        self.assertNotIn("must-not-escape", receipt_text)
 
     def test_provider_check_summary_is_bounded_and_redacted_in_receipt(self) -> None:
         root = self._project()

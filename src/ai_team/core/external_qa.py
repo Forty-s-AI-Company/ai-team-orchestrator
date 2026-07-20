@@ -34,13 +34,12 @@ MAX_CHECK_FIELDS = 20
 MAX_CHECK_ITEMS = 20
 MAX_CHECK_STRING_CHARS = 300
 TRUNCATED_DEPTH_MARKER = "<truncated: maximum depth>"
-CALLBACK_TRADE_QUERY_DIAGNOSTIC_FIELDS = (
-    "attempt",
-    "querySucceeded",
-    "tradeStatus",
-    "tradeNoPresent",
-    "flowStage",
-    "errorCategory",
+CALLBACK_TRADE_QUERY_PROVIDER_SIGNAL_FIELDS = (
+    "tradeNotFound",
+    "authentication",
+    "invalidRequest",
+    "processing",
+    "providerRejection",
 )
 LEGACY_CALLBACK_TRADE_QUERIES_RERUN_VERSION = 1
 LEGACY_CALLBACK_TRADE_QUERIES_RERUN_REASON = "legacy-truncated-callback-trade-queries"
@@ -256,12 +255,12 @@ def _has_legacy_truncated_callback_trade_queries(receipt: dict[str, Any]) -> boo
     callback_trade_queries = provider_checks.get("callbackTradeQueries")
     if not isinstance(callback_trade_queries, list) or not callback_trade_queries:
         return False
-    # The old serializer produced this exact shape for every recorded query.
-    # A single truncated entry alongside useful evidence is not a legacy
-    # receipt and must remain subject to the normal run-once cache.
+    # ``providerSignals`` was a nested object at the old depth boundary.  A
+    # legacy receipt therefore has this exact marker in every recorded query;
+    # mixed evidence is not an eligible legacy shape and stays cached.
     return all(
         isinstance(query, dict)
-        and all(query.get(field) == TRUNCATED_DEPTH_MARKER for field in CALLBACK_TRADE_QUERY_DIAGNOSTIC_FIELDS)
+        and query.get("providerSignals") == TRUNCATED_DEPTH_MARKER
         for query in callback_trade_queries
     )
 
@@ -281,17 +280,19 @@ def _safe_checks(parsed: dict[str, Any]) -> dict[str, Any] | None:
     checks = parsed.get("checks")
     if not isinstance(checks, dict):
         return None
-    safe = _safe_check_value(checks, depth=0)
+    safe = _safe_check_value(checks, depth=0, path=())
     return safe if isinstance(safe, dict) else None
 
 
-def _safe_check_value(value: Any, *, depth: int) -> Any:
+def _safe_check_value(value: Any, *, depth: int, path: tuple[str, ...]) -> Any:
     """Keep bounded, JSON-shaped provider evidence for a redacted receipt."""
 
-    # Leaf evidence at the depth boundary is useful for callback diagnostics:
-    # checks -> providerChecks -> callbackTradeQueries -> attempt -> field.
-    # Bound nesting applies to containers, while scalar values at that boundary
-    # remain safe under their existing type and length limits.
+    # Leaf evidence at the depth boundary remains safe under its existing type
+    # and length limits.  The one exception below is deliberately narrow: the
+    # nested PayUni classification object is necessary to diagnose a failed
+    # callback, but it must not become a general depth-limit bypass.
+    if path == ("providerChecks", "callbackTradeQueries", "providerSignals"):
+        return _safe_callback_trade_query_provider_signals(value)
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -314,11 +315,30 @@ def _safe_check_value(value: Any, *, depth: int) -> Any:
             if SECRET_KEY_PATTERN.search(key):
                 summary[safe_key] = "<redacted>" if item else item
             else:
-                summary[safe_key] = _safe_check_value(item, depth=depth + 1)
+                summary[safe_key] = _safe_check_value(
+                    item,
+                    depth=depth + 1,
+                    path=path + (key,),
+                )
         return summary
     if isinstance(value, list):
-        return [_safe_check_value(item, depth=depth + 1) for item in value[:MAX_CHECK_ITEMS]]
+        return [
+            _safe_check_value(item, depth=depth + 1, path=path)
+            for item in value[:MAX_CHECK_ITEMS]
+        ]
     return "<unsupported value>"
+
+
+def _safe_callback_trade_query_provider_signals(value: Any) -> dict[str, bool]:
+    """Serialize only the fixed boolean PayUni callback classifications."""
+
+    if not isinstance(value, dict):
+        return {}
+    return {
+        field: value[field]
+        for field in CALLBACK_TRADE_QUERY_PROVIDER_SIGNAL_FIELDS
+        if isinstance(value.get(field), bool)
+    }
 
 
 def _write_receipt(report_dir: Path, result: dict[str, Any], output: str) -> Path:
