@@ -291,7 +291,7 @@ class ExternalQATests(unittest.TestCase):
         self.assertEqual(provider_checks["checkoutHttpStatus"], 302)
         self.assertEqual(provider_checks["visiblePayUniStatus"], "等待 PayUni 回傳付款結果")
 
-    def test_callback_trade_query_attempt_leaves_are_preserved_at_depth_boundary(self) -> None:
+    def test_callback_trade_query_attempt_uses_order_independent_payuni_summary(self) -> None:
         root = self._project()
         loaded = load_project(root)
         payload = {
@@ -320,6 +320,14 @@ class ExternalQATests(unittest.TestCase):
                                 "apiKey": "provider-signals-secret",
                                 "unexpected": "must-not-escape",
                             },
+                            "providerResultType": "object",
+                            "providerResultFields": [
+                                "MerchantOrderNo",
+                                "TradeNo",
+                                "RespondCode",
+                                "apiKey",
+                                "unexpected",
+                            ],
                         },
                         {
                             "providerSignals": {
@@ -354,7 +362,6 @@ class ExternalQATests(unittest.TestCase):
         )
         self.assertEqual(attempt["flowStage"], "callback-received")
         self.assertIsNone(attempt["errorCategory"])
-        self.assertEqual(attempt["deeperEvidence"], "<truncated: maximum depth>")
         self.assertEqual(
             attempt["providerSignals"],
             {
@@ -365,6 +372,13 @@ class ExternalQATests(unittest.TestCase):
                 "providerRejection": True,
             },
         )
+        self.assertEqual(attempt["providerResultType"], "object")
+        self.assertEqual(
+            attempt["providerResultFields"],
+            ["MerchantOrderNo", "TradeNo", "RespondCode"],
+        )
+        self.assertNotIn("apiKey", attempt)
+        self.assertNotIn("deeperEvidence", attempt)
         self.assertEqual(
             result.result["providerChecks"]["providerChecks"]["callbackTradeQueries"][1]["providerSignals"],
             {},
@@ -372,13 +386,115 @@ class ExternalQATests(unittest.TestCase):
 
         receipt = json.loads(result.receipt_path.read_text(encoding="utf-8"))
         receipt_attempt = receipt["providerChecks"]["providerChecks"]["callbackTradeQueries"][0]
-        self.assertEqual(receipt_attempt["apiKey"], "<redacted>")
         self.assertEqual(receipt_attempt["providerSignals"], attempt["providerSignals"])
         receipt_text = result.receipt_path.read_text(encoding="utf-8")
         self.assertNotIn("sensitive-payuni-credential", receipt_text)
         self.assertNotIn("provider-signals-secret", receipt_text)
         self.assertNotIn("another-provider-signals-secret", receipt_text)
         self.assertNotIn("must-not-escape", receipt_text)
+
+    def test_callback_trade_query_result_shape_survives_more_than_twenty_prior_fields(self) -> None:
+        root = self._project()
+        loaded = load_project(root)
+        attempt = {f"safeButUnknown{index}": index for index in range(MAX_CHECK_FIELDS)}
+        attempt.update(
+            {
+                "attempt": 3,
+                "flowStage": "provider-result",
+                "querySucceeded": False,
+                "providerSignals": {"providerRejection": True, "token": "must-not-escape"},
+                "providerResultType": "object",
+                "providerResultFields": [
+                    "TradeNo",
+                    "RespondCode",
+                    "MerchantOrderNo",
+                    "unknownField",
+                    "apiKey",
+                ],
+                "providerResult": {"apiKey": "must-not-escape", "unknown": "must-not-escape"},
+            }
+        )
+        payload = {
+            "schema": "celebratedeal-payuni-sandbox-qa/v1",
+            "success": False,
+            "environment": "sandbox",
+            "checks": {"providerChecks": {"callbackTradeQueries": [attempt]}},
+            "productionValidation": {"automatedChargeAllowed": False},
+        }
+        completed = subprocess.CompletedProcess(
+            ["npm", "run", "qa:payuni:sandbox"], 1, json.dumps(payload) + "\n", ""
+        )
+
+        with patch("ai_team.core.external_qa.subprocess.run", return_value=completed):
+            result = run_external_qa(loaded, "j" * 40, root / "reports")
+
+        summary = result.result["providerChecks"]["providerChecks"]["callbackTradeQueries"][0]
+        self.assertEqual(summary["providerResultType"], "object")
+        self.assertEqual(
+            summary["providerResultFields"],
+            ["TradeNo", "RespondCode", "MerchantOrderNo"],
+        )
+        self.assertEqual(summary["providerSignals"], {"providerRejection": True})
+        self.assertNotIn("safeButUnknown0", summary)
+        self.assertNotIn("providerResult", summary)
+        receipt_text = result.receipt_path.read_text(encoding="utf-8")
+        self.assertNotIn("must-not-escape", receipt_text)
+        self.assertNotIn("unknownField", receipt_text)
+
+    def test_version_one_provider_result_receipt_reruns_once_for_version_two_shape(self) -> None:
+        root = self._project()
+        loaded = load_project(root)
+        revision = "k" * 40
+        prior = {
+            "schema": "ai-team-external-qa-receipt/v1",
+            "revision": revision,
+            "status": "failed",
+            "diagnosticRerun": {
+                "version": 1,
+                "reason": "legacy-truncated-callback-trade-queries",
+            },
+            "providerChecks": {
+                "providerChecks": {
+                    "callbackTradeQueries": [
+                        {"attempt": 3, "flowStage": "provider-result", "providerSignals": {}}
+                    ]
+                }
+            },
+        }
+        payload = {
+            "schema": "celebratedeal-payuni-sandbox-qa/v1",
+            "success": False,
+            "environment": "sandbox",
+            "checks": {
+                "providerChecks": {
+                    "callbackTradeQueries": [
+                        {
+                            "attempt": 3,
+                            "flowStage": "provider-result",
+                            "providerResultType": "object",
+                            "providerResultFields": ["TradeNo"],
+                        }
+                    ]
+                }
+            },
+            "productionValidation": {"automatedChargeAllowed": False},
+        }
+        completed = subprocess.CompletedProcess(
+            ["npm", "run", "qa:payuni:sandbox"], 1, json.dumps(payload) + "\n", ""
+        )
+
+        with patch("ai_team.core.external_qa.subprocess.run", return_value=completed) as run:
+            replacement = run_external_qa(loaded, revision, root / "reports", prior=prior)
+            persisted = json.loads(replacement.receipt_path.read_text(encoding="utf-8"))
+            cached = run_external_qa(loaded, revision, root / "reports", prior=persisted)
+
+        self.assertEqual(
+            replacement.result["diagnosticRerun"],
+            {"version": 2, "reason": "missing-provider-result-shape"},
+        )
+        self.assertEqual(persisted["diagnosticRerun"]["version"], 2)
+        self.assertEqual(cached.result["reason"], "already-run-for-revision")
+        run.assert_called_once()
 
     def test_provider_check_summary_is_bounded_and_redacted_in_receipt(self) -> None:
         root = self._project()

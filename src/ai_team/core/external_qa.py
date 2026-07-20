@@ -41,8 +41,51 @@ CALLBACK_TRADE_QUERY_PROVIDER_SIGNAL_FIELDS = (
     "processing",
     "providerRejection",
 )
+CALLBACK_TRADE_QUERY_SCALAR_FIELDS = (
+    "attempt",
+    "querySucceeded",
+    "tradeStatus",
+    "tradeNoPresent",
+    "currentHttpsHostPath",
+    "flowStage",
+    "errorCategory",
+)
+CALLBACK_TRADE_QUERY_PROVIDER_RESULT_TYPES = frozenset(
+    {"array", "boolean", "missing", "null", "number", "object", "string", "undefined"}
+)
+# These are PayUni's documented callback/query result names.  The receipt
+# records names only, never provider values, and remains deliberately bounded.
+CALLBACK_TRADE_QUERY_PROVIDER_RESULT_FIELDS = frozenset(
+    {
+        "Amt",
+        "Auth",
+        "AuthBank",
+        "Card4No",
+        "Card6No",
+        "ECI",
+        "EscrowType",
+        "IP",
+        "Inst",
+        "InstEach",
+        "InstFirst",
+        "MerchantID",
+        "MerchantOrderNo",
+        "PayTime",
+        "PaymentMethod",
+        "PaymentType",
+        "RespondCode",
+        "RespondType",
+        "Status",
+        "TokenUseStatus",
+        "TradeNo",
+        "Version",
+    }
+)
+MAX_CALLBACK_TRADE_QUERY_PROVIDER_RESULT_FIELDS = 12
 LEGACY_CALLBACK_TRADE_QUERIES_RERUN_VERSION = 1
 LEGACY_CALLBACK_TRADE_QUERIES_RERUN_REASON = "legacy-truncated-callback-trade-queries"
+PROVIDER_RESULT_SHAPE_RERUN_VERSION = 2
+PROVIDER_RESULT_SHAPE_RERUN_REASON = "missing-provider-result-shape"
 
 
 @dataclass(frozen=True)
@@ -96,18 +139,30 @@ def run_external_qa(
         )
 
     previous = prior if isinstance(prior, dict) else {}
-    should_rerun_legacy_failure = False
+    diagnostic_rerun: dict[str, Any] | None = None
     if config.run_once_per_revision and previous.get("revision") == revision:
         previous_status = str(previous.get("status") or "")
-        should_rerun_legacy_failure = (
-            previous_status == "failed"
-            and not _legacy_callback_trade_queries_rerun_was_performed(previous)
-            and _has_legacy_truncated_callback_trade_queries(previous)
-        )
+        if previous_status == "failed":
+            if (
+                not _provider_result_shape_rerun_was_performed(previous)
+                and _has_callback_provider_result_missing_shape(previous)
+            ):
+                diagnostic_rerun = {
+                    "version": PROVIDER_RESULT_SHAPE_RERUN_VERSION,
+                    "reason": PROVIDER_RESULT_SHAPE_RERUN_REASON,
+                }
+            elif (
+                not _legacy_callback_trade_queries_rerun_was_performed(previous)
+                and _has_legacy_truncated_callback_trade_queries(previous)
+            ):
+                diagnostic_rerun = {
+                    "version": LEGACY_CALLBACK_TRADE_QUERIES_RERUN_VERSION,
+                    "reason": LEGACY_CALLBACK_TRADE_QUERIES_RERUN_REASON,
+                }
         # A previous serializer truncated scalar callback evidence needed to
         # diagnose whether PayUni created or completed a trade. The current
         # bounded serializer preserves these values on this one retry.
-        if previous_status in {"passed", "failed", "blocked"} and not should_rerun_legacy_failure:
+        if previous_status in {"passed", "failed", "blocked"} and diagnostic_rerun is None:
             # Preserve the attested result. Replacing it with a small
             # ``already-run`` marker discarded the original Playwright error
             # and made watchdog diagnosis impossible. A failed revision stays
@@ -127,16 +182,13 @@ def run_external_qa(
         return ExternalQAResult("ready", {**base, "status": "ready"})
 
     execution_base = base
-    if should_rerun_legacy_failure:
+    if diagnostic_rerun is not None:
         # This runner-owned marker is persisted in the replacement receipt so
         # even malformed or untrusted QA output containing the old truncation
         # marker can trigger at most one additional sandbox execution.
         execution_base = {
             **base,
-            "diagnosticRerun": {
-                "version": LEGACY_CALLBACK_TRADE_QUERIES_RERUN_VERSION,
-                "reason": LEGACY_CALLBACK_TRADE_QUERIES_RERUN_REASON,
-            },
+            "diagnosticRerun": diagnostic_rerun,
         }
 
     started = datetime.now(UTC)
@@ -276,6 +328,37 @@ def _legacy_callback_trade_queries_rerun_was_performed(receipt: dict[str, Any]) 
     )
 
 
+def _has_callback_provider_result_missing_shape(receipt: dict[str, Any]) -> bool:
+    """Identify failed provider-result attempts that predate the v2 summary."""
+
+    checks = receipt.get("providerChecks")
+    if not isinstance(checks, dict):
+        return False
+    provider_checks = checks.get("providerChecks")
+    if not isinstance(provider_checks, dict):
+        return False
+    callback_trade_queries = provider_checks.get("callbackTradeQueries")
+    if not isinstance(callback_trade_queries, list):
+        return False
+    return any(
+        isinstance(query, dict)
+        and query.get("flowStage") == "provider-result"
+        and "providerResultType" not in query
+        for query in callback_trade_queries
+    )
+
+
+def _provider_result_shape_rerun_was_performed(receipt: dict[str, Any]) -> bool:
+    """Return whether the one-time v2 provider-result diagnostic was run."""
+
+    rerun = receipt.get("diagnosticRerun")
+    return (
+        isinstance(rerun, dict)
+        and rerun.get("version") == PROVIDER_RESULT_SHAPE_RERUN_VERSION
+        and rerun.get("reason") == PROVIDER_RESULT_SHAPE_RERUN_REASON
+    )
+
+
 def _safe_checks(parsed: dict[str, Any]) -> dict[str, Any] | None:
     checks = parsed.get("checks")
     if not isinstance(checks, dict):
@@ -322,6 +405,13 @@ def _safe_check_value(value: Any, *, depth: int, path: tuple[str, ...]) -> Any:
                 )
         return summary
     if isinstance(value, list):
+        if path == ("providerChecks", "callbackTradeQueries"):
+            return [
+                _safe_callback_trade_query_attempt(item)
+                if isinstance(item, dict)
+                else _safe_check_value(item, depth=depth + 1, path=path)
+                for item in value[:MAX_CHECK_ITEMS]
+            ]
         return [
             _safe_check_value(item, depth=depth + 1, path=path)
             for item in value[:MAX_CHECK_ITEMS]
@@ -339,6 +429,53 @@ def _safe_callback_trade_query_provider_signals(value: Any) -> dict[str, bool]:
         for field in CALLBACK_TRADE_QUERY_PROVIDER_SIGNAL_FIELDS
         if isinstance(value.get(field), bool)
     }
+
+
+def _safe_callback_trade_query_attempt(value: dict[str, Any]) -> dict[str, Any]:
+    """Serialize one PayUni callback query without relying on input order.
+
+    This intentionally does not call the generic check serializer: a callback
+    attempt can contain arbitrary provider data, while only these fixed
+    diagnostics are useful and safe to persist.
+    """
+
+    summary: dict[str, Any] = {}
+    for field in CALLBACK_TRADE_QUERY_SCALAR_FIELDS:
+        item = value.get(field)
+        if field == "attempt":
+            if isinstance(item, int) and not isinstance(item, bool):
+                summary[field] = item
+        elif field in {"querySucceeded", "tradeNoPresent"}:
+            if isinstance(item, bool):
+                summary[field] = item
+        elif field == "errorCategory":
+            if item is None or isinstance(item, str):
+                summary[field] = item if item is None else item[:MAX_CHECK_STRING_CHARS]
+        elif isinstance(item, str):
+            summary[field] = item[:MAX_CHECK_STRING_CHARS]
+
+    provider_signals = _safe_callback_trade_query_provider_signals(value.get("providerSignals"))
+    if "providerSignals" in value:
+        summary["providerSignals"] = provider_signals
+
+    provider_result_type = value.get("providerResultType")
+    if isinstance(provider_result_type, str) and provider_result_type in CALLBACK_TRADE_QUERY_PROVIDER_RESULT_TYPES:
+        summary["providerResultType"] = provider_result_type
+
+    provider_result_fields = value.get("providerResultFields")
+    if isinstance(provider_result_fields, list):
+        safe_fields: list[str] = []
+        for field in provider_result_fields:
+            if (
+                isinstance(field, str)
+                and field in CALLBACK_TRADE_QUERY_PROVIDER_RESULT_FIELDS
+                and field not in safe_fields
+            ):
+                safe_fields.append(field)
+            if len(safe_fields) == MAX_CALLBACK_TRADE_QUERY_PROVIDER_RESULT_FIELDS:
+                break
+        summary["providerResultFields"] = safe_fields
+    return summary
 
 
 def _write_receipt(report_dir: Path, result: dict[str, Any], output: str) -> Path:
