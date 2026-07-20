@@ -204,6 +204,80 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(result["sameSignatureCount"], 0)
             self.assertEqual(result["status"], "ok")
 
+    def test_successful_repair_waits_for_new_supervisor_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            supervisor = root / "supervisor.json"
+            watcher = root / "watchdog.json"
+            alerts = root / "alerts.log"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            old_heartbeat = now - timedelta(minutes=5)
+            _write_supervisor(supervisor, old_heartbeat, status="attention-required")
+            watcher.write_text(
+                json.dumps(
+                    {
+                        "signature": (
+                            f"{'a' * 64}|attention-required|publication-exception|"
+                            "manual-review-required"
+                        ),
+                        "sameSignatureCount": 3,
+                        "lastSupervisorUpdatedAt": old_heartbeat.isoformat(),
+                        "lastRestartCount": 5,
+                        "repairAttempts": 1,
+                        "lastRepairAt": (now - timedelta(seconds=30)).isoformat(),
+                        "lastRepair": {
+                            "attempted": True,
+                            "success": True,
+                            "restarted": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            thresholds = WatchdogThresholds(
+                repeat_count=1,
+                restart_count=1,
+                stale_seconds=60,
+                cooldown_seconds=60,
+                repair_restart_grace_seconds=120,
+            )
+            notifications: list[str] = []
+
+            waiting = run_watchdog(
+                supervisor,
+                watcher,
+                alerts,
+                service_name="example.service",
+                now=now,
+                runner=_service_runner(9),
+                notifier=lambda _title, message: notifications.append(message) or True,
+                thresholds=thresholds,
+            )
+
+            self.assertEqual(waiting["status"], "ok")
+            self.assertTrue(waiting["repairRestartGrace"])
+            self.assertEqual(waiting["sameSignatureCount"], 0)
+            self.assertIsNone(waiting["alertType"])
+            self.assertEqual(notifications, [])
+
+            # A changed heartbeat proves the restarted supervisor has observed
+            # the repaired revision. A new attention state is actionable again.
+            _write_supervisor(supervisor, now + timedelta(seconds=1), status="attention-required")
+            observed = run_watchdog(
+                supervisor,
+                watcher,
+                alerts,
+                service_name="example.service",
+                now=now + timedelta(seconds=1),
+                runner=_service_runner(9),
+                notifier=lambda _title, message: notifications.append(message) or True,
+                thresholds=thresholds,
+            )
+
+            self.assertFalse(observed["repairRestartGrace"])
+            self.assertEqual(observed["alertType"], "repeated-attention")
+            self.assertEqual(len(notifications), 1)
+
     def test_thresholds_must_be_positive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

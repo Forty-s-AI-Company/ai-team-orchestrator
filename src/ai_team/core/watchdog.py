@@ -18,6 +18,7 @@ class WatchdogThresholds:
     restart_count: int = 3
     stale_seconds: int = 25 * 60
     cooldown_seconds: int = 30 * 60
+    repair_restart_grace_seconds: int = 2 * 60
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -50,7 +51,14 @@ def run_watchdog(
 
     signature = _state_signature(supervisor)
     attention = _needs_attention(supervisor)
-    same_signature_count = (
+    repair_restart_grace = _awaiting_post_repair_heartbeat(
+        previous,
+        supervisor,
+        service,
+        checked_at,
+        thresholds.repair_restart_grace_seconds,
+    )
+    same_signature_count = 0 if repair_restart_grace else (
         int(previous.get("sameSignatureCount") or 0) + 1
         if attention and previous.get("signature") == signature
         else (1 if attention else 0)
@@ -62,7 +70,7 @@ def run_watchdog(
     stale_seconds = _state_age_seconds(supervisor, checked_at)
     task_failure = _task_failure_evidence(report_dir, supervisor)
 
-    alert = _select_alert(
+    alert = None if repair_restart_grace else _select_alert(
         supervisor,
         service,
         signature,
@@ -105,6 +113,11 @@ def run_watchdog(
     elif not _repair_condition_present(supervisor, task_failure, restart_delta):
         current_repair_key = None
         repair_attempts = 0
+    # A repair can spend several minutes in Sol/Terra/QA. Production calls use
+    # the actual completion time so the restart grace does not expire while
+    # the repair itself is still running. Tests that pass ``now`` remain fully
+    # deterministic.
+    recorded_at = checked_at if now is not None else datetime.now(UTC)
     delivered = False
     suppressed = False
     if alert:
@@ -119,11 +132,11 @@ def run_watchdog(
                 )
             )
             delivered = send(alert["title"], alert["message"])
-            _append_alert_log(alert_log_path, checked_at, alert, delivered)
+            _append_alert_log(alert_log_path, recorded_at, alert, delivered)
 
     state = {
         "schemaVersion": 1,
-        "updatedAt": checked_at.isoformat(),
+        "updatedAt": recorded_at.isoformat(),
         "signature": signature,
         "sameSignatureCount": same_signature_count,
         "lastSupervisorUpdatedAt": supervisor.get("updatedAt"),
@@ -135,7 +148,7 @@ def run_watchdog(
         "repairKey": current_repair_key,
         "repairAttempts": repair_attempts,
         "lastRepairAt": (
-            checked_at.isoformat()
+            recorded_at.isoformat()
             if repair and repair.get("attempted") is True
             else previous.get("lastRepairAt")
         ),
@@ -146,7 +159,7 @@ def run_watchdog(
             else previous.get("lastAlertKey")
         ),
         "lastAlertAt": (
-            checked_at.isoformat()
+            recorded_at.isoformat()
             if alert and not suppressed
             else previous.get("lastAlertAt")
         ),
@@ -168,6 +181,7 @@ def run_watchdog(
         "alertType": alert.get("type") if alert else None,
         "notificationDelivered": delivered,
         "notificationSuppressed": suppressed,
+        "repairRestartGrace": repair_restart_grace,
         "sameSignatureCount": same_signature_count,
         "restartDelta": restart_delta,
         "staleSeconds": stale_seconds,
@@ -184,6 +198,42 @@ def _repair_condition_present(
     supervisor: dict[str, Any], task_failure: dict[str, Any], restart_delta: int
 ) -> bool:
     return _needs_attention(supervisor) or bool(task_failure["reason"]) or restart_delta > 0
+
+
+def _awaiting_post_repair_heartbeat(
+    previous: dict[str, Any],
+    supervisor: dict[str, Any],
+    service: dict[str, str],
+    now: datetime,
+    grace_seconds: int,
+) -> bool:
+    """Avoid re-reading the stale failure snapshot immediately after repair.
+
+    A successful repair starts the supervisor asynchronously. Until that
+    process writes a new ``updatedAt`` heartbeat, a timer invocation can still
+    see the pre-repair attention state and launch a duplicate repair. The
+    grace is intentionally short and applies only while the service is active
+    or starting; a failed/dead service is never hidden by it.
+    """
+
+    repair = previous.get("lastRepair")
+    if not isinstance(repair, dict):
+        return False
+    if repair.get("success") is not True or repair.get("restarted") is not True:
+        return False
+    if service.get("ActiveState") not in {"active", "activating"}:
+        return False
+    if supervisor.get("updatedAt") != previous.get("lastSupervisorUpdatedAt"):
+        return False
+    value = previous.get("lastRepairAt")
+    if not isinstance(value, str):
+        return False
+    try:
+        repaired_at = _as_utc(datetime.fromisoformat(value))
+    except ValueError:
+        return False
+    elapsed = (now - repaired_at).total_seconds()
+    return 0 <= elapsed < grace_seconds
 
 
 def _repair_alert(
@@ -499,6 +549,7 @@ def _validate_thresholds(thresholds: WatchdogThresholds) -> None:
         thresholds.restart_count,
         thresholds.stale_seconds,
         thresholds.cooldown_seconds,
+        thresholds.repair_restart_grace_seconds,
     ) <= 0:
         raise ValueError("watchdog thresholds must be positive")
 

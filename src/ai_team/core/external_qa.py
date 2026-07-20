@@ -48,10 +48,11 @@ CALLBACK_TRADE_QUERY_SCALAR_FIELDS = (
     "tradeNoPresent",
     "currentHttpsHostPath",
     "flowStage",
+    "failureStage",
     "errorCategory",
 )
 CALLBACK_TRADE_QUERY_PROVIDER_RESULT_TYPES = frozenset(
-    {"array", "boolean", "missing", "null", "number", "object", "string", "undefined"}
+    {"absent", "array", "boolean", "missing", "null", "number", "object", "string", "undefined"}
 )
 # These are PayUni's documented callback/query result names.  The receipt
 # records names only, never provider values, and remains deliberately bounded.
@@ -342,7 +343,7 @@ def _has_callback_provider_result_missing_shape(receipt: dict[str, Any]) -> bool
         return False
     return any(
         isinstance(query, dict)
-        and query.get("flowStage") == "provider-result"
+        and query.get("failureStage") == "provider-result"
         and "providerResultType" not in query
         for query in callback_trade_queries
     )

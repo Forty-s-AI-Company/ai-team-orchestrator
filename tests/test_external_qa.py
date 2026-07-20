@@ -400,7 +400,8 @@ class ExternalQATests(unittest.TestCase):
         attempt.update(
             {
                 "attempt": 3,
-                "flowStage": "provider-result",
+                "flowStage": "waiting-payment-callback",
+                "failureStage": "provider-result",
                 "querySucceeded": False,
                 "providerSignals": {"providerRejection": True, "token": "must-not-escape"},
                 "providerResultType": "object",
@@ -429,6 +430,8 @@ class ExternalQATests(unittest.TestCase):
             result = run_external_qa(loaded, "j" * 40, root / "reports")
 
         summary = result.result["providerChecks"]["providerChecks"]["callbackTradeQueries"][0]
+        self.assertEqual(summary["flowStage"], "waiting-payment-callback")
+        self.assertEqual(summary["failureStage"], "provider-result")
         self.assertEqual(summary["providerResultType"], "object")
         self.assertEqual(
             summary["providerResultFields"],
@@ -456,7 +459,12 @@ class ExternalQATests(unittest.TestCase):
             "providerChecks": {
                 "providerChecks": {
                     "callbackTradeQueries": [
-                        {"attempt": 3, "flowStage": "provider-result", "providerSignals": {}}
+                        {
+                            "attempt": 3,
+                            "flowStage": "waiting-payment-callback",
+                            "failureStage": "provider-result",
+                            "providerSignals": {},
+                        }
                     ]
                 }
             },
@@ -470,9 +478,9 @@ class ExternalQATests(unittest.TestCase):
                     "callbackTradeQueries": [
                         {
                             "attempt": 3,
-                            "flowStage": "provider-result",
-                            "providerResultType": "object",
-                            "providerResultFields": ["TradeNo"],
+                            "flowStage": "waiting-payment-callback",
+                            "failureStage": "provider-result",
+                            "providerResultType": "absent",
                         }
                     ]
                 }
@@ -493,6 +501,9 @@ class ExternalQATests(unittest.TestCase):
             {"version": 2, "reason": "missing-provider-result-shape"},
         )
         self.assertEqual(persisted["diagnosticRerun"]["version"], 2)
+        persisted_attempt = persisted["providerChecks"]["providerChecks"]["callbackTradeQueries"][0]
+        self.assertEqual(persisted_attempt["failureStage"], "provider-result")
+        self.assertEqual(persisted_attempt["providerResultType"], "absent")
         self.assertEqual(cached.result["reason"], "already-run-for-revision")
         run.assert_called_once()
 
