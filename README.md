@@ -795,6 +795,12 @@ Use `ai-team status-zh /path/to/project` to see the active repair phase and the
 last five cycle outcomes, including AGY findings, Sol review findings, and
 deferred-task reasons, in Traditional Chinese.
 
+An enabled human-only external QA policy is recorded separately in
+`releaseReviewTasks` after code, publication, and deterministic checks pass.
+The task is counted as development-complete so its dependants and the next PM
+task can continue, while the human release attestation remains visible and is
+never falsely reported as passed by an autonomous model.
+
 Use `--test-notification` to verify the Windows notification path without
 reading the supervisor state or calling an AI provider.
 

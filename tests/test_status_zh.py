@@ -83,6 +83,75 @@ def test_status_reports_a_real_stop_when_no_service_has_a_pid(tmp_path: Path) ->
     assert "目前負責：無" in output
 
 
+def test_status_labels_systemd_auto_restart_as_a_temporary_transition(tmp_path: Path) -> None:
+    project = tmp_path / "CelebrateDeal"
+    project.mkdir()
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps({
+            "releaseReviewTasks": [{
+                "id": "payment-check",
+                "reason": "等待人工外部 QA 驗收；不阻塞後續測試站開發",
+            }]
+        }),
+        encoding="utf-8",
+    )
+
+    def runner(command: list[str]) -> str:
+        joined = " ".join(command)
+        if "supervisor.service" in joined:
+            return "ActiveState=activating\nSubState=auto-restart\nMainPID=0\n"
+        if command[0] == "systemctl":
+            return "ActiveState=inactive\nSubState=dead\nMainPID=0\n"
+        return ""
+
+    output = render_chinese_status(
+        project,
+        supervisor_state_path=state,
+        supervisor_service="supervisor.service",
+        watchdog_service="watchdog.service",
+        runner=runner,
+        now=datetime.fromisoformat("2026-07-20T21:30:00+08:00"),
+    )
+
+    assert "主流程正在自動重啟（短暫切換中，不是永久停止）" in output
+    assert "主流程：自動重啟等待中（短暫狀態）" in output
+    assert "待人工上線驗收（不阻塞測試站開發）" in output
+
+
+def test_status_reports_active_supervisor_even_between_model_processes(tmp_path: Path) -> None:
+    project = tmp_path / "CelebrateDeal"
+    project.mkdir()
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps({"status": "completed-development", "nextAction": "next-contract"}),
+        encoding="utf-8",
+    )
+
+    def runner(command: list[str]) -> str:
+        joined = " ".join(command)
+        if "supervisor.service" in joined:
+            return "ActiveState=active\nSubState=running\nMainPID=100\n"
+        if command[0] == "systemctl":
+            return "ActiveState=inactive\nSubState=dead\nMainPID=0\n"
+        if command[:2] == ["ps", "-eo"]:
+            return "100 1 20 0.1 Ss ai-team supervise\n"
+        return ""
+
+    output = render_chinese_status(
+        project,
+        supervisor_state_path=state,
+        supervisor_service="supervisor.service",
+        watchdog_service="watchdog.service",
+        runner=runner,
+        now=datetime.fromisoformat("2026-07-20T21:35:00+08:00"),
+    )
+
+    assert "整體狀態：主流程自動開發中" in output
+    assert "目前負責：Supervisor（自動開發控制器）" in output
+    assert "正在進行：切換到下一個優先任務" in output
+
+
 def test_status_shows_readable_failed_repair_history(tmp_path: Path) -> None:
     project = tmp_path / "CelebrateDeal"
     project.mkdir()

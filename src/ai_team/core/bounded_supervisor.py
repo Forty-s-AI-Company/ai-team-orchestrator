@@ -507,21 +507,26 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                     )
                     external_qa = qa_result.result
                     if qa_result.status == "review-required":
-                        state = _supervisor_state(
+                        # Product code and publication already passed here.
+                        # Preserve the release attestation as a non-blocking
+                        # human checklist instead of returning into a systemd
+                        # restart loop that can never satisfy a human gate.
+                        completed.add(selected.task_sha)
+                        state = _release_review_state(
                             running,
                             cycles,
-                            "attention-required",
                             completed,
                             queue_size=_pending_count(entries, completed),
                             current=selected,
-                            stop_reason="external-qa-human-attestation-required",
-                            next_action="manual-review-required",
                             delivery_result=effective_result,
                             publication=publication,
                             external_qa=external_qa,
+                            recorded_at=options.wall_clock(),
                         )
                         _write_json(options.state_path, state)
-                        return state
+                        if _must_stop(options, started):
+                            return state
+                        continue
             completed.add(selected.task_sha)
             state = _supervisor_state(
                 running,
@@ -882,6 +887,9 @@ def _supervisor_state(
         "deferredTasks": redact_secrets([
             item for item in prior.get("deferredTasks", []) if isinstance(item, dict)
         ]),
+        "releaseReviewTasks": redact_secrets([
+            item for item in prior.get("releaseReviewTasks", []) if isinstance(item, dict)
+        ]),
         "currentTask": (
             {
                 "id": current.contract.id,
@@ -908,6 +916,48 @@ def _supervisor_state(
             autonomous_backlog if autonomous_backlog is not None else prior.get("autonomousBacklog")
         ),
     }
+
+
+def _release_review_state(
+    prior: dict[str, Any],
+    cycle: int,
+    completed: set[str],
+    *,
+    queue_size: int,
+    current: ContractEntry,
+    delivery_result: dict[str, Any],
+    publication: dict[str, Any],
+    external_qa: dict[str, Any],
+    recorded_at: datetime,
+) -> dict[str, Any]:
+    state = _supervisor_state(
+        prior,
+        cycle,
+        "completed-development",
+        completed,
+        queue_size=queue_size,
+        current=current,
+        stop_reason=None,
+        next_action="next-contract",
+        delivery_result=delivery_result,
+        publication=publication,
+        external_qa=external_qa,
+    )
+    prior_reviews = [
+        item
+        for item in prior.get("releaseReviewTasks", [])
+        if isinstance(item, dict) and item.get("taskSha") != current.task_sha
+    ]
+    prior_reviews.append({
+        "id": current.contract.id,
+        "taskSha": current.task_sha,
+        "revision": external_qa.get("revision"),
+        "reason": "等待人工外部 QA 驗收；不阻塞後續測試站開發",
+        "recordedAt": _as_utc(recorded_at).isoformat(),
+        "status": "review-required",
+    })
+    state["releaseReviewTasks"] = redact_secrets(prior_reviews[-256:])
+    return state
 
 
 def _recovery_stage(prior: dict[str, Any], current: ContractEntry) -> str:

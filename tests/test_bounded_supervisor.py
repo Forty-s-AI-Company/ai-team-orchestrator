@@ -454,11 +454,13 @@ external_qa:
                 )
             )
 
-            self.assertEqual(result["status"], "attention-required")
-            self.assertEqual(result["stopReason"], "external-qa-human-attestation-required")
-            self.assertEqual(result["nextAction"], "manual-review-required")
-            self.assertEqual(result["completedTaskShas"], [])
+            self.assertEqual(result["status"], "completed-development")
+            self.assertIsNone(result["stopReason"])
+            self.assertEqual(result["nextAction"], "next-contract")
+            self.assertEqual(result["completedTaskShas"], [task_sha])
             self.assertEqual(result["externalQa"]["status"], "review-required")
+            self.assertEqual(result["releaseReviewTasks"][0]["taskSha"], task_sha)
+            self.assertIn("不阻塞", result["releaseReviewTasks"][0]["reason"])
 
     def test_transient_provider_failure_waits_and_retries_same_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

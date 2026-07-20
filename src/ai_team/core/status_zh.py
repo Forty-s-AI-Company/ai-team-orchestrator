@@ -28,13 +28,25 @@ def render_chinese_status(
     watchdog = _service_status(watchdog_service, execute)
     processes = _process_table(execute)
     watchdog_pid = _positive_int(watchdog.get("MainPID"))
-    descendants = _descendants(watchdog_pid, processes) if watchdog_pid else []
+    supervisor_pid = _positive_int(supervisor.get("MainPID"))
+    watchdog_descendants = _descendants(watchdog_pid, processes) if watchdog_pid else []
+    supervisor_descendants = _descendants(supervisor_pid, processes) if supervisor_pid else []
+    descendants = watchdog_descendants or supervisor_descendants
     state = _read_json(supervisor_state_path)
     repair = _latest_repair_activity(project, checked_at)
     repair_report = _repair_report(report_dir)
 
-    overall = _overall_status(supervisor, watchdog, descendants, repair)
-    owner, activity = _current_activity(descendants, repair_report)
+    overall = _overall_status(
+        supervisor,
+        watchdog,
+        watchdog_descendants,
+        repair,
+    )
+    controller = "watchdog" if watchdog_descendants else "supervisor"
+    owner, activity = _current_activity(descendants, repair_report, controller=controller)
+    if not descendants and supervisor.get("ActiveState") == "active":
+        owner = "Supervisor（自動開發控制器）"
+        activity = _supervisor_activity(state)
     task_title, task_instruction = _task_description(state)
     latest_commit = _latest_commit(project, execute)
 
@@ -82,6 +94,16 @@ def render_chinese_status(
                 continue
             lines.append(
                 f"- {item.get('id') or '未知任務'}：{_shorten(str(item.get('reason') or '未提供原因'), 100)}"
+            )
+
+    release_reviews = state.get("releaseReviewTasks")
+    if isinstance(release_reviews, list) and release_reviews:
+        lines.extend(["", "待人工上線驗收（不阻塞測試站開發）"])
+        for item in release_reviews[-5:]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- {item.get('id') or '未知任務'}：{_shorten(str(item.get('reason') or '等待人工驗收'), 100)}"
             )
 
     if state.get("status") == "stopped" and watchdog_pid:
@@ -163,13 +185,15 @@ def _descendants(root_pid: int, rows: list[dict[str, int | str]]) -> list[dict[s
 def _overall_status(
     supervisor: dict[str, str],
     watchdog: dict[str, str],
-    descendants: list[dict[str, int | str]],
+    watchdog_descendants: list[dict[str, int | str]],
     repair: dict[str, str] | None,
 ) -> str:
-    if descendants:
+    if watchdog_descendants:
         return "自動修復中（AI Team 確實有在工作）"
     if supervisor.get("ActiveState") == "active":
         return "主流程自動開發中"
+    if supervisor.get("ActiveState") == "activating":
+        return "主流程正在自動重啟（短暫切換中，不是永久停止）"
     if _positive_int(watchdog.get("MainPID")):
         if repair and not repair["stale"]:
             return "自動修復中（正在切換或收尾）"
@@ -180,6 +204,8 @@ def _overall_status(
 def _current_activity(
     descendants: list[dict[str, int | str]],
     repair_report: dict,
+    *,
+    controller: str,
 ) -> tuple[str, str]:
     commands = "\n".join(str(row["command"]) for row in descendants).lower()
     if "playwright" in commands or "e2e:" in commands:
@@ -199,7 +225,7 @@ def _current_activity(
     elif "gpt-5.6-terra" in commands:
         activity = "依照審查意見修改程式"
     elif descendants:
-        activity = "執行自動修復流程"
+        activity = "執行自動修復流程" if controller == "watchdog" else "執行自動開發流程"
     else:
         activity = _phase_activity(repair_report)
 
@@ -211,7 +237,11 @@ def _current_activity(
     elif "gpt-5.6-sol" in commands:
         owner = f"Sol {effort}（診斷／QA 審查）"
     elif descendants:
-        owner = "Watchdog（自動修復控制器）"
+        owner = (
+            "Watchdog（自動修復控制器）"
+            if controller == "watchdog"
+            else "Supervisor（自動開發控制器）"
+        )
     elif repair_report.get("status") == "running":
         owner = _phase_owner(repair_report)
     else:
@@ -267,6 +297,13 @@ def _repair_history_lines(report: dict) -> list[str]:
         return []
     limit = report.get("cycleLimit") or 5
     lines = ["", f"自動修復歷程（最多 {limit} 輪）"]
+    repository = report.get("repository")
+    if repository:
+        target = "AI Team 編排器" if repository == "orchestrator" else "CelebrateDeal 專案"
+        lines.append(f"- 修復對象：{target}")
+    diagnosis = report.get("diagnosis")
+    if isinstance(diagnosis, dict) and diagnosis.get("summary"):
+        lines.append(f"- 修復內容：{_shorten(str(diagnosis['summary']), 140)}")
     for item in cycles[-5:]:
         if not isinstance(item, dict):
             continue
@@ -346,6 +383,23 @@ def _phase_owner(report: dict) -> str:
     return "Watchdog（自動修復控制器）"
 
 
+def _supervisor_activity(state: dict) -> str:
+    next_action = str(state.get("nextAction") or "")
+    status = str(state.get("status") or "")
+    return {
+        "bounded-delivery": "執行目前任務的分工、修改與測試",
+        "run-autonomous-contract": "準備執行 PM 新建立的任務",
+        "watch-contract-directory": "等待或掃描下一個開發任務",
+        "next-contract": "切換到下一個優先任務",
+        "provider-probe": "檢查 AI 模型供應商是否恢復",
+        "retry-selected-cloud-model": "重試目前選定的 AI 模型",
+    }.get(
+        next_action,
+        "PM 掃描專案並規劃下一項工作" if status in {"planning-next-task", "completed-development"}
+        else "主流程執行中，等待下一個階段",
+    )
+
+
 def _task_description(state: dict) -> tuple[str, str]:
     task = state.get("currentTask") if isinstance(state.get("currentTask"), dict) else {}
     contract_path = Path(str(task.get("contractPath") or ""))
@@ -378,6 +432,8 @@ def _service_label(service: dict[str, str], *, paused_by_watchdog: bool = False)
         return f"執行中（PID {pid}）"
     if active == "activating" and pid:
         return f"執行中（PID {pid}）"
+    if active == "activating" and sub == "auto-restart":
+        return "自動重啟等待中（短暫狀態）"
     if paused_by_watchdog and active == "inactive":
         return "暫停，由自動修復接管"
     return f"未執行（{active or '未知'}/{sub or '未知'}）"
