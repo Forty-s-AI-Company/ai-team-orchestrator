@@ -13,6 +13,7 @@ from ai_team.core.bounded_delivery import load_trusted_task_contract
 from ai_team.core.cloud_resilience import LocalContinuitySettings, RetrySettings, default_engineer_routes
 from ai_team.core.bounded_supervisor import (
     ContinuousBoundedOptions,
+    _external_qa_required,
     _exclude_deferred_contracts,
     _sync_primary,
     cleanup_completed_worktree,
@@ -25,6 +26,23 @@ from ai_team.providers.base import BaseProvider, ProviderRequest, ProviderResult
 
 
 class ContinuousBoundedSupervisorTests(unittest.TestCase):
+    def test_external_qa_only_matches_configured_payment_paths(self) -> None:
+        triggers = ["src/app/api/payments/", "src/lib/payment-providers/", "scripts/payuni-"]
+
+        self.assertTrue(_external_qa_required(
+            triggers,
+            {"changedFiles": ["src/app/api/payments/checkout/route.ts"]},
+        ))
+        self.assertTrue(_external_qa_required(
+            triggers,
+            {"changedFiles": ["scripts/payuni-sandbox-external-qa.mjs"]},
+        ))
+        self.assertFalse(_external_qa_required(
+            triggers,
+            {"changedFiles": ["src/app/(app)/lives/page.tsx"]},
+        ))
+        self.assertTrue(_external_qa_required(triggers, {"changedFiles": []}))
+
     def test_deferred_contract_is_removed_without_marking_it_completed(self) -> None:
         blocked = SimpleNamespace(task_sha="blocked-sha")
         next_task = SimpleNamespace(task_sha="next-sha")

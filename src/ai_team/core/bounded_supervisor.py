@@ -498,7 +498,14 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                     )
                 else:
                     loaded_source = None
-                if loaded_source is not None and loaded_source.profile.external_qa.enabled:
+                if (
+                    loaded_source is not None
+                    and loaded_source.profile.external_qa.enabled
+                    and _external_qa_required(
+                        loaded_source.profile.external_qa.trigger_paths,
+                        effective_result,
+                    )
+                ):
                     source_revision = _git_head(options.project_path)
                     qa_result = run_external_qa(
                         loaded_source,
@@ -958,6 +965,35 @@ def _release_review_state(
     })
     state["releaseReviewTasks"] = redact_secrets(prior_reviews[-256:])
     return state
+
+
+def _external_qa_required(
+    trigger_paths: list[str],
+    delivery_result: dict[str, Any],
+) -> bool:
+    """Fail closed unless every changed path is known and unrelated."""
+
+    if not trigger_paths:
+        # Backward-compatible policy: enabled profiles without a scope retain
+        # the original project-wide release review behavior.
+        return True
+    changed_files = delivery_result.get("changedFiles")
+    if not isinstance(changed_files, list) or not changed_files:
+        return True
+    normalized: list[str] = []
+    for value in changed_files:
+        if not isinstance(value, str):
+            return True
+        path = value.strip().replace("\\", "/")
+        parts = tuple(part for part in path.split("/") if part)
+        if not path or path.startswith("/") or ".." in parts:
+            return True
+        normalized.append(path)
+    return any(
+        changed == prefix.rstrip("/") or changed.startswith(prefix)
+        for changed in normalized
+        for prefix in trigger_paths
+    )
 
 
 def _recovery_stage(prior: dict[str, Any], current: ContractEntry) -> str:

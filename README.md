@@ -799,7 +799,11 @@ An enabled human-only external QA policy is recorded separately in
 `releaseReviewTasks` after code, publication, and deterministic checks pass.
 The task is counted as development-complete so its dependants and the next PM
 task can continue, while the human release attestation remains visible and is
-never falsely reported as passed by an autonomous model.
+never falsely reported as passed by an autonomous model. Configure
+`external_qa.trigger_paths` with project-relative path prefixes to apply that
+review only when the trusted delivery result changed a sensitive integration.
+An enabled policy with no trigger paths retains the conservative project-wide
+behavior; missing or malformed changed-file evidence also triggers review.
 
 Use `--test-notification` to verify the Windows notification path without
 reading the supervisor state or calling an AI provider.

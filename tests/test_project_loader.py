@@ -74,7 +74,7 @@ class ProjectLoaderTests(unittest.TestCase):
             profile.write_text(
                 profile.read_text(encoding="utf-8").replace(
                     "safety:\n",
-                    "external_qa:\n  enabled: true\n  environment: staging\n  command: npm run qa:payuni:sandbox\n\nsafety:\n",
+                    "external_qa:\n  enabled: true\n  environment: staging\n  command: npm run qa:payuni:sandbox\n  trigger_paths:\n    - src/app/api/payments/\n    - scripts/payuni-\n\nsafety:\n",
                 ),
                 encoding="utf-8",
             )
@@ -85,6 +85,28 @@ class ProjectLoaderTests(unittest.TestCase):
             self.assertEqual(loaded.profile.external_qa.execution_mode, "manual-attestation-only")
             self.assertEqual(loaded.profile.external_qa.environment, "staging")
             self.assertEqual(loaded.profile.external_qa.command, "npm run qa:payuni:sandbox")
+            self.assertEqual(
+                loaded.profile.external_qa.trigger_paths,
+                ["src/app/api/payments/", "scripts/payuni-"],
+            )
+
+    def test_rejects_unsafe_external_qa_trigger_paths(self) -> None:
+        for trigger in ("../.env", "/etc/passwd", ".git/config", ""):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "project"
+                root.mkdir()
+                init_git_project(root)
+                profile = root / ".ai-team" / "project.yaml"
+                profile.write_text(
+                    profile.read_text(encoding="utf-8").replace(
+                        "safety:\n",
+                        f"external_qa:\n  enabled: true\n  trigger_paths:\n    - {trigger!r}\n\nsafety:\n",
+                    ),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaises(ProjectConfigError):
+                    load_project(root)
 
     def test_rejects_external_qa_execution_modes_other_than_manual_attestation(self) -> None:
         for mode in ("automatic", "subprocess", "manual-review"):

@@ -82,6 +82,7 @@ class ExternalQAConfig(BaseModel):
     run_once_per_revision: bool = True
     reviewer_role: str = "delivery-qa"
     production_requires_human_approval: bool = True
+    trigger_paths: list[str] = Field(default_factory=list)
 
     @field_validator("environment", "command", "reviewer_role")
     @classmethod
@@ -89,6 +90,20 @@ class ExternalQAConfig(BaseModel):
         if not value or not value.strip():
             raise ValueError("must not be empty")
         return value.strip()
+
+    @field_validator("trigger_paths")
+    @classmethod
+    def safe_external_qa_trigger_paths(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            path = value.strip().replace("\\", "/")
+            parts = tuple(part for part in path.split("/") if part)
+            if not path or path.startswith("/") or ".." in parts or path.startswith(".git"):
+                raise ValueError("external QA trigger paths must be safe project-relative prefixes")
+            normalized.append(path)
+        if len(normalized) > 128 or len(normalized) != len(set(normalized)):
+            raise ValueError("external QA trigger paths must be unique and contain at most 128 items")
+        return normalized
 
 
 class StagingOperationsPolicy(BaseModel):
