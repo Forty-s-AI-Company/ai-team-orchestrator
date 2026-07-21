@@ -14,6 +14,7 @@ from ai_team.core.bounded_delivery import (
     EngineeringAttempt,
     _engineering_failure,
     _review_patch_evidence,
+    _trusted_stale_checkpoint_replay,
     _validate_adopted_secondary_binding,
     _validated_resume_worktree,
     load_trusted_task_contract,
@@ -899,6 +900,13 @@ class BoundedDeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             root = _init_project(base / "project")
+            source_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             contract_path = _write_contract(base, "docs/safe.md")
             worktree = base / "resume-worktree"
             subprocess.run(
@@ -932,7 +940,17 @@ class BoundedDeliveryTests(unittest.TestCase):
             run_receipt = isolated_reports / "run.json"
             executor_receipt = isolated_reports / "executor.json"
             run_receipt.write_text("{}", encoding="utf-8")
-            executor_receipt.write_text("{}", encoding="utf-8")
+            executor_receipt.write_text(
+                json.dumps({
+                    "schemaVersion": 1,
+                    "sourceProjectPath": str(root.resolve()),
+                    "sourceCommitSha": source_sha,
+                    "worktreePath": str(worktree.resolve()),
+                    "worktreeCommitSha": commit_sha,
+                    "keepWorktree": True,
+                }),
+                encoding="utf-8",
+            )
 
             def provider(role: str) -> BaseProvider:
                 return _QaAliasReviewQuotaOnceProvider(role, stage_calls, provider_state)
@@ -958,6 +976,7 @@ class BoundedDeliveryTests(unittest.TestCase):
                     commit_sha=commit_sha,
                     run_receipt=run_receipt,
                     executor_receipt=executor_receipt,
+                    source_commit_sha=source_sha,
                 )
 
             options = BoundedDeliveryOptions(
@@ -1112,6 +1131,120 @@ class BoundedDeliveryTests(unittest.TestCase):
             )
 
             self.assertEqual(resumed, worktree.resolve())
+
+    def test_trusted_stale_checkpoint_is_replayed_only_after_linear_source_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = _init_project(base / "project")
+            source_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            worktree = base / "resume-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(worktree), source_sha],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            target = worktree / "docs" / "safe.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("checkpointed candidate\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", "docs/safe.md"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "checkpoint: obsolete candidate"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+            )
+            checkpoint_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            (root / "source-advance.txt").write_text("shared fixture fix\n", encoding="utf-8")
+            subprocess.run(["git", "add", "source-advance.txt"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "test: advance shared source"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            current_source_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            reports = base / "reports"
+            reports.mkdir()
+            run_receipt = (reports / "run.json").resolve()
+            executor_receipt = (reports / "executor.json").resolve()
+            run_receipt.write_text(
+                json.dumps({
+                    "schemaVersion": 1,
+                    "projectPath": str(worktree.resolve()),
+                    "sourceCommitSha": source_sha,
+                    "commitSha": checkpoint_sha,
+                }),
+                encoding="utf-8",
+            )
+            executor_receipt.write_text(
+                json.dumps({
+                    "schemaVersion": 1,
+                    "sourceProjectPath": str(root.resolve()),
+                    "sourceCommitSha": source_sha,
+                    "worktreePath": str(worktree.resolve()),
+                    "worktreeCommitSha": checkpoint_sha,
+                    "runReceipt": str(run_receipt),
+                    "keepWorktree": True,
+                }),
+                encoding="utf-8",
+            )
+            options = BoundedDeliveryOptions(
+                project_path=root,
+                task_contract_path=_write_contract(base, "docs/safe.md"),
+                provider_for_role=_provider_for_role,
+                workspace_allowlist=[str(base)],
+                report_dir=reports,
+                state_path=base / "state.json",
+                trusted_dev=TrustedDevSettings(enabled=True),
+            )
+            prior = {
+                "taskSha": "task-sha",
+                "worktreePath": str(worktree.resolve()),
+                # The interrupted result can miss commitSha even though both
+                # isolated receipts and the clean worktree attest the commit.
+                "commitSha": None,
+                "sourceCommitSha": source_sha,
+                "changedFiles": ["docs/safe.md"],
+                "validation": {"success": False},
+                "runReceipt": str(run_receipt),
+                "executorReceipt": str(executor_receipt),
+                "repairs": [{"findingSha": "old"}],
+            }
+
+            evidence = _trusted_stale_checkpoint_replay(
+                options,
+                prior,
+                task_sha="task-sha",
+                allowed_write_paths=("docs/safe.md",),
+            )
+
+            self.assertIsNotNone(evidence)
+            self.assertEqual(evidence["kind"], "stale-checkpoint-replay")
+            self.assertEqual(evidence["checkpointCommitSha"], checkpoint_sha)
+            self.assertEqual(evidence["previousSourceCommitSha"], source_sha)
+            self.assertEqual(evidence["currentSourceCommitSha"], current_source_sha)
+            self.assertEqual(evidence["supersededRepairCount"], 1)
 
     def test_trusted_resume_accepts_in_scope_partial_initialized_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

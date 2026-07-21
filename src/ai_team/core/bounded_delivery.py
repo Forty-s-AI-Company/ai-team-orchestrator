@@ -228,6 +228,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             "worktreeInitialized",
             "worktreeBaseSha",
             "sourceCommitSha",
+            "resumeRecovery",
         ):
             if key in prior:
                 context[key] = prior[key]
@@ -258,7 +259,54 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
         )
         context["trustedDevProjectWideWrites"] = options.trusted_dev.enabled
 
-        repairs = _recover_repairs(prior, task_sha, engineering_write_scope)
+        resume_prior = prior
+        replay_evidence = _trusted_stale_checkpoint_replay(
+            options,
+            prior,
+            task_sha=task_sha,
+            allowed_write_paths=engineering_write_scope,
+        )
+        if replay_evidence is not None:
+            # A clean, attested candidate can become obsolete when the source
+            # branch advances (for example after a shared E2E infrastructure
+            # fix). Never keep validating the old source snapshot. Preserve a
+            # bounded audit record, then replay the contract in a fresh
+            # disposable worktree created from the current source revision.
+            resume_prior = {
+                key: value
+                for key, value in prior.items()
+                if key
+                not in {
+                    "worktreePath",
+                    "commitSha",
+                    "changedFiles",
+                    "validation",
+                    "runReceipt",
+                    "executorReceipt",
+                    "repairs",
+                    "worktreeInitialized",
+                    "worktreeBaseSha",
+                    "sourceCommitSha",
+                }
+            }
+            for key in (
+                "worktreePath",
+                "commitSha",
+                "changedFiles",
+                "validation",
+                "runReceipt",
+                "executorReceipt",
+                "repairs",
+                "worktreeInitialized",
+                "worktreeBaseSha",
+                "sourceCommitSha",
+            ):
+                context.pop(key, None)
+            context["resumeRecovery"] = replay_evidence
+            for stage in ("engineer", "qa", "review"):
+                checkpoints.pop(stage, None)
+
+        repairs = _recover_repairs(resume_prior, task_sha, engineering_write_scope)
         if repairs:
             context["repairs"] = repairs
 
@@ -305,16 +353,20 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
                 return _stop(options, context, "max-repair-attempts-reached", "qa-review")
             repairs.append({"findingSha": _sha(findings), "findings": findings})
             context["repairs"] = repairs
-        elif options.engineering_executor is None and prior.get("taskSha") == task_sha and prior.get("worktreePath"):
+        elif (
+            options.engineering_executor is None
+            and resume_prior.get("taskSha") == task_sha
+            and resume_prior.get("worktreePath")
+        ):
             reusable_worktree = _validated_resume_worktree(
                 options,
-                prior,
+                resume_prior,
                 task_sha=task_sha,
                 allowed_write_paths=engineering_write_scope,
                 expected_commit=None,
-                expected_changed_files=prior.get("changedFiles"),
-                expected_run_receipt=prior.get("runReceipt"),
-                expected_executor_receipt=prior.get("executorReceipt"),
+                expected_changed_files=resume_prior.get("changedFiles"),
+                expected_run_receipt=resume_prior.get("runReceipt"),
+                expected_executor_receipt=resume_prior.get("executorReceipt"),
                 allow_dirty=True,
             )
 
@@ -1115,6 +1167,119 @@ def _recover_repairs(
     return recovered
 
 
+def _trusted_stale_checkpoint_replay(
+    options: BoundedDeliveryOptions,
+    prior: dict[str, Any],
+    *,
+    task_sha: str,
+    allowed_write_paths: tuple[str, ...] | None,
+) -> dict[str, Any] | None:
+    """Attest an obsolete checkpoint before replaying from the current source.
+
+    This is intentionally narrower than normal resume. It never adopts the old
+    candidate into the source branch. It only proves that the retained worktree
+    is an unmodified AI Team artifact and that the source branch advanced
+    linearly, allowing the same contract to be retried in a fresh worktree.
+    """
+    if (
+        not options.trusted_dev.enabled
+        or prior.get("taskSha") != task_sha
+        or not isinstance(prior.get("worktreePath"), str)
+        or not isinstance(prior.get("changedFiles"), list)
+        or not isinstance(prior.get("sourceCommitSha"), str)
+    ):
+        return None
+    try:
+        source = load_project(options.project_path, allowlist=options.workspace_allowlist)
+        path = Path(prior["worktreePath"]).resolve()
+        loaded = load_project(path, allowlist=options.workspace_allowlist)
+        source_sha = prior["sourceCommitSha"]
+        current_source_sha = source.commit_sha
+        changed_files = prior["changedFiles"]
+        if (
+            not isinstance(current_source_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", current_source_sha) is None
+            or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+            or source_sha == current_source_sha
+            or path == source.root
+            or not loaded.is_disposable_worktree()
+            or loaded.is_branch_protected()
+            or _git_common_directory(source.root) != _git_common_directory(loaded.root)
+            or list_changed_files(loaded.root)
+            or not changed_files
+            or not all(isinstance(item, str) and item for item in changed_files)
+            or not _paths_within(changed_files, allowed_write_paths)
+        ):
+            return None
+        run_receipt_value = prior.get("runReceipt")
+        executor_receipt_value = prior.get("executorReceipt")
+        if not (
+            _is_attested_report_file(options.report_dir, run_receipt_value)
+            and _is_attested_report_file(options.report_dir, executor_receipt_value)
+        ):
+            return None
+        run_receipt_path = Path(str(run_receipt_value)).resolve()
+        executor_receipt_path = Path(str(executor_receipt_value)).resolve()
+        run_receipt = _read_json(run_receipt_path)
+        executor_receipt = _read_json(executor_receipt_path)
+        checkpoint_sha = loaded.commit_sha
+        if (
+            not isinstance(checkpoint_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", checkpoint_sha) is None
+            or run_receipt.get("schemaVersion") != 1
+            or run_receipt.get("projectPath") != str(path)
+            or run_receipt.get("sourceCommitSha") != source_sha
+            or run_receipt.get("commitSha") != checkpoint_sha
+            or executor_receipt.get("runReceipt") != str(run_receipt_path)
+            or executor_receipt.get("sourceCommitSha") != source_sha
+        ):
+            return None
+        attested_source_sha = _checkpoint_source_sha(
+            executor_receipt_path,
+            source_root=source.root,
+            worktree_root=loaded.root,
+            worktree_commit=checkpoint_sha,
+        )
+        prior_commit = prior.get("commitSha")
+        if prior_commit is not None and prior_commit != checkpoint_sha:
+            return None
+        if attested_source_sha != source_sha:
+            return None
+        source_advanced = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", source_sha, current_source_sha],
+            cwd=source.root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        candidate_descends_from_source = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", source_sha, checkpoint_sha],
+            cwd=source.root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if source_advanced.returncode != 0 or candidate_descends_from_source.returncode != 0:
+            return None
+        committed_files = list_committed_files_since(loaded.root, source_sha)
+        if sorted(committed_files) != sorted(changed_files):
+            return None
+        repairs = prior.get("repairs")
+        superseded_repairs = len(repairs) if isinstance(repairs, list) else 0
+        return {
+            "kind": "stale-checkpoint-replay",
+            "checkpointCommitSha": checkpoint_sha,
+            "previousSourceCommitSha": source_sha,
+            "currentSourceCommitSha": current_source_sha,
+            "changedFiles": sorted(changed_files),
+            "supersededRepairCount": superseded_repairs,
+        }
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def _validated_resume_worktree(
     options: BoundedDeliveryOptions,
     prior: dict[str, Any],
@@ -1174,6 +1339,14 @@ def _validated_resume_worktree(
         ):
             if prior.get(key) != value or not _is_attested_report_file(options.report_dir, value):
                 raise ValueError(f"resume state has an invalid {key}")
+        checkpoint_source_sha = _checkpoint_source_sha(
+            Path(str(expected_executor_receipt)),
+            source_root=source.root,
+            worktree_root=loaded.root,
+            worktree_commit=loaded.commit_sha,
+        )
+        if checkpoint_source_sha != source.commit_sha:
+            raise ValueError("resume checkpoint was created from an obsolete source revision")
         if expected_commit is not None:
             if prior.get("commitSha") != expected_commit or loaded.commit_sha != expected_commit or changed_files:
                 raise ValueError("committed resume target is not clean at the attested commit")
@@ -1189,13 +1362,7 @@ def _validated_resume_worktree(
             # HEAD to the original source and the cumulative file set matches.
             if prior["commitSha"] != loaded.commit_sha:
                 raise ValueError("checkpoint resume commit does not match worktree HEAD")
-            source_sha = _checkpoint_source_sha(
-                Path(str(expected_executor_receipt)),
-                source_root=source.root,
-                worktree_root=loaded.root,
-                worktree_commit=loaded.commit_sha,
-            )
-            committed_files = list_committed_files_since(loaded.root, source_sha)
+            committed_files = list_committed_files_since(loaded.root, checkpoint_source_sha)
             if sorted(committed_files) != sorted(expected_changed_files):
                 raise ValueError("checkpoint resume files do not match the attested state")
         else:
