@@ -754,7 +754,11 @@ minute from a systemd user timer. It sends deduplicated Telegram and Windows not
 appends a local JSON-lines audit record when the same `attention-required`
 signature is observed three times, three Engineer receipts contain the same
 stop reason, the service restarts three times between checks, or the supervisor
-state has not changed for 25 minutes:
+state has not changed for 25 minutes. It also detects five consecutive healthy
+heartbeats where the queue is empty but a previously created PM task is still
+cached. That idle-loop repair invalidates only the bounded PM cache, restarts
+the Supervisor, and forces a same-revision project rescan without calling an AI
+repair model:
 
 It also reports each newly deferred five-cycle repair, newly queued human
 release review, and provider backoff transition. These lifecycle alerts are
@@ -767,7 +771,7 @@ ai-team watchdog \
   --alert-log ~/.local/state/ai-team/CelebrateDeal/watchdog-alerts.log \
   --report-dir ~/.local/share/ai-team/CelebrateDeal/reports \
   --service celebratedeal-ai-team-supervisor.service \
-  --repeat-count 3 --restart-count 3 \
+  --repeat-count 3 --restart-count 3 --idle-count 5 \
   --stale-minutes 25 --cooldown-minutes 30 \
   --auto-repair \
   --project ~/projects/CelebrateDeal \
@@ -786,8 +790,10 @@ ai-team watchdog \
 With `--auto-repair`, the watchdog stops the Supervisor before every repair.
 It deterministically restores project-profile validation commands for the
 known malformed-contract failure, and performs one bounded clean restart for
-a failed service or stale state. Unknown failures remain stopped with their
-evidence intact. With `--ai-repair`, the restart-loop path runs one High cycle
+a failed service or stale state. A deferred or completed autonomous task is
+treated as terminal even when the Git revision did not change, so PM discovery
+continues and rejects repeated terminal task IDs. Unknown failures remain
+stopped with their evidence intact. With `--ai-repair`, the restart-loop path runs one High cycle
 of Sol diagnosis, Terra repair, deterministic validation, independent
 Antigravity QA, and Sol review. Rejected results are replanned with Sol XHigh
 and repaired with Terra XHigh for at most five total cycles. A fifth rejection

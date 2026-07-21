@@ -44,6 +44,56 @@ class AutonomousBacklogTests(unittest.TestCase):
             self.assertEqual(second["status"], "unchanged", second)
             self.assertEqual(provider.calls, 1)
 
+    def test_terminal_cached_task_forces_a_same_revision_rescan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contracts = root / "contracts"
+            state_path = root / "backlog.json"
+            provider = _DiscoveryProvider(_task_payload())
+
+            first = discover_next_task(
+                project_path=root,
+                contract_dir=contracts,
+                state_path=state_path,
+                provider=provider,
+                timeout_seconds=30,
+            )
+            next_payload = _task_payload()
+            next_payload["contract"]["id"] = "auto-keyboard-navigation-smoke"
+            provider.payload = next_payload
+
+            second = discover_next_task(
+                project_path=root,
+                contract_dir=contracts,
+                state_path=state_path,
+                provider=provider,
+                timeout_seconds=30,
+                terminal_task_shas=frozenset({first["taskSha"]}),
+                excluded_task_ids=(first["taskId"],),
+            )
+
+            self.assertEqual(second["status"], "task-created", second)
+            self.assertEqual(second["taskId"], "auto-keyboard-navigation-smoke")
+            self.assertEqual(provider.calls, 2)
+            self.assertIn("auto-accessibility-smoke", provider.last_request.prompt)
+
+    def test_rejects_a_terminal_task_id_even_when_pm_repeats_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            result = discover_next_task(
+                project_path=root,
+                contract_dir=root / "contracts",
+                state_path=root / "backlog.json",
+                provider=_DiscoveryProvider(_task_payload()),
+                timeout_seconds=30,
+                excluded_task_ids=("auto-accessibility-smoke",),
+            )
+
+            self.assertEqual(result["status"], "contract-rejected", result)
+            self.assertIn("terminal outcome", result["diagnostic"])
+            self.assertFalse(list((root / "contracts").glob("*.json")))
+
     def test_ready_response_is_persisted_without_a_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -195,6 +195,85 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(result["alertType"], "stale-state")
             self.assertEqual(result["staleSeconds"], 26 * 60)
 
+    def test_idle_pm_cache_is_invalidated_and_supervisor_restarted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            supervisor = root / "continuous-bounded-state.json"
+            backlog = root / "autonomous-product-backlog.json"
+            watcher = root / "watchdog.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            task_sha = "b" * 64
+            backlog.write_text(
+                json.dumps({
+                    "status": "task-created",
+                    "outcome": "task-created",
+                    "projectRevision": "a" * 40,
+                    "taskId": "auto-terminal-task",
+                    "taskSha": task_sha,
+                }),
+                encoding="utf-8",
+            )
+            supervisor.write_text(
+                json.dumps({
+                    "updatedAt": now.isoformat(),
+                    "status": "idle",
+                    "queueSize": 0,
+                    "currentTask": None,
+                    "stopReason": None,
+                    "nextAction": "watch-contract-directory",
+                    "autonomousBacklog": {
+                        "status": "unchanged",
+                        "outcome": "task-created",
+                        "projectRevision": "a" * 40,
+                        "taskId": "auto-terminal-task",
+                        "taskSha": task_sha,
+                        "statePath": str(backlog),
+                    },
+                }),
+                encoding="utf-8",
+            )
+            project = _write_project(root)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            runner = _RecordingServiceRunner(restarts=0)
+            notifications: list[str] = []
+            thresholds = WatchdogThresholds(
+                repeat_count=3,
+                restart_count=3,
+                idle_count=3,
+                stale_seconds=3600,
+                cooldown_seconds=1800,
+            )
+
+            for offset in range(3):
+                result = run_watchdog(
+                    supervisor,
+                    watcher,
+                    root / "alerts.log",
+                    service_name="example.service",
+                    now=now + timedelta(minutes=offset),
+                    runner=runner,
+                    notifier=lambda title, _message: notifications.append(title) or True,
+                    thresholds=thresholds,
+                    auto_repair=AutoRepairOptions(
+                        enabled=True,
+                        project_path=project,
+                        contract_dir=contracts,
+                        backup_dir=root / "backups",
+                        supervisor_state_path=supervisor,
+                    ),
+                )
+
+            repaired_backlog = json.loads(backlog.read_text(encoding="utf-8"))
+            self.assertEqual(result["status"], "repaired")
+            self.assertEqual(result["alertType"], "auto-repair-success")
+            self.assertEqual(result["idleStallCount"], 3)
+            self.assertEqual(result["repair"]["action"], "refresh-autonomous-backlog")
+            self.assertEqual(repaired_backlog["outcome"], "rescan-required")
+            self.assertEqual(repaired_backlog["invalidatedTaskSha"], task_sha)
+            self.assertEqual(notifications, ["AI Team 已自動修復並重啟"])
+            self.assertEqual(runner.actions[-3:], ["stop", "reset-failed", "start"])
+
     def test_repeated_engineer_failure_receipts_alert_while_supervisor_is_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

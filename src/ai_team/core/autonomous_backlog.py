@@ -33,23 +33,42 @@ def discover_next_task(
     provider: BaseProvider,
     timeout_seconds: int,
     project_validation_commands: tuple[str, ...] = (),
+    terminal_task_shas: frozenset[str] = frozenset(),
+    excluded_task_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Generate at most one validated task for the current project revision."""
 
     revision = _project_revision(project_path)
     prior = _read_json(state_path)
-    if prior.get("projectRevision") == revision and prior.get("outcome") in {
-        "task-created",
-        "no-safe-task",
-    }:
+    terminal_shas = {
+        value for value in terminal_task_shas
+        if isinstance(value, str) and value
+    }
+    excluded_ids = tuple(dict.fromkeys(
+        value for value in excluded_task_ids
+        if isinstance(value, str) and TASK_ID_PATTERN.fullmatch(value)
+    ))[:256]
+    prior_outcome = prior.get("outcome")
+    prior_task_is_terminal = (
+        prior_outcome == "task-created"
+        and isinstance(prior.get("taskSha"), str)
+        and prior.get("taskSha") in terminal_shas
+    )
+    if (
+        prior.get("projectRevision") == revision
+        and prior_outcome in {"task-created", "no-safe-task"}
+        and not prior_task_is_terminal
+    ):
         return {
             "status": "unchanged",
             "projectRevision": revision,
-            "outcome": prior.get("outcome"),
+            "outcome": prior_outcome,
+            "taskId": prior.get("taskId"),
+            "taskSha": prior.get("taskSha"),
             "statePath": str(state_path),
         }
 
-    prompt = _discovery_prompt(revision)
+    prompt = _discovery_prompt(revision, excluded_task_ids=excluded_ids)
     result = provider.run(
         ProviderRequest(
             workflow="autonomous-product-discovery",
@@ -113,6 +132,7 @@ def discover_next_task(
             payload["contract"],
             revision=revision,
             project_validation_commands=project_validation_commands,
+            excluded_task_ids=frozenset(excluded_ids),
         )
     except (OSError, ValueError) as exc:
         return _persist(
@@ -140,8 +160,12 @@ def discover_next_task(
     )
 
 
-def _discovery_prompt(revision: str) -> str:
-    return "\n".join((
+def _discovery_prompt(
+    revision: str,
+    *,
+    excluded_task_ids: tuple[str, ...] = (),
+) -> str:
+    lines = [
         "You are the read-only product manager for an autonomous development team.",
         f"Project Git revision: {revision}",
         "Inspect the repository, tests, recent commits, project docs, and existing product gaps.",
@@ -158,7 +182,14 @@ def _discovery_prompt(revision: str) -> str:
         "Always include changePolicy as a JSON object with exactly these boolean keys: schemaChanges, apiContractChanges, migrationArtifacts, fixtureData.",
         "When no such code change is required, set all four changePolicy values to false; never use a string, array, or null.",
         "Never request execution of migrations, seeds, deploys, or payments.",
-    ))
+    ]
+    if excluded_task_ids:
+        lines.extend((
+            "The following task IDs already reached a terminal outcome and must not be proposed again,",
+            "including renamed or materially equivalent versions: "
+            + json.dumps(excluded_task_ids, ensure_ascii=False),
+        ))
+    return "\n".join(lines)
 
 
 def _parse_payload(content: str) -> dict[str, Any]:
@@ -196,6 +227,7 @@ def _write_validated_contract(
     *,
     revision: str,
     project_validation_commands: tuple[str, ...] = (),
+    excluded_task_ids: frozenset[str] = frozenset(),
 ) -> tuple[Path, str, str]:
     contract_dir.mkdir(parents=True, exist_ok=True)
     if contract_dir.is_symlink() or not contract_dir.is_dir():
@@ -205,6 +237,8 @@ def _write_validated_contract(
 
     sanitized = dict(raw_contract)
     task_id = _normalize_task_id(sanitized.get("id"), sanitized)
+    if task_id in excluded_task_ids:
+        raise ValueError("autonomous PM proposed a task that already reached a terminal outcome")
     sanitized["id"] = task_id
     sanitized["source"] = {
         "kind": "trusted-contract",

@@ -15,6 +15,7 @@ from ai_team.core.bounded_supervisor import (
     ContinuousBoundedOptions,
     _external_qa_required,
     _exclude_deferred_contracts,
+    _terminal_task_ids,
     _sync_primary,
     cleanup_completed_worktree,
     discover_contracts,
@@ -50,6 +51,27 @@ class ContinuousBoundedSupervisorTests(unittest.TestCase):
         active = _exclude_deferred_contracts([blocked, next_task], {"blocked-sha"})
 
         self.assertEqual(active, [next_task])
+
+    def test_terminal_task_ids_include_contract_history_and_deferred_state(self) -> None:
+        completed = SimpleNamespace(
+            task_sha="completed-sha",
+            contract=SimpleNamespace(id="auto-completed"),
+        )
+        deferred = SimpleNamespace(
+            task_sha="deferred-sha",
+            contract=SimpleNamespace(id="auto-deferred"),
+        )
+
+        result = _terminal_task_ids(
+            [completed, deferred],
+            {"completed-sha", "deferred-sha"},
+            {"deferredTasks": [{"id": "auto-history-only"}]},
+        )
+
+        self.assertEqual(
+            result,
+            ("auto-completed", "auto-deferred", "auto-history-only"),
+        )
 
     def test_cleanup_is_idempotent_when_merged_worktree_is_already_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

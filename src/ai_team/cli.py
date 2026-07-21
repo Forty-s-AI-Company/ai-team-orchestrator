@@ -238,6 +238,7 @@ def check_watchdog(
     service: str,
     repeat_count: int,
     restart_count: int,
+    idle_count: int,
     stale_minutes: int,
     cooldown_minutes: int,
     powershell_path: str,
@@ -299,6 +300,7 @@ def check_watchdog(
         thresholds=WatchdogThresholds(
             repeat_count=repeat_count,
             restart_count=restart_count,
+            idle_count=idle_count,
             stale_seconds=stale_minutes * 60,
             cooldown_seconds=cooldown_minutes * 60,
         ),
@@ -901,6 +903,7 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog_parser.add_argument("--service", required=True)
     watchdog_parser.add_argument("--repeat-count", type=int, default=3)
     watchdog_parser.add_argument("--restart-count", type=int, default=3)
+    watchdog_parser.add_argument("--idle-count", type=int, default=5)
     watchdog_parser.add_argument("--stale-minutes", type=int, default=25)
     watchdog_parser.add_argument("--cooldown-minutes", type=int, default=30)
     watchdog_parser.add_argument("--powershell-path", default="powershell.exe")
@@ -1125,6 +1128,7 @@ def main() -> None:
                 args.service,
                 args.repeat_count,
                 args.restart_count,
+                args.idle_count,
                 args.stale_minutes,
                 args.cooldown_minutes,
                 args.powershell_path,

@@ -27,6 +27,7 @@ from ai_team.core.telegram_notify import (
 class WatchdogThresholds:
     repeat_count: int = 3
     restart_count: int = 3
+    idle_count: int = 5
     stale_seconds: int = 25 * 60
     cooldown_seconds: int = 30 * 60
     repair_restart_grace_seconds: int = 2 * 60
@@ -86,6 +87,16 @@ def run_watchdog(
     restart_delta = max(0, restart_total - previous_restart_total) if previous else 0
     stale_seconds = _state_age_seconds(supervisor, checked_at)
     task_failure = _task_failure_evidence(report_dir, supervisor)
+    idle_signature = _idle_stall_signature(supervisor)
+    idle_stall_count = (
+        0
+        if repair_restart_grace or idle_signature is None
+        else (
+            _nonnegative_int(previous.get("idleStallCount")) + 1
+            if previous.get("idleSignature") == idle_signature
+            else 1
+        )
+    )
 
     alert = None
     if not repair_restart_grace:
@@ -94,6 +105,8 @@ def run_watchdog(
             service,
             signature,
             same_signature_count,
+            idle_signature,
+            idle_stall_count,
             restart_delta,
             stale_seconds,
             task_failure,
@@ -166,6 +179,8 @@ def run_watchdog(
         "updatedAt": recorded_at.isoformat(),
         "signature": signature,
         "sameSignatureCount": same_signature_count,
+        "idleSignature": idle_signature,
+        "idleStallCount": idle_stall_count,
         "lastSupervisorUpdatedAt": supervisor.get("updatedAt"),
         "lastRestartCount": restart_total,
         "lastTaskFailureReason": task_failure["reason"],
@@ -227,6 +242,7 @@ def run_watchdog(
         "notificationSuppressed": suppressed,
         "repairRestartGrace": repair_restart_grace,
         "sameSignatureCount": same_signature_count,
+        "idleStallCount": idle_stall_count,
         "restartDelta": restart_delta,
         "staleSeconds": stale_seconds,
         "taskFailureReason": task_failure["reason"],
@@ -397,6 +413,8 @@ def _select_alert(
     service: dict[str, str],
     signature: str,
     same_signature_count: int,
+    idle_signature: str | None,
+    idle_stall_count: int,
     restart_delta: int,
     stale_seconds: int,
     task_failure: dict[str, Any],
@@ -418,6 +436,16 @@ def _select_alert(
             "key": "service-failed",
             "title": "AI Team 服務失敗",
             "message": "Supervisor 已進入 failed 狀態，請查看 systemctl 與 watchdog 告警紀錄。",
+        }
+    if idle_signature is not None and idle_stall_count >= thresholds.idle_count:
+        return {
+            "type": "idle-loop",
+            "key": f"idle-loop:{idle_signature}",
+            "title": "AI Team 有心跳但沒有推進",
+            "message": (
+                f"已連續 {idle_stall_count} 輪沒有任務、佇列或 Git 進度。"
+                "系統將清除失效的 PM 任務快取並重新掃描。"
+            ),
         }
     if task_failure["reason"] and task_failure["count"] >= thresholds.repeat_count:
         repeated_reason = _safe_label(task_failure["reason"], "原因未提供")
@@ -559,6 +587,33 @@ def _state_signature(supervisor: dict[str, Any]) -> str:
         supervisor.get("nextAction"),
     )
     return "|".join(str(value or "") for value in values)
+
+
+def _idle_stall_signature(supervisor: dict[str, Any]) -> str | None:
+    """Identify an orphaned PM cache while the heartbeat remains healthy."""
+
+    if (
+        supervisor.get("status") != "idle"
+        or _nonnegative_int(supervisor.get("queueSize")) != 0
+        or supervisor.get("currentTask") is not None
+        or supervisor.get("nextAction") != "watch-contract-directory"
+    ):
+        return None
+    backlog = supervisor.get("autonomousBacklog")
+    if not isinstance(backlog, dict):
+        return None
+    task_sha = backlog.get("taskSha")
+    revision = backlog.get("projectRevision")
+    if (
+        backlog.get("status") != "unchanged"
+        or backlog.get("outcome") != "task-created"
+        or not isinstance(task_sha, str)
+        or not task_sha
+        or not isinstance(revision, str)
+        or not revision
+    ):
+        return None
+    return f"{revision[:40]}:{task_sha[:64]}"
 
 
 def _needs_attention(supervisor: dict[str, Any]) -> bool:
@@ -727,6 +782,7 @@ def _validate_thresholds(thresholds: WatchdogThresholds) -> None:
     if min(
         thresholds.repeat_count,
         thresholds.restart_count,
+        thresholds.idle_count,
         thresholds.stale_seconds,
         thresholds.cooldown_seconds,
         thresholds.repair_restart_grace_seconds,

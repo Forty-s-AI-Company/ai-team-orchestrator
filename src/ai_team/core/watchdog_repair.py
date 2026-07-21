@@ -77,11 +77,14 @@ class AutoRepairOptions:
 def repair_key(supervisor: dict[str, Any], task_failure_reason: str | None) -> str:
     task = supervisor.get("currentTask")
     task_sha = task.get("taskSha") if isinstance(task, dict) else None
+    backlog = supervisor.get("autonomousBacklog")
+    backlog_task_sha = backlog.get("taskSha") if isinstance(backlog, dict) else None
     identity = {
         "taskSha": str(task_sha or "no-task"),
         "stopReason": str(supervisor.get("stopReason") or ""),
         "taskFailureReason": str(task_failure_reason or ""),
         "diagnostic": str(supervisor.get("diagnostic") or ""),
+        "backlogTaskSha": str(backlog_task_sha or ""),
     }
     digest = hashlib.sha256(
         json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -119,6 +122,8 @@ def attempt_auto_repair(
     diagnostic = str(supervisor.get("diagnostic") or "")
     if diagnostic == CONTRACT_COMMAND_DIAGNOSTIC:
         repair = _repair_contract_commands(supervisor, options, now=now)
+    elif alert_type == "idle-loop":
+        repair = _invalidate_stalled_backlog(supervisor, options, now=now)
     elif alert_type in {"service-failed", "stale-state"}:
         repair = _result(True, True, "controlled-restart", "supervisor stopped for a clean restart")
     elif options.ai_repair_enabled:
@@ -173,6 +178,67 @@ def attempt_auto_repair(
             "diagnostic": "supervisor restarted but revive timer could not be restored",
         }
     return {**repair, "restarted": True}
+
+
+def _invalidate_stalled_backlog(
+    supervisor: dict[str, Any],
+    options: AutoRepairOptions,
+    *,
+    now: datetime | None,
+) -> dict[str, Any]:
+    """Invalidate only the orphaned autonomous PM cache, then rescan safely."""
+
+    supervisor_path = options.supervisor_state_path
+    backlog = supervisor.get("autonomousBacklog")
+    state_value = backlog.get("statePath") if isinstance(backlog, dict) else None
+    if supervisor_path is None or not isinstance(state_value, str) or not state_value:
+        return _result(True, False, "refresh-autonomous-backlog", "autonomous backlog state is missing")
+
+    try:
+        expected = supervisor_path.resolve(strict=True).with_name(
+            "autonomous-product-backlog.json"
+        )
+    except OSError as exc:
+        return _result(True, False, "refresh-autonomous-backlog", str(exc)[:300])
+    candidate = Path(state_value)
+    try:
+        if candidate.is_symlink():
+            raise ValueError("autonomous backlog state path must not be a symlink")
+        resolved = candidate.resolve(strict=True)
+        if resolved != expected or not resolved.is_file():
+            raise ValueError("autonomous backlog state path is not trusted")
+        if resolved.stat().st_size > 1_000_000:
+            raise ValueError("autonomous backlog state exceeds size limit")
+        state = json.loads(resolved.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("autonomous backlog state must be a JSON object")
+        expected_task_sha = backlog.get("taskSha") if isinstance(backlog, dict) else None
+        if (
+            state.get("outcome") != "task-created"
+            or not isinstance(expected_task_sha, str)
+            or state.get("taskSha") != expected_task_sha
+        ):
+            raise ValueError("autonomous backlog changed before repair")
+        repaired_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        state.update({
+            "updatedAt": repaired_at,
+            "status": "rescan-required",
+            "outcome": "rescan-required",
+            "invalidatedTaskSha": expected_task_sha,
+            "diagnostic": "orphaned terminal task cache invalidated by watchdog",
+        })
+        _write_bytes_atomic(
+            resolved,
+            (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return _result(True, False, "refresh-autonomous-backlog", str(exc)[:300])
+    return _result(
+        True,
+        True,
+        "refresh-autonomous-backlog",
+        "orphaned PM cache invalidated; supervisor will rescan",
+    )
 
 
 def _record_deferred_task(

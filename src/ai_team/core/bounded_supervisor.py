@@ -140,6 +140,7 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
             # Deferred tasks remain visible in state/report history but are
             # removed from the runnable queue. Their dependants stay blocked
             # because a deferred task is deliberately not treated as complete.
+            terminal_task_ids = _terminal_task_ids(entries, completed | deferred, prior)
             entries = _exclude_deferred_contracts(entries, deferred)
             blocked_tasks = _blocked_tasks(entries, completed)
             selected = _next_ready_contract(entries, completed)
@@ -177,6 +178,8 @@ def run_continuous_bounded_delivery(options: ContinuousBoundedOptions) -> dict[s
                                 for command in (*baseline_commands, *commands.additional_validation)
                                 if isinstance(command, str)
                             ),
+                            terminal_task_shas=frozenset(completed | deferred),
+                            excluded_task_ids=terminal_task_ids,
                         )
                     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                         autonomous_backlog = {
@@ -1299,6 +1302,26 @@ def _exclude_deferred_contracts(
     entries: list[ContractEntry], deferred: set[str]
 ) -> list[ContractEntry]:
     return [entry for entry in entries if entry.task_sha not in deferred]
+
+
+def _terminal_task_ids(
+    entries: list[ContractEntry],
+    terminal_shas: set[str],
+    prior: dict[str, Any],
+) -> tuple[str, ...]:
+    """Return bounded task IDs that PM discovery must not propose again."""
+
+    values = [
+        entry.contract.id
+        for entry in entries
+        if entry.task_sha in terminal_shas
+    ]
+    deferred_items = prior.get("deferredTasks")
+    for item in deferred_items if isinstance(deferred_items, list) else []:
+        task_id = item.get("id") if isinstance(item, dict) else None
+        if isinstance(task_id, str) and task_id not in values:
+            values.append(task_id)
+    return tuple(values[-256:])
 
 
 def _next_ready_contract(entries: list[ContractEntry], completed: set[str]) -> ContractEntry | None:
