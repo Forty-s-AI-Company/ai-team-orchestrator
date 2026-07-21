@@ -175,6 +175,56 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(result["restartDelta"], 4)
             self.assertIn("重啟 4 次", messages[0])
 
+    def test_restart_counter_rebaselines_after_watchdog_maintenance_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            supervisor = root / "supervisor.json"
+            watcher = root / "watchdog.json"
+            alerts = root / "alerts.log"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(supervisor, now, status="running")
+            watcher.write_text(
+                json.dumps({
+                    "schemaVersion": 1,
+                    "updatedAt": (now - timedelta(minutes=20)).isoformat(),
+                    "lastRestartCount": 1,
+                }),
+                encoding="utf-8",
+            )
+
+            baseline = run_watchdog(
+                supervisor,
+                watcher,
+                alerts,
+                service_name="example.service",
+                now=now,
+                runner=_service_runner(20),
+                notifier=lambda _title, _message: True,
+            )
+
+            self.assertEqual(baseline["status"], "ok")
+            self.assertIsNone(baseline["alertType"])
+            self.assertEqual(baseline["restartDelta"], 0)
+            self.assertFalse(baseline["restartObservationContiguous"])
+            self.assertEqual(
+                json.loads(watcher.read_text(encoding="utf-8"))["lastRestartCount"],
+                20,
+            )
+
+            observed = run_watchdog(
+                supervisor,
+                watcher,
+                alerts,
+                service_name="example.service",
+                now=now + timedelta(minutes=1),
+                runner=_service_runner(24),
+                notifier=lambda _title, _message: True,
+            )
+
+            self.assertEqual(observed["alertType"], "restart-loop")
+            self.assertEqual(observed["restartDelta"], 4)
+            self.assertTrue(observed["restartObservationContiguous"])
+
     def test_stale_running_state_alerts_after_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

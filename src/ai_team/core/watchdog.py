@@ -33,6 +33,7 @@ class WatchdogThresholds:
     stale_seconds: int = 25 * 60
     cooldown_seconds: int = 30 * 60
     repair_restart_grace_seconds: int = 2 * 60
+    restart_observation_max_gap_seconds: int = 5 * 60
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -86,7 +87,16 @@ def run_watchdog(
 
     restart_total = _nonnegative_int(service.get("NRestarts"))
     previous_restart_total = _nonnegative_int(previous.get("lastRestartCount"))
-    restart_delta = max(0, restart_total - previous_restart_total) if previous else 0
+    restart_observation_contiguous = _restart_observation_is_contiguous(
+        previous,
+        checked_at,
+        thresholds.restart_observation_max_gap_seconds,
+    )
+    restart_delta = (
+        max(0, restart_total - previous_restart_total)
+        if restart_observation_contiguous
+        else 0
+    )
     supervisor_stale_seconds = _state_age_seconds(supervisor, checked_at)
     task_progress = _task_progress_evidence(report_dir, supervisor, checked_at)
     progress_age = task_progress.get("ageSeconds")
@@ -287,6 +297,7 @@ def run_watchdog(
         "notificationDelivered": delivered,
         "notificationSuppressed": suppressed,
         "repairRestartGrace": repair_restart_grace,
+        "restartObservationContiguous": restart_observation_contiguous,
         "sameSignatureCount": same_signature_count,
         "idleStallCount": idle_stall_count,
         "restartDelta": restart_delta,
@@ -309,6 +320,34 @@ def _repair_condition_present(
     supervisor: dict[str, Any], task_failure: dict[str, Any], restart_delta: int
 ) -> bool:
     return _needs_attention(supervisor) or bool(task_failure["reason"]) or restart_delta > 0
+
+
+def _restart_observation_is_contiguous(
+    previous: dict[str, Any],
+    now: datetime,
+    maximum_gap_seconds: int,
+) -> bool:
+    """Compare cumulative systemd restarts only across adjacent observations.
+
+    ``NRestarts`` is cumulative for the loaded unit. If the watchdog was
+    intentionally disabled during maintenance, subtracting a many-hours-old
+    baseline would misreport every historical restart as a one-minute loop.
+    Legacy state without an observation timestamp retains the old comparison
+    behavior for compatibility; malformed or expired timestamps rebaseline.
+    """
+    if not previous:
+        return False
+    value = previous.get("updatedAt")
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    try:
+        observed_at = _as_utc(datetime.fromisoformat(value))
+    except ValueError:
+        return False
+    elapsed = (now - observed_at).total_seconds()
+    return 0 <= elapsed <= maximum_gap_seconds
 
 
 def _awaiting_post_repair_heartbeat(
@@ -912,6 +951,7 @@ def _validate_thresholds(thresholds: WatchdogThresholds) -> None:
         thresholds.stale_seconds,
         thresholds.cooldown_seconds,
         thresholds.repair_restart_grace_seconds,
+        thresholds.restart_observation_max_gap_seconds,
     ) <= 0:
         raise ValueError("watchdog thresholds must be positive")
 
