@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -85,7 +86,14 @@ def run_watchdog(
     restart_total = _nonnegative_int(service.get("NRestarts"))
     previous_restart_total = _nonnegative_int(previous.get("lastRestartCount"))
     restart_delta = max(0, restart_total - previous_restart_total) if previous else 0
-    stale_seconds = _state_age_seconds(supervisor, checked_at)
+    supervisor_stale_seconds = _state_age_seconds(supervisor, checked_at)
+    task_progress = _task_progress_evidence(report_dir, supervisor, checked_at)
+    progress_age = task_progress.get("ageSeconds")
+    stale_seconds = (
+        min(supervisor_stale_seconds, progress_age)
+        if isinstance(progress_age, int)
+        else supervisor_stale_seconds
+    )
     task_failure = _task_failure_evidence(report_dir, supervisor)
     idle_signature = _idle_stall_signature(supervisor)
     idle_stall_count = (
@@ -182,6 +190,8 @@ def run_watchdog(
         "idleSignature": idle_signature,
         "idleStallCount": idle_stall_count,
         "lastSupervisorUpdatedAt": supervisor.get("updatedAt"),
+        "lastTaskProgressAt": task_progress.get("updatedAt"),
+        "lastTaskProgressStage": task_progress.get("stage"),
         "lastRestartCount": restart_total,
         "lastTaskFailureReason": task_failure["reason"],
         "taskFailureCount": task_failure["count"],
@@ -245,6 +255,9 @@ def run_watchdog(
         "idleStallCount": idle_stall_count,
         "restartDelta": restart_delta,
         "staleSeconds": stale_seconds,
+        "supervisorStaleSeconds": supervisor_stale_seconds,
+        "taskProgressAgeSeconds": progress_age,
+        "taskProgressStage": task_progress.get("stage"),
         "taskFailureReason": task_failure["reason"],
         "taskFailureCount": task_failure["count"],
         "taskReceiptCount": task_failure["receiptCount"],
@@ -634,6 +647,85 @@ def _state_age_seconds(supervisor: dict[str, Any], now: datetime) -> int:
     return max(0, int((now - updated_at).total_seconds()))
 
 
+def _task_progress_evidence(
+    report_dir: Path | None,
+    supervisor: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    """Return only bounded-delivery progress bound to the current task SHA.
+
+    The heartbeat is a structured state transition written by bounded delivery
+    itself.  A process merely existing, or writing arbitrary stdout, never
+    counts as progress.
+    """
+
+    empty = {"updatedAt": None, "ageSeconds": None, "stage": None}
+    task = supervisor.get("currentTask")
+    if not isinstance(task, dict):
+        return empty
+    task_sha = task.get("taskSha")
+    if not isinstance(task_sha, str) or re.fullmatch(r"[0-9a-f]{64}", task_sha) is None:
+        return empty
+    state_path = _current_task_state_path(report_dir, task_sha)
+    if state_path is None:
+        return empty
+    try:
+        state = _read_json(state_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return empty
+    stage = state.get("stage")
+    if (
+        state.get("schemaVersion") != 1
+        or state.get("taskSha") != task_sha
+        or state.get("status") != "running"
+        or stage not in {"pm", "architect", "engineer", "qa", "review"}
+    ):
+        return empty
+    value = state.get("updatedAt")
+    if not isinstance(value, str):
+        return empty
+    try:
+        updated_at = _as_utc(datetime.fromisoformat(value))
+    except ValueError:
+        return empty
+    # A damaged or manually forged future timestamp must not suppress stale
+    # recovery indefinitely.  Five minutes only covers ordinary clock skew.
+    if (updated_at - now).total_seconds() > 5 * 60:
+        return empty
+    return {
+        "updatedAt": updated_at.isoformat(),
+        "ageSeconds": max(0, int((now - updated_at).total_seconds())),
+        "stage": stage,
+    }
+
+
+def _current_task_state_path(report_dir: Path | None, task_sha: str) -> Path | None:
+    if report_dir is None or re.fullmatch(r"[0-9a-f]{64}", task_sha) is None:
+        return None
+    candidates: list[Path] = []
+    for tasks_root in (
+        report_dir / "continuous-bounded-delivery" / "tasks",
+        report_dir / "tasks",
+    ):
+        if not tasks_root.is_dir() or tasks_root.is_symlink():
+            continue
+        try:
+            resolved_root = tasks_root.resolve(strict=True)
+        except OSError:
+            continue
+        for state_path in tasks_root.glob(f"*-{task_sha[:12]}/state.json"):
+            if state_path.is_symlink() or state_path.parent.is_symlink():
+                continue
+            try:
+                resolved = state_path.resolve(strict=True)
+                resolved.relative_to(resolved_root)
+            except (OSError, ValueError):
+                continue
+            if resolved.is_file() and resolved.stat().st_size <= 4_000_000:
+                candidates.append(resolved)
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _task_failure_evidence(report_dir: Path | None, supervisor: dict[str, Any]) -> dict[str, Any]:
     empty = {"reason": None, "count": 0, "receiptCount": 0}
     task = supervisor.get("currentTask")
@@ -643,17 +735,9 @@ def _task_failure_evidence(report_dir: Path | None, supervisor: dict[str, Any]) 
     if not isinstance(task_sha, str) or len(task_sha) < 12:
         return empty
 
-    task_state_paths: list[Path] = []
-    for tasks_root in (
-        report_dir / "continuous-bounded-delivery" / "tasks",
-        report_dir / "tasks",
-    ):
-        if tasks_root.is_dir():
-            task_state_paths.extend(tasks_root.glob(f"*-{task_sha[:12]}/state.json"))
-    if len(task_state_paths) != 1:
+    task_state_path = _current_task_state_path(report_dir, task_sha)
+    if task_state_path is None:
         return empty
-
-    task_state_path = task_state_paths[0]
     task_root = task_state_path.parent.resolve()
     try:
         task_state = _read_json(task_state_path)

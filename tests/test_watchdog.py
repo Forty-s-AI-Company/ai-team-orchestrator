@@ -195,6 +195,80 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(result["alertType"], "stale-state")
             self.assertEqual(result["staleSeconds"], 26 * 60)
 
+    def test_fresh_bounded_task_progress_prevents_stale_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            supervisor = root / "supervisor.json"
+            reports = root / "reports"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(
+                supervisor,
+                now - timedelta(minutes=31),
+                status="running",
+            )
+            _write_task_progress(
+                reports,
+                updated_at=now - timedelta(minutes=2),
+                stage="qa",
+            )
+
+            result = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                report_dir=reports,
+                now=now,
+                runner=_service_runner(5),
+                notifier=lambda _title, _message: True,
+            )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertIsNone(result["alertType"])
+            self.assertEqual(result["supervisorStaleSeconds"], 31 * 60)
+            self.assertEqual(result["staleSeconds"], 2 * 60)
+            self.assertEqual(result["taskProgressAgeSeconds"], 2 * 60)
+            self.assertEqual(result["taskProgressStage"], "qa")
+
+    def test_unmatched_or_terminal_task_state_cannot_hide_stale_supervisor(self) -> None:
+        cases = (
+            ("b" * 64, "running"),
+            ("a" * 64, "completed"),
+        )
+        for task_sha, task_status in cases:
+            with self.subTest(task_sha=task_sha, task_status=task_status), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                supervisor = root / "supervisor.json"
+                reports = root / "reports"
+                now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+                _write_supervisor(
+                    supervisor,
+                    now - timedelta(minutes=31),
+                    status="running",
+                )
+                _write_task_progress(
+                    reports,
+                    updated_at=now - timedelta(minutes=1),
+                    stage="engineer",
+                    task_sha=task_sha,
+                    status=task_status,
+                )
+
+                result = run_watchdog(
+                    supervisor,
+                    root / "watchdog.json",
+                    root / "alerts.log",
+                    service_name="example.service",
+                    report_dir=reports,
+                    now=now,
+                    runner=_service_runner(5),
+                    notifier=lambda _title, _message: True,
+                )
+
+                self.assertEqual(result["alertType"], "stale-state")
+                self.assertEqual(result["staleSeconds"], 31 * 60)
+                self.assertIsNone(result["taskProgressAgeSeconds"])
+
     def test_idle_pm_cache_is_invalidated_and_supervisor_restarted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1239,6 +1313,34 @@ def _write_task_failure_receipts(report_dir: Path, *, count: int, reason: str) -
         receipt.write_text(json.dumps({"stopReason": reason}), encoding="utf-8")
         receipts.append(str(receipt))
     (task_root / "state.json").write_text(json.dumps({"receipts": receipts}), encoding="utf-8")
+
+
+def _write_task_progress(
+    report_dir: Path,
+    *,
+    updated_at: datetime,
+    stage: str,
+    task_sha: str = "a" * 64,
+    status: str = "running",
+) -> None:
+    task_root = (
+        report_dir
+        / "continuous-bounded-delivery"
+        / "tasks"
+        / f"auto-example-task-{'a' * 12}"
+    )
+    task_root.mkdir(parents=True)
+    (task_root / "state.json").write_text(
+        json.dumps({
+            "schemaVersion": 1,
+            "updatedAt": updated_at.isoformat(),
+            "status": status,
+            "stage": stage,
+            "taskSha": task_sha,
+            "receipts": [],
+        }),
+        encoding="utf-8",
+    )
 
 
 def _append_successful_engineer_receipt(report_dir: Path) -> None:

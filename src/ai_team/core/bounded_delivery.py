@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 from dataclasses import asdict, dataclass
@@ -318,6 +319,7 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             )
 
         _write_state(options, "running", "engineer", context)
+
         def checkpoint_worktree(path: Path) -> None:
             loaded_worktree = load_project(path, allowlist=options.workspace_allowlist)
             context.update({
@@ -331,10 +333,15 @@ def run_bounded_delivery(options: BoundedDeliveryOptions) -> dict[str, Any]:
             })
             _write_state(options, "running", "engineer", context)
 
+        def checkpoint_progress(phase: str) -> None:
+            context["progressPhase"] = phase
+            _write_state(options, "running", "engineer", context)
+
         engineering_executor = options.engineering_executor or _default_engineering_executor(
             options,
             reusable_worktree=reusable_worktree,
             on_worktree_ready=checkpoint_worktree,
+            on_progress=checkpoint_progress,
         )
         for iteration in range(1, options.limits.max_iterations + 1):
             instruction = _engineering_instruction(context, repairs)
@@ -559,6 +566,7 @@ def _default_engineering_executor(
     *,
     reusable_worktree: Path | None = None,
     on_worktree_ready: Callable[[Path], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> Callable[[TrustedTaskContract, str, BaseProvider, int], EngineeringAttempt]:
 
     def execute(contract: TrustedTaskContract, instruction: str, provider: BaseProvider, iteration: int) -> EngineeringAttempt:
@@ -574,6 +582,7 @@ def _default_engineering_executor(
             reuse_worktree_path=reusable_worktree,
             trusted_dev=options.trusted_dev,
             on_worktree_ready=on_worktree_ready,
+            on_progress=on_progress,
         )
         reusable_worktree = result.worktree_path
         validation = result.commit_result.get("validation") or {"success": False}
@@ -1268,8 +1277,22 @@ def _stop(options: BoundedDeliveryOptions, context: dict[str, Any], reason: str,
 
 def _write_state(options: BoundedDeliveryOptions, status: str, stage: str, context: dict[str, Any], reason: str | None = None) -> None:
     options.state_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = redact_secrets({"schemaVersion": 1, "status": status, "stage": stage, "stopReason": reason, **context})
-    options.state_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    payload = redact_secrets({
+        "schemaVersion": 1,
+        "updatedAt": datetime.now(UTC).isoformat(),
+        "status": status,
+        "stage": stage,
+        "stopReason": reason,
+        **context,
+    })
+    temporary = options.state_path.with_name(
+        f".{options.state_path.name}.{os.getpid()}.tmp"
+    )
+    temporary.write_text(
+        json.dumps(payload, indent=2, default=str),
+        encoding="utf-8",
+    )
+    os.replace(temporary, options.state_path)
 
 
 def _native_success(result: ProviderResult, expected_provider: str) -> bool:

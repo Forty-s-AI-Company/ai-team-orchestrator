@@ -73,6 +73,7 @@ def run_in_disposable_worktree(
     reuse_worktree_path: Path | None = None,
     trusted_dev: TrustedDevSettings = TrustedDevSettings(),
     on_worktree_ready: Callable[[Path], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> IsolatedRunResult:
     source = load_project(source_project_path, allowlist=workspace_allowlist)
     workflow = load_workflow(workflow_name)
@@ -97,6 +98,8 @@ def run_in_disposable_worktree(
         worktree_path = create_disposable_worktree(source, worktree_parent=worktree_parent)
     if on_worktree_ready is not None:
         on_worktree_ready(worktree_path)
+    if on_progress is not None:
+        on_progress("worktree-ready")
     executor_receipt: Path | None = None
     try:
         loaded = load_project(worktree_path, allowlist=workspace_allowlist)
@@ -112,6 +115,8 @@ def run_in_disposable_worktree(
             # The write provider must see the same controlled dependency tree
             # used by deterministic validation. This is also what makes local
             # framework documentation available before a Next.js edit.
+            if on_progress is not None:
+                on_progress("provider-started")
             result = Orchestrator(provider=provider, max_retries=2).run(
                 loaded,
                 workflow_name=workflow_name,
@@ -119,6 +124,8 @@ def run_in_disposable_worktree(
                 run_mode=run_mode,
                 task_instruction=task_instruction,
             )
+            if on_progress is not None:
+                on_progress("provider-completed")
             candidate_before_validation = capture_candidate_snapshot(loaded.root)
             dependency_root = (
                 loaded.root
@@ -132,6 +139,8 @@ def run_in_disposable_worktree(
                     trusted_dev.test_database,
                     dependency_root=dependency_root,
                 )
+                if on_progress is not None:
+                    on_progress("test-database-bootstrap-completed")
                 validation_result = (
                     run_validation_commands(
                         loaded.root,
@@ -139,6 +148,7 @@ def run_in_disposable_worktree(
                         require_nonempty=require_validation,
                         dependency_root=dependency_root,
                         environment_overrides=database_environment,
+                        on_progress=on_progress,
                     )
                     if bootstrap_result["success"]
                     else bootstrap_result
@@ -611,6 +621,7 @@ def run_validation_commands(
     require_nonempty: bool = False,
     dependency_root: Path | None = None,
     environment_overrides: dict[str, str] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if require_nonempty and not commands:
         payload: dict[str, Any] = {
@@ -627,7 +638,9 @@ def run_validation_commands(
         payload["hash"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
         return payload
     results: list[dict[str, Any]] = []
-    for command in commands:
+    for index, command in enumerate(commands, start=1):
+        if on_progress is not None:
+            on_progress(f"validation-{index}-started")
         args = shlex.split(command, posix=False)
         executable = shutil.which(args[0])
         if executable:
@@ -663,6 +676,8 @@ def run_validation_commands(
                 "stderr": str(exc.stderr or exc)[-4000:],
             }
         results.append(result)
+        if on_progress is not None:
+            on_progress(f"validation-{index}-completed")
         if result["returnCode"] != 0:
             break
     payload = {"success": all(item["returnCode"] == 0 for item in results), "commands": results}
