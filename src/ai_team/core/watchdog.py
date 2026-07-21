@@ -15,6 +15,7 @@ from ai_team.core.watchdog_repair import (
     AutoRepairOptions,
     attempt_auto_repair,
     repair_key,
+    repair_subject,
     requires_manual_review,
 )
 from ai_team.core.telegram_notify import (
@@ -124,21 +125,52 @@ def run_watchdog(
     informational_alert = bool(
         alert and alert.get("type") in INFORMATIONAL_ALERT_TYPES
     )
+    repair_alert_type = alert.get("type") if alert else None
     current_repair_key = (
         None
-        if manual_review_required or informational_alert
-        else repair_key(supervisor, task_failure["reason"])
+        if manual_review_required or informational_alert or repair_alert_type is None
+        else repair_key(supervisor, task_failure["reason"], repair_alert_type)
+    )
+    current_repair_subject = repair_subject(supervisor)
+    same_repair_subject = previous.get("repairSubject") in {
+        None,
+        current_repair_subject,
+    }
+    repair_attempts_by_key = _repair_attempts_by_key(
+        previous,
+        current_repair_subject,
     )
     previous_repair_attempts = (
-        _nonnegative_int(previous.get("repairAttempts"))
-        if current_repair_key is not None and previous.get("repairKey") == current_repair_key
+        repair_attempts_by_key.get(current_repair_key, 0)
+        if current_repair_key is not None
+        else 0
+    )
+    total_repair_attempts = (
+        _nonnegative_int(previous.get("totalRepairAttempts"))
+        if same_repair_subject
         else 0
     )
     repair: dict[str, Any] | None = None
     repair_attempts = previous_repair_attempts
     if alert and auto_repair.enabled and not manual_review_required and not informational_alert:
-        if previous_repair_attempts < auto_repair.max_attempts:
+        if total_repair_attempts >= auto_repair.max_total_attempts:
+            repair = {
+                "attempted": False,
+                "success": False,
+                "action": "global-attempt-limit-reached",
+                "diagnostic": (
+                    "maximum total automatic repair attempts reached for this task; "
+                    "supervisor remains stopped"
+                ),
+                "restarted": False,
+                "exhausted": True,
+                "limitScope": "task-total",
+            }
+        elif previous_repair_attempts < auto_repair.max_attempts:
             repair_attempts += 1
+            total_repair_attempts += 1
+            if current_repair_key is not None:
+                repair_attempts_by_key[current_repair_key] = repair_attempts
             repair = attempt_auto_repair(
                 supervisor,
                 alert_type=alert["type"],
@@ -156,6 +188,7 @@ def run_watchdog(
                 "diagnostic": "maximum automatic repair attempts reached; supervisor remains stopped",
                 "restarted": False,
                 "exhausted": True,
+                "limitScope": "alert-type",
             }
         alert = _repair_alert(alert, repair, repair_attempts, auto_repair.max_attempts)
     elif manual_review_required or not _repair_condition_present(supervisor, task_failure, restart_delta):
@@ -214,8 +247,11 @@ def run_watchdog(
             alert.get("type") if alert else None,
         ),
         "autoRepairEnabled": auto_repair.enabled,
+        "repairSubject": current_repair_subject,
         "repairKey": current_repair_key,
         "repairAttempts": repair_attempts,
+        "repairAttemptsByKey": repair_attempts_by_key,
+        "totalRepairAttempts": total_repair_attempts,
         "lastRepairAt": (
             recorded_at.isoformat()
             if repair and repair.get("attempted") is True
@@ -262,6 +298,8 @@ def run_watchdog(
         "taskFailureCount": task_failure["count"],
         "taskReceiptCount": task_failure["receiptCount"],
         "repairAttempts": repair_attempts,
+        "totalRepairAttempts": total_repair_attempts,
+        "maxTotalRepairAttempts": auto_repair.max_total_attempts,
         "repair": repair,
         "service": service,
     }
@@ -333,11 +371,15 @@ def _repair_alert(
             "message": f"修復動作：{repair.get('action')}；嘗試 {attempts}/{maximum}。",
         }
     if repair.get("exhausted") is True:
+        if repair.get("limitScope") == "task-total":
+            limit_message = "同一任務已達跨故障類型的自動修復總上限"
+        else:
+            limit_message = f"同一問題已達 {maximum} 次修復上限"
         return {
             "type": "auto-repair-exhausted",
             "key": f"auto-repair-exhausted:{original['key']}",
             "title": "AI Team 自動修復已停止",
-            "message": f"同一問題已達 {maximum} 次修復上限；Supervisor 保持停止，請查看紀錄。",
+            "message": f"{limit_message}；Supervisor 保持停止，請查看紀錄。",
         }
     return {
         "type": "auto-repair-failed",
@@ -877,6 +919,10 @@ def _validate_thresholds(thresholds: WatchdogThresholds) -> None:
 def _validate_auto_repair(options: AutoRepairOptions) -> None:
     if options.max_attempts <= 0:
         raise ValueError("watchdog auto repair attempts must be positive")
+    if options.max_total_attempts < options.max_attempts:
+        raise ValueError(
+            "watchdog total auto repair attempts must be at least the per-alert limit"
+        )
     if options.enabled and any(
         path is None for path in (options.project_path, options.contract_dir, options.backup_dir)
     ):
@@ -899,6 +945,24 @@ def _nonnegative_int(value: Any) -> int:
         return max(0, int(str(value)))
     except (TypeError, ValueError):
         return 0
+
+
+def _repair_attempts_by_key(
+    previous: dict[str, Any],
+    current_subject: str,
+) -> dict[str, int]:
+    if previous.get("repairSubject") not in {None, current_subject}:
+        return {}
+    result: dict[str, int] = {}
+    value = previous.get("repairAttemptsByKey")
+    if isinstance(value, dict):
+        for key, attempts in list(value.items())[-32:]:
+            if isinstance(key, str) and 1 <= len(key) <= 300:
+                result[key] = _nonnegative_int(attempts)
+    legacy_key = previous.get("repairKey")
+    if not result and isinstance(legacy_key, str) and legacy_key:
+        result[legacy_key[:300]] = _nonnegative_int(previous.get("repairAttempts"))
+    return result
 
 
 def _safe_label(value: Any, fallback: str) -> str:

@@ -778,6 +778,7 @@ ai-team watchdog \
   --contract-dir ~/.local/share/ai-team/CelebrateDeal/contracts \
   --repair-backup-dir ~/.local/state/ai-team/CelebrateDeal/repair-backups \
   --max-auto-repair-attempts 1 \
+  --max-total-auto-repair-attempts 5 \
   --ai-repair \
   --orchestrator-project ~/projects/ai-team-orchestrator \
   --ai-repair-report-dir ~/.local/share/ai-team/CelebrateDeal/reports \

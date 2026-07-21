@@ -60,6 +60,7 @@ class AutoRepairOptions:
     contract_dir: Path | None = None
     backup_dir: Path | None = None
     max_attempts: int = 2
+    max_total_attempts: int = 5
     ai_repair_enabled: bool = False
     orchestrator_path: Path | None = None
     ai_report_dir: Path | None = None
@@ -74,22 +75,35 @@ class AutoRepairOptions:
     max_ai_repair_cycles: int = 5
 
 
-def repair_key(supervisor: dict[str, Any], task_failure_reason: str | None) -> str:
+def repair_subject(supervisor: dict[str, Any]) -> str:
     task = supervisor.get("currentTask")
     task_sha = task.get("taskSha") if isinstance(task, dict) else None
     backlog = supervisor.get("autonomousBacklog")
     backlog_task_sha = backlog.get("taskSha") if isinstance(backlog, dict) else None
+    return str(task_sha or backlog_task_sha or "no-task")[:128]
+
+
+def repair_key(
+    supervisor: dict[str, Any],
+    task_failure_reason: str | None,
+    alert_type: str,
+) -> str:
+    subject = repair_subject(supervisor)
     identity = {
-        "taskSha": str(task_sha or "no-task"),
+        "taskSha": subject,
+        "alertType": str(alert_type),
         "stopReason": str(supervisor.get("stopReason") or ""),
         "taskFailureReason": str(task_failure_reason or ""),
         "diagnostic": str(supervisor.get("diagnostic") or ""),
-        "backlogTaskSha": str(backlog_task_sha or ""),
     }
     digest = hashlib.sha256(
         json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
-    return f"{identity['taskSha']}:{digest}"
+    alert_label = "".join(
+        character if character.isalnum() or character in "-_" else "-"
+        for character in alert_type
+    )[:64]
+    return f"{subject}:{alert_label}:{digest}"
 
 
 def attempt_auto_repair(

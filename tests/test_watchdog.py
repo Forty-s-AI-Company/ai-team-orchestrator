@@ -665,6 +665,125 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(runner.actions.count("stop"), 1)
             self.assertNotIn("start", runner.actions)
 
+    def test_controlled_restart_keeps_receipt_repair_budget_and_global_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = _write_project(root)
+            orchestrator = root / "orchestrator"
+            orchestrator.mkdir()
+            contracts = root / "contracts"
+            contracts.mkdir()
+            reports = root / "reports"
+            supervisor = root / "supervisor.json"
+            watcher = root / "watchdog.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(
+                supervisor,
+                now - timedelta(minutes=26),
+                status="running",
+            )
+            runner = _RecordingServiceRunner(restarts=0)
+            ai_calls: list[str] = []
+            options = AutoRepairOptions(
+                enabled=True,
+                project_path=project,
+                contract_dir=contracts,
+                backup_dir=root / "backups",
+                max_attempts=1,
+                max_total_attempts=2,
+                ai_repair_enabled=True,
+                orchestrator_path=orchestrator,
+                ai_report_dir=reports,
+            )
+            thresholds = WatchdogThresholds(
+                repeat_count=1,
+                restart_count=99,
+                stale_seconds=25 * 60,
+                cooldown_seconds=30 * 60,
+            )
+
+            restarted = run_watchdog(
+                supervisor,
+                watcher,
+                root / "alerts.log",
+                service_name="example.service",
+                report_dir=reports,
+                now=now,
+                runner=runner,
+                notifier=lambda _title, _message: True,
+                thresholds=thresholds,
+                auto_repair=options,
+            )
+            self.assertEqual(restarted["repair"]["action"], "controlled-restart")
+            self.assertEqual(restarted["repairAttempts"], 1)
+            self.assertEqual(restarted["totalRepairAttempts"], 1)
+
+            _write_supervisor(
+                supervisor,
+                now + timedelta(minutes=1),
+                status="running",
+            )
+            _write_task_failure_receipts(
+                reports,
+                count=3,
+                reason="deterministic-validation-failed",
+            )
+            receipt_repair = run_watchdog(
+                supervisor,
+                watcher,
+                root / "alerts.log",
+                service_name="example.service",
+                report_dir=reports,
+                now=now + timedelta(minutes=1),
+                runner=runner,
+                notifier=lambda _title, _message: True,
+                thresholds=thresholds,
+                auto_repair=options,
+                ai_repairer=lambda *_args, **_kwargs: ai_calls.append("called") or {
+                    "attempted": True,
+                    "success": True,
+                    "action": "codex-sol-terra-agy-qa-repair",
+                    "diagnostic": "QA passed",
+                    "restarted": False,
+                },
+            )
+            self.assertEqual(receipt_repair["status"], "repaired")
+            self.assertEqual(receipt_repair["repairAttempts"], 1)
+            self.assertEqual(receipt_repair["totalRepairAttempts"], 2)
+            self.assertEqual(ai_calls, ["called"])
+            state = json.loads(watcher.read_text(encoding="utf-8"))
+            keys = list(state["repairAttemptsByKey"])
+            self.assertEqual(len(keys), 2)
+            self.assertTrue(any(":stale-state:" in key for key in keys))
+            self.assertTrue(any(":repeated-task-receipts:" in key for key in keys))
+
+            _append_successful_engineer_receipt(reports)
+            _write_supervisor(
+                supervisor,
+                now - timedelta(minutes=27),
+                status="running",
+            )
+            exhausted = run_watchdog(
+                supervisor,
+                watcher,
+                root / "alerts.log",
+                service_name="example.service",
+                report_dir=reports,
+                now=now + timedelta(minutes=2),
+                runner=runner,
+                notifier=lambda _title, _message: True,
+                thresholds=thresholds,
+                auto_repair=options,
+                ai_repairer=lambda *_args, **_kwargs: ai_calls.append("unexpected") or {},
+            )
+            self.assertEqual(exhausted["status"], "repair-exhausted")
+            self.assertEqual(
+                exhausted["repair"]["action"],
+                "global-attempt-limit-reached",
+            )
+            self.assertEqual(exhausted["totalRepairAttempts"], 2)
+            self.assertEqual(ai_calls, ["called"])
+
     def test_external_qa_manual_review_alerts_without_auto_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

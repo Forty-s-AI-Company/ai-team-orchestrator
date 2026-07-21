@@ -248,6 +248,7 @@ def check_watchdog(
     contract_dir: str | None,
     repair_backup_dir: str | None,
     max_auto_repair_attempts: int,
+    max_total_auto_repair_attempts: int,
     ai_repair: bool,
     orchestrator_project: str | None,
     ai_repair_report_dir: str | None,
@@ -311,6 +312,7 @@ def check_watchdog(
             contract_dir=Path(contract_dir).resolve() if contract_dir else None,
             backup_dir=Path(repair_backup_dir).resolve() if repair_backup_dir else None,
             max_attempts=max_auto_repair_attempts,
+            max_total_attempts=max_total_auto_repair_attempts,
             ai_repair_enabled=ai_repair,
             orchestrator_path=(
                 Path(orchestrator_project).resolve() if orchestrator_project else None
@@ -914,6 +916,12 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog_parser.add_argument("--repair-backup-dir")
     watchdog_parser.add_argument("--max-auto-repair-attempts", type=int, default=2)
     watchdog_parser.add_argument(
+        "--max-total-auto-repair-attempts",
+        type=int,
+        default=5,
+        help="Absolute per-task repair cap shared by all alert types",
+    )
+    watchdog_parser.add_argument(
         "--ai-repair",
         action="store_true",
         help=(
@@ -1138,6 +1146,7 @@ def main() -> None:
                 args.contract_dir,
                 args.repair_backup_dir,
                 args.max_auto_repair_attempts,
+                args.max_total_auto_repair_attempts,
                 args.ai_repair,
                 args.orchestrator_project,
                 args.ai_repair_report_dir,
