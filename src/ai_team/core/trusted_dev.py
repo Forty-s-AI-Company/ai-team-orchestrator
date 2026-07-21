@@ -14,6 +14,9 @@ LOOPBACK_DATABASE_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 @dataclass(frozen=True)
 class TestDatabaseSettings:
+    # This is a production configuration value, not a pytest test class.
+    __test__ = False
+
     enabled: bool = False
     url_env: str = "AI_TEAM_TEST_DATABASE_URL"
     allowed_hosts: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
