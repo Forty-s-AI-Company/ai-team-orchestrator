@@ -156,12 +156,20 @@ def test_status_shows_readable_failed_repair_history(tmp_path: Path) -> None:
     project = tmp_path / "CelebrateDeal"
     project.mkdir()
     state = tmp_path / "state.json"
-    state.write_text("{}", encoding="utf-8")
+    task_sha = "c" * 64
+    state.write_text(
+        json.dumps({
+            "revision": 12,
+            "currentTask": {"id": "payment-repair", "taskSha": task_sha},
+        }),
+        encoding="utf-8",
+    )
     reports = tmp_path / "reports"
     reports.mkdir()
     (reports / "watchdog-ai-repair-current.json").write_text(
         json.dumps({
             "status": "deferred",
+            "startedAt": "2026-07-20T04:00:00+00:00",
             "cycleLimit": 5,
             "activePhase": "deferred",
             "acceptanceContract": {
@@ -189,6 +197,10 @@ def test_status_shows_readable_failed_repair_history(tmp_path: Path) -> None:
                 },
             ],
             "deferReason": "連續 5 輪仍未通過，已暫緩",
+            "supervisorEvidence": {
+                "revision": 12,
+                "currentTask": {"id": "payment-repair", "taskSha": task_sha},
+            },
         }),
         encoding="utf-8",
     )
@@ -216,3 +228,73 @@ def test_status_shows_readable_failed_repair_history(tmp_path: Path) -> None:
     assert "驗收契約已凍結（1 項）" in output
     assert "範圍外發現（已另行記錄，不阻擋目前修復）" in output
     assert "建議重寫發布協議" in output
+    assert "歷史修復紀錄" not in output
+
+
+def test_status_marks_mismatched_repair_as_history_and_keeps_deferred_tasks(tmp_path: Path) -> None:
+    project = tmp_path / "CelebrateDeal"
+    project.mkdir()
+    current_sha = "d" * 64
+    old_sha = "e" * 64
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps({
+            "revision": 21,
+            "currentTask": {"id": "current-checkout", "taskSha": current_sha},
+            "deferredTasks": [{
+                "id": "old-payment-repair",
+                "reason": "連續五輪仍未通過，已暫緩",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    report = {
+        "schema": "ai-team-watchdog-repair/v1",
+        "startedAt": "2026-07-20T02:00:00+00:00",
+        "completedAt": "2026-07-20T03:00:00+00:00",
+        "status": "deferred",
+        "cycleLimit": 5,
+        "cycles": [{
+            "cycle": 5,
+            "reasoningEffort": "xhigh",
+            "outcome": "review-rejected",
+        }],
+        "deferReason": "舊任務五輪未通過",
+        "supervisorEvidence": {
+            "revision": 19,
+            "currentTask": {"id": "old-payment-repair", "taskSha": old_sha},
+        },
+    }
+    (reports / "watchdog-ai-repair-current.json").write_text(
+        json.dumps(report),
+        encoding="utf-8",
+    )
+    # The timestamped report is the same run; it must not appear twice.
+    (reports / "watchdog-ai-repair-20260720T030000Z.json").write_text(
+        json.dumps(report),
+        encoding="utf-8",
+    )
+
+    def runner(command: list[str]) -> str:
+        if command[0] == "systemctl":
+            return "ActiveState=inactive\nSubState=dead\nMainPID=0\n"
+        return ""
+
+    output = render_chinese_status(
+        project,
+        supervisor_state_path=state,
+        supervisor_service="supervisor.service",
+        watchdog_service="watchdog.service",
+        report_dir=reports,
+        runner=runner,
+        now=datetime.fromisoformat("2026-07-20T12:23:00+08:00"),
+    )
+
+    assert "自動修復歷程（最多 5 輪）" not in output
+    assert output.count("歷史修復紀錄（非目前任務／非目前執行批次）") == 1
+    assert "歷史任務：old-payment-repair（eeeeeeeeeeee）" in output
+    assert "歷史結果：達修復上限，已記錄並暫緩" in output
+    assert "已暫緩任務（不阻塞其他工作）" in output
+    assert "old-payment-repair：連續五輪仍未通過，已暫緩" in output

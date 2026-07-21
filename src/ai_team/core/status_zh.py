@@ -34,7 +34,7 @@ def render_chinese_status(
     descendants = watchdog_descendants or supervisor_descendants
     state = _read_json(supervisor_state_path)
     repair = _latest_repair_activity(project, checked_at)
-    repair_report = _repair_report(report_dir)
+    repair_report, historical_repair_report = _repair_reports(report_dir, state)
 
     overall = _overall_status(
         supervisor,
@@ -85,6 +85,7 @@ def render_chinese_status(
         ]
     )
     lines.extend(_repair_history_lines(repair_report))
+    lines.extend(_historical_repair_lines(historical_repair_report))
 
     deferred_tasks = state.get("deferredTasks")
     if isinstance(deferred_tasks, list) and deferred_tasks:
@@ -274,21 +275,135 @@ def _latest_repair_activity(project: Path, now: datetime) -> dict[str, str] | No
     }
 
 
-def _repair_report(report_dir: Path | None) -> dict:
+def _repair_reports(
+    report_dir: Path | None,
+    state: dict,
+) -> tuple[dict, dict]:
     if report_dir is None:
-        return {}
+        return {}, {}
     current = report_dir / "watchdog-ai-repair-current.json"
-    if current.is_file():
-        return _read_json(current)
+    paths: list[Path] = [current] if current.is_file() else []
     try:
-        candidates = sorted(
-            report_dir.glob("watchdog-ai-repair-*.json"),
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
+        paths.extend(
+            path
+            for path in sorted(
+                report_dir.glob("watchdog-ai-repair-*.json"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            if path != current
         )
     except OSError:
+        pass
+
+    current_report: dict = {}
+    historical_report: dict = {}
+    seen_reports: set[tuple[object, ...]] = set()
+    for path in paths[:40]:
+        report = _read_repair_report(path, report_dir)
+        if not report:
+            continue
+        fingerprint = _repair_report_fingerprint(report)
+        if fingerprint in seen_reports:
+            continue
+        seen_reports.add(fingerprint)
+        if not current_report and _repair_report_matches_state(report, state):
+            current_report = report
+        elif not historical_report:
+            historical_report = report
+        if current_report and historical_report:
+            break
+    return current_report, historical_report
+
+
+def _repair_report_fingerprint(report: dict) -> tuple[object, ...]:
+    evidence = report.get("supervisorEvidence")
+    task = evidence.get("currentTask") if isinstance(evidence, dict) else None
+    return (
+        report.get("schema"),
+        report.get("startedAt"),
+        report.get("completedAt"),
+        report.get("status"),
+        task.get("taskSha") if isinstance(task, dict) else None,
+        evidence.get("revision") if isinstance(evidence, dict) else None,
+    )
+
+
+def _read_repair_report(path: Path, report_dir: Path) -> dict:
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 2_000_000:
+            return {}
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(report_dir.resolve(strict=True))
+    except (OSError, ValueError):
         return {}
-    return _read_json(candidates[0]) if candidates else {}
+    return _read_json(resolved)
+
+
+def _repair_report_matches_state(report: dict, state: dict) -> bool:
+    current_task = state.get("currentTask")
+    evidence = report.get("supervisorEvidence")
+    report_task = evidence.get("currentTask") if isinstance(evidence, dict) else None
+    if not isinstance(current_task, dict) or not isinstance(report_task, dict):
+        return False
+    current_sha = current_task.get("taskSha")
+    report_sha = report_task.get("taskSha")
+    if not isinstance(current_sha, str) or not current_sha or report_sha != current_sha:
+        return False
+
+    # While Watchdog owns a repair, Supervisor is stopped and its revision is
+    # the run-instance boundary.  Once Supervisor writes a newer revision, the
+    # old report is history even if a task SHA is retried later.
+    current_revision = state.get("revision")
+    report_revision = evidence.get("revision")
+    if isinstance(current_revision, int) and isinstance(report_revision, int):
+        if report_revision != current_revision:
+            return False
+
+    current_external = state.get("externalQa")
+    report_external = evidence.get("externalQa")
+    current_external_revision = (
+        current_external.get("revision") if isinstance(current_external, dict) else None
+    )
+    report_external_revision = (
+        report_external.get("revision") if isinstance(report_external, dict) else None
+    )
+    if (
+        isinstance(current_external_revision, str)
+        and current_external_revision
+        and report_external_revision != current_external_revision
+    ):
+        return False
+    return True
+
+
+def _historical_repair_lines(report: dict) -> list[str]:
+    if not report:
+        return []
+    evidence = report.get("supervisorEvidence")
+    task = evidence.get("currentTask") if isinstance(evidence, dict) else None
+    task_id = task.get("id") if isinstance(task, dict) else None
+    task_sha = task.get("taskSha") if isinstance(task, dict) else None
+    task_label = str(task_id or "未知任務")
+    if isinstance(task_sha, str) and task_sha:
+        task_label = f"{task_label}（{task_sha[:12]}）"
+    status = str(report.get("status") or "unknown")
+    status_label = {
+        "running": "舊執行批次未留下終態",
+        "passed": "已修好並通過所有 QA",
+        "deferred": "達修復上限，已記錄並暫緩",
+        "failed": "修復流程發生錯誤",
+    }.get(status, status)
+    lines = [
+        "",
+        "歷史修復紀錄（非目前任務／非目前執行批次）",
+        f"- 歷史任務：{task_label}",
+        f"- 歷史結果：{status_label}",
+    ]
+    reason = report.get("deferReason") or report.get("error")
+    if reason:
+        lines.append(f"- 歷史原因：{_shorten(str(reason), 140)}")
+    return lines
 
 
 def _repair_history_lines(report: dict) -> list[str]:
