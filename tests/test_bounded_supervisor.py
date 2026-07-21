@@ -1194,6 +1194,89 @@ external_qa:
             with self.assertRaisesRegex(RuntimeError, "expected branch"):
                 _sync_primary(Path("/project"), "master")
 
+    def test_primary_sync_reconciles_attested_content_after_squash_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            remote = base / "remote.git"
+            primary = base / "primary"
+            published = base / "published"
+
+            def git(cwd: Path, *args: str) -> str:
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            subprocess.run(
+                ["git", "init", "--bare", str(remote)],
+                check=True,
+                capture_output=True,
+            )
+            primary.mkdir()
+            git(primary, "init", "-b", "development")
+            git(primary, "config", "user.email", "tests@example.com")
+            git(primary, "config", "user.name", "AI Team Tests")
+            (primary / "base.txt").write_text("base\n", encoding="utf-8")
+            git(primary, "add", "base.txt")
+            git(primary, "commit", "-m", "base")
+            git(primary, "remote", "add", "origin", str(remote))
+            git(primary, "push", "-u", "origin", "development")
+
+            # This checkpoint exists only in the local primary. GitHub's
+            # squash commit will contain its content but not its ancestry.
+            (primary / "shared-fix.txt").write_text("fixture fix\n", encoding="utf-8")
+            git(primary, "add", "shared-fix.txt")
+            git(primary, "commit", "-m", "local fixture checkpoint")
+            local_checkpoint = git(primary, "rev-parse", "HEAD")
+
+            subprocess.run(
+                ["git", "clone", "--branch", "development", str(remote), str(published)],
+                check=True,
+                capture_output=True,
+            )
+            git(published, "config", "user.email", "tests@example.com")
+            git(published, "config", "user.name", "AI Team Tests")
+            (published / "shared-fix.txt").write_text("fixture fix\n", encoding="utf-8")
+            (published / "feature.txt").write_text("squashed feature\n", encoding="utf-8")
+            git(published, "add", "shared-fix.txt", "feature.txt")
+            git(published, "commit", "-m", "squash merged feature")
+            remote_squash = git(published, "rev-parse", "HEAD")
+            git(published, "push", "origin", "development")
+
+            synchronized = _sync_primary(primary, "development")
+
+            self.assertNotEqual(synchronized, remote_squash)
+            self.assertEqual(
+                git(primary, "rev-parse", "HEAD^{tree}"),
+                git(primary, "rev-parse", "origin/development^{tree}"),
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", local_checkpoint, synchronized],
+                    cwd=primary,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", remote_squash, synchronized],
+                    cwd=primary,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                len(git(primary, "rev-list", "--parents", "-n", "1", synchronized).split()),
+                3,
+            )
+            # A retry after publication must reuse the reconciliation commit
+            # instead of manufacturing another empty merge checkpoint.
+            self.assertEqual(_sync_primary(primary, "development"), synchronized)
+
 
 class _NoopProvider(BaseProvider):
     def ready(self) -> bool:

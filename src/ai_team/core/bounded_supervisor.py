@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -1250,16 +1251,101 @@ def _sync_primary(project_path: Path, branch: str | None) -> str:
     fetch = _run(["git", "fetch", "origin", branch], project_path, 120)
     if fetch.returncode != 0:
         raise RuntimeError("failed to fetch merged primary branch")
-    ancestor = _run(["git", "merge-base", "--is-ancestor", "HEAD", f"origin/{branch}"], project_path, 30)
-    if ancestor.returncode != 0:
-        raise RuntimeError("primary branch cannot be fast-forwarded to the merged remote branch")
-    merge = _run(["git", "merge", "--ff-only", f"origin/{branch}"], project_path, 120)
-    if merge.returncode != 0:
-        raise RuntimeError("primary branch fast-forward sync failed")
+    remote_ref = f"origin/{branch}"
+    ancestor = _run(
+        ["git", "merge-base", "--is-ancestor", "HEAD", remote_ref],
+        project_path,
+        30,
+    )
+    if ancestor.returncode == 0:
+        merge = _run(["git", "merge", "--ff-only", remote_ref], project_path, 120)
+        if merge.returncode != 0:
+            raise RuntimeError("primary branch fast-forward sync failed")
+    elif ancestor.returncode == 1:
+        _reconcile_squash_merge(project_path, remote_ref)
+    else:
+        raise RuntimeError("unable to compare primary and merged remote ancestry")
     head = _run(["git", "rev-parse", "HEAD"], project_path, 30)
     if head.returncode != 0:
         raise RuntimeError("unable to read synchronized primary HEAD")
     return head.stdout.strip()
+
+
+def _reconcile_squash_merge(project_path: Path, remote_ref: str) -> None:
+    """Preserve local checkpoints after GitHub rewrites them with squash merge.
+
+    A squash commit can contain every local change while no longer descending
+    from the local checkpoint. Reconcile only when Git's conflict-aware virtual
+    merge produces exactly the remote tree. The resulting local merge commit
+    preserves both histories without resetting or overwriting an unverified
+    working tree.
+    """
+    head = _run(["git", "rev-parse", "HEAD"], project_path, 30)
+    remote = _run(["git", "rev-parse", remote_ref], project_path, 30)
+    head_tree = _run(["git", "rev-parse", "HEAD^{tree}"], project_path, 30)
+    remote_tree = _run(["git", "rev-parse", f"{remote_ref}^{{tree}}"], project_path, 30)
+    if any(
+        result.returncode != 0
+        for result in (head, remote, head_tree, remote_tree)
+    ):
+        raise RuntimeError("unable to inspect squash-merged primary revisions")
+    values = [result.stdout.strip() for result in (head, remote, head_tree, remote_tree)]
+    if any(re.fullmatch(r"[0-9a-f]{40}", value) is None for value in values):
+        raise RuntimeError("squash-merged primary revisions are invalid")
+    head_sha, remote_sha, head_tree_sha, remote_tree_sha = values
+
+    remote_already_reconciled = _run(
+        ["git", "merge-base", "--is-ancestor", remote_sha, head_sha],
+        project_path,
+        30,
+    )
+    if remote_already_reconciled.returncode == 0:
+        if head_tree_sha != remote_tree_sha:
+            raise RuntimeError("local primary diverged after squash reconciliation")
+        return
+    if remote_already_reconciled.returncode not in {0, 1}:
+        raise RuntimeError("unable to inspect squash reconciliation ancestry")
+
+    merged_tree = _run(
+        ["git", "merge-tree", "--write-tree", head_sha, remote_sha],
+        project_path,
+        120,
+    )
+    merged_tree_sha = merged_tree.stdout.strip()
+    if (
+        merged_tree.returncode != 0
+        or re.fullmatch(r"[0-9a-f]{40}", merged_tree_sha) is None
+        or merged_tree_sha != remote_tree_sha
+    ):
+        raise RuntimeError("squash merge does not safely contain the local primary checkpoint")
+    reconciliation = _run(
+        [
+            "git",
+            "commit-tree",
+            remote_tree_sha,
+            "-p",
+            head_sha,
+            "-p",
+            remote_sha,
+            "-m",
+            "chore(ai-team): reconcile squash-merged checkpoint",
+        ],
+        project_path,
+        30,
+    )
+    reconciliation_sha = reconciliation.stdout.strip()
+    if (
+        reconciliation.returncode != 0
+        or re.fullmatch(r"[0-9a-f]{40}", reconciliation_sha) is None
+    ):
+        raise RuntimeError("unable to create squash reconciliation checkpoint")
+    merge = _run(
+        ["git", "merge", "--ff-only", reconciliation_sha],
+        project_path,
+        120,
+    )
+    if merge.returncode != 0:
+        raise RuntimeError("primary squash reconciliation failed")
 
 
 def _slug(value: str) -> str:
