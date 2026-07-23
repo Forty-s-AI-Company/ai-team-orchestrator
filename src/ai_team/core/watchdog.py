@@ -181,8 +181,25 @@ def run_watchdog(
             total_repair_attempts += 1
             if current_repair_key is not None:
                 repair_attempts_by_key[current_repair_key] = repair_attempts
+            repair_supervisor = {
+                **supervisor,
+                "watchdogIncident": {
+                    "alertType": alert["type"],
+                    "taskFailureReason": task_failure["reason"],
+                    "taskFailureCount": task_failure["count"],
+                    "taskReceiptCount": task_failure["receiptCount"],
+                    "sameSignatureCount": same_signature_count,
+                    "idleStallCount": idle_stall_count,
+                    "restartDelta": restart_delta,
+                    "staleSeconds": stale_seconds,
+                    "service": {
+                        key: service[key]
+                        for key in ("ActiveState", "SubState", "NRestarts")
+                    },
+                },
+            }
             repair = attempt_auto_repair(
-                supervisor,
+                repair_supervisor,
                 alert_type=alert["type"],
                 service_name=service_name,
                 options=auto_repair,

@@ -715,6 +715,85 @@ class WatchdogTests(unittest.TestCase):
             self.assertEqual(runner.actions.count("stop"), 1)
             self.assertNotIn("start", runner.actions)
 
+    def test_repeated_task_receipt_repair_receives_incident_without_mutating_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = _write_project(root)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            orchestrator = root / "orchestrator"
+            orchestrator.mkdir()
+            reports = root / "reports"
+            supervisor = root / "supervisor.json"
+            now = datetime(2026, 7, 18, 10, tzinfo=UTC)
+            _write_supervisor(supervisor, now, status="running")
+            original_supervisor = supervisor.read_bytes()
+            _write_task_failure_receipts(
+                reports,
+                count=3,
+                reason="deterministic-validation-failed",
+            )
+            received_supervisors: list[dict[str, object]] = []
+
+            def ai_repairer(received_supervisor, **_kwargs):
+                received_supervisors.append(received_supervisor)
+                return {
+                    "attempted": True,
+                    "success": True,
+                    "action": "codex-sol-terra-agy-qa-repair",
+                    "diagnostic": "QA passed",
+                    "restarted": False,
+                }
+
+            result = run_watchdog(
+                supervisor,
+                root / "watchdog.json",
+                root / "alerts.log",
+                service_name="example.service",
+                report_dir=reports,
+                now=now,
+                runner=_RecordingServiceRunner(restarts=7),
+                notifier=lambda _title, _message: True,
+                thresholds=WatchdogThresholds(
+                    restart_count=99,
+                    stale_seconds=3600,
+                ),
+                auto_repair=AutoRepairOptions(
+                    enabled=True,
+                    project_path=project,
+                    contract_dir=contracts,
+                    backup_dir=root / "backups",
+                    ai_repair_enabled=True,
+                    orchestrator_path=orchestrator,
+                    ai_report_dir=reports,
+                ),
+                ai_repairer=ai_repairer,
+            )
+
+            self.assertEqual(result["alertType"], "auto-repair-success")
+            self.assertEqual(len(received_supervisors), 1)
+            incident = received_supervisors[0]["watchdogIncident"]
+            self.assertEqual(
+                incident,
+                {
+                    "alertType": "repeated-task-receipts",
+                    "taskFailureReason": "deterministic-validation-failed",
+                    "taskFailureCount": 3,
+                    "taskReceiptCount": 3,
+                    "sameSignatureCount": 0,
+                    "idleStallCount": 0,
+                    "restartDelta": 0,
+                    "staleSeconds": 0,
+                    "service": {
+                        "ActiveState": "active",
+                        "SubState": "running",
+                        "NRestarts": "7",
+                    },
+                },
+            )
+            self.assertEqual(supervisor.read_bytes(), original_supervisor)
+            self.assertNotIn("watchdogIncident", json.loads(supervisor.read_text(encoding="utf-8")))
+
     def test_controlled_restart_keeps_receipt_repair_budget_and_global_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
